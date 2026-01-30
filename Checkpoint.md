@@ -27,6 +27,8 @@ Verified tables:
 - `document_objects` – MinIO object pointers (bucket/key/version/etag)  
 - `chunks` – text chunks (for vector DB)  
 - `tool_calls` – agentic audit log  
+- `run_events` – observability events (SSE source)
+- `reports` – report pointers + status
 
 This schema is:
 - Auditable  
@@ -40,6 +42,9 @@ This schema is:
 - `GET /health`
 - `POST /runs`
 - `POST /runs/:runId/ingest-text`
+- `GET /runs/:runId/events` (SSE)
+- `GET /runs/:runId` (status + latest report pointer)
+- `GET /runs/:runId/report` (render report + citations)
 
 End‑to‑end flow works:
 **API → MinIO (raw bytes) → Postgres (provenance metadata)**
@@ -86,6 +91,22 @@ docker compose -f infra/docker/docker-compose.yml ps
 ```
 
 ---
+
+## 2.1 Apply Database Migrations (Required)
+
+Run all SQL files in order from `infra/db/migrations`:
+
+```bash
+PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
+NET=$(docker inspect "$PG_CID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
+for f in infra/db/migrations/*.sql; do
+  docker run --rm -i --network "$NET" -e PGPASSWORD=osint postgres:16 \
+    psql -h postgres -U osint -d osint -v ON_ERROR_STOP=1 < "$f"
+done
+```
+
+Re-run this after adding new migrations.
 
 ## 3. Verify Core Services
 

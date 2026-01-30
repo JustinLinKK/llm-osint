@@ -89,6 +89,25 @@ services:
     ports:
       - "3000:3000"
 
+  mcp-server:
+    build:
+      context: ../../
+      dockerfile: apps/mcp-server/Dockerfile
+    environment:
+      MCP_PORT: "3001"
+      DATABASE_URL: postgresql://osint:osint@postgres:5432/osint
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio12345
+      MINIO_BUCKET: osint-raw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+
 
 volumes:
   pgdata:

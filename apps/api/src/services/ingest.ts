@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import { pool } from "../clients/pg.js";
 import { minio, ensureBucket } from "../clients/minio.js";
 import { cfg } from "../config.js";
+import { emitEvent } from "./events.js";
 
 export type Seed = { type: string; value: string };
 
@@ -13,6 +14,7 @@ export async function createRun(prompt: string, seeds: Seed[] = [], constraints:
      VALUES ($1, $2, $3::jsonb, $4::jsonb, 'created')`,
     [runId, prompt, JSON.stringify(seeds), JSON.stringify(constraints)]
   );
+  await emitEvent(runId, "RUN_CREATED", { prompt, seeds, constraints });
   return runId;
 }
 
@@ -29,6 +31,14 @@ export async function ingestRawBytes(params: {
     runId, sourceType, sourceUrl, contentType,
     bytes, title, trustTier = 3
   } = params;
+
+  await emitEvent(runId, "TOOL_CALL_STARTED", {
+    tool: "upload_user_text",
+    sourceType,
+    sourceUrl: sourceUrl ?? null,
+    contentType: contentType ?? null,
+    sizeBytes: bytes.length
+  });
 
   // 1) Hash for dedupe
   const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
@@ -98,8 +108,22 @@ export async function ingestRawBytes(params: {
     await pool.query("COMMIT");
   } catch (e) {
     await pool.query("ROLLBACK");
+    await emitEvent(runId, "TOOL_CALL_FINISHED", {
+      tool: "upload_user_text",
+      ok: false,
+      error: (e as Error).message
+    });
     throw e;
   }
+
+  await emitEvent(runId, "TOOL_CALL_FINISHED", {
+    tool: "upload_user_text",
+    ok: true,
+    documentId,
+    bucket: cfg.minio.bucket,
+    objectKey,
+    etag
+  });
 
   return { documentId, sha256, bucket: cfg.minio.bucket, objectKey, etag };
 }

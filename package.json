@@ -3,7 +3,9 @@
   "private": true,
   "packageManager": "yarn@4.6.0",
   "workspaces": [
-    "apps/*"
+    "apps/*",
+    "packages/*",
+    "services/*"
   ],
   "scripts": {
     "infra:up": "docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml up -d",
@@ -19,5 +21,8 @@
     "@types/uuid": "^11.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@temporalio/workflow": "^1.14.1"
   }
 }

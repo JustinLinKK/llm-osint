@@ -1,0 +1,25 @@
+{
+  "name": "@osint/worker-temporal",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "yarn tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@temporalio/client": "^1.12.5",
+    "@temporalio/worker": "^1.12.5",
+    "@temporalio/workflow": "^1.12.5",
+    "pg": "^8.12.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
