@@ -2,15 +2,22 @@
   "name": "osint-pipeline",
   "private": true,
   "packageManager": "yarn@4.6.0",
-  "workspaces": ["apps/*"],
+  "workspaces": [
+    "apps/*"
+  ],
   "scripts": {
     "infra:up": "docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml up -d",
     "infra:down": "docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml down",
-    "infra:logs": "docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml logs -f --tail=200",
-
+    "logs:api": "docker compose -f infra/docker/docker-compose.yml logs -f --tail=200 api",
     "dev:web": "yarn workspace @osint/web dev",
     "dev:api": "yarn workspace @osint/api dev",
-
     "dev": "yarn infra:up && yarn dev:api & yarn dev:web"
+  },
+  "devDependencies": {
+    "@types/minio": "^7.1.1",
+    "@types/pg": "^8.16.0",
+    "@types/uuid": "^11.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }

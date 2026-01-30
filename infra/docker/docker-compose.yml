@@ -7,6 +7,11 @@ services:
       POSTGRES_DB: osint
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U osint -d osint"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   redis:
     image: redis:7
@@ -14,12 +19,25 @@ services:
 
   minio:
     image: minio/minio:latest
-    command: server /data --console-address ":9001"
+    command: server /data1 /data2 /data3 /data4 --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: minio12345
-    ports: ["9000:9000", "9001:9001"]
-    volumes: ["minio_data:/data"]
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data1:/data1
+      - minio_data2:/data2
+      - minio_data3:/data3
+      - minio_data4:/data4
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
 
   qdrant:
     image: qdrant/qdrant:latest
@@ -51,8 +69,32 @@ services:
       - TEMPORAL_ADDRESS=temporal:7233
     ports: ["8233:8080"]
 
+
+  api:
+    build:
+      context: ../../
+      dockerfile: apps/api/Dockerfile
+    environment:
+      API_PORT: "3000"
+      DATABASE_URL: postgresql://osint:osint@postgres:5432/osint
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minio
+      MINIO_SECRET_KEY: minio12345
+      MINIO_BUCKET: osint-raw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+
+
 volumes:
   pgdata:
-  minio_data:
+  minio_data1:
+  minio_data2:
+  minio_data3:
+  minio_data4:
   qdrant_data:
   neo4j_data:
