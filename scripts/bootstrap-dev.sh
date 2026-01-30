@@ -7,7 +7,11 @@ if [ ! -f infra/docker/.env ] && [ -f infra/docker/.env.example ]; then
   echo "[bootstrap] Created infra/docker/.env"
 fi
 
-echo "[bootstrap] Installing Yarn deps..."
+echo "[bootstrap] Enabling Corepack + pinning Yarn..."
+corepack enable
+corepack prepare yarn@4.6.0 --activate
+
+echo "[bootstrap] Installing dependencies..."
 yarn install
 
 echo "[bootstrap] Done."
