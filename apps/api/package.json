@@ -1,0 +1,11 @@
+{
+  "name": "@osint/api",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/index.ts"
+  },
+  "dependencies": {
+    "fastify": "^4.28.1"
+  }
+}
