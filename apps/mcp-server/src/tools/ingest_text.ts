@@ -13,44 +13,101 @@ type Chunk = {
   charEnd: number;
   text: string;
   vectorId: string | null;
+  sectionTitle: string | null;
 };
 
 function chunkText(text: string, maxChars = 2000, overlap = 200) {
   const cleaned = text.replace(/\r\n/g, "\n").trim();
   if (!cleaned) return [] as Chunk[];
 
+  const sections = splitSections(cleaned);
+  if (sections.length === 0) return [] as Chunk[];
+
   const chunks: Chunk[] = [];
-  let start = 0;
   let index = 0;
 
-  while (start < cleaned.length) {
-    let end = Math.min(start + maxChars, cleaned.length);
-    if (end < cleaned.length) {
-      const window = cleaned.slice(start, end);
-      const lastBreak = Math.max(window.lastIndexOf("\n"), window.lastIndexOf(" "));
-      if (lastBreak > 0) {
-        end = start + lastBreak;
+  for (const section of sections) {
+    let start = section.contentStart;
+    const endLimit = section.contentEnd;
+    while (start < endLimit) {
+      let end = Math.min(start + maxChars, endLimit);
+      if (end < endLimit) {
+        const window = cleaned.slice(start, end);
+        const lastBreak = Math.max(window.lastIndexOf("\n"), window.lastIndexOf(" "));
+        if (lastBreak > 0) {
+          end = start + lastBreak;
+        }
       }
-    }
 
-    const chunkTextValue = cleaned.slice(start, end).trim();
-    if (chunkTextValue) {
-      chunks.push({
-        chunkId: uuidv4(),
-        chunkIndex: index,
-        charStart: start,
-        charEnd: end,
-        text: chunkTextValue,
-        vectorId: null,
-      });
-      index += 1;
-    }
+      const chunkTextValue = cleaned.slice(start, end).trim();
+      if (chunkTextValue) {
+        chunks.push({
+          chunkId: uuidv4(),
+          chunkIndex: index,
+          charStart: start,
+          charEnd: end,
+          text: chunkTextValue,
+          vectorId: null,
+          sectionTitle: section.title,
+        });
+        index += 1;
+      }
 
-    if (end >= cleaned.length) break;
-    start = Math.max(0, end - overlap);
+      if (end >= endLimit) break;
+      start = Math.max(section.contentStart, end - overlap);
+    }
   }
 
   return chunks;
+}
+
+function splitSections(text: string) {
+  const lines = text.split("\n");
+  const sections: Array<{ title: string | null; contentStart: number; contentEnd: number }> = [];
+  let offset = 0;
+  let currentTitle: string | null = null;
+  let currentStart = 0;
+
+  const pushSection = (endOffset: number) => {
+    const trimmedStart = Math.min(currentStart, endOffset);
+    const trimmedEnd = Math.max(trimmedStart, endOffset);
+    if (trimmedEnd > trimmedStart) {
+      sections.push({ title: currentTitle, contentStart: trimmedStart, contentEnd: trimmedEnd });
+    }
+  };
+
+  for (const line of lines) {
+    const lineStart = offset;
+    const lineEnd = offset + line.length;
+    const normalized = line.trim();
+
+    if (isHeadingLine(normalized)) {
+      pushSection(lineStart);
+      currentTitle = normalized.replace(/^#+\s*/, "").trim() || normalized;
+      currentStart = lineEnd + 1;
+    }
+
+    offset = lineEnd + 1;
+  }
+
+  pushSection(text.length);
+
+  if (sections.length === 0) {
+    return [{ title: null, contentStart: 0, contentEnd: text.length }];
+  }
+
+  return sections;
+}
+
+function isHeadingLine(line: string) {
+  if (!line) return false;
+  if (/^#{1,6}\s+/.test(line)) return true;
+  if (line.length > 80) return false;
+  const letters = line.replace(/[^A-Za-z]/g, "");
+  if (letters.length >= 4 && letters === letters.toUpperCase()) {
+    return true;
+  }
+  return false;
 }
 
 async function ensureQdrantCollection(vectorSize: number) {
@@ -126,7 +183,8 @@ export function registerIngestText(server: McpServer) {
   server.registerTool(
     "ingest_text",
     {
-      description: "Ingest raw text into Postgres + Qdrant (chunk + embed + upsert)",
+      description:
+        "Ingest plain text evidence. Use when you already have text (e.g., LLM-parsed, OCR output, or extracted content). Chunks by section headings, embeds via OpenRouter, upserts to Qdrant, and writes chunks to Postgres. Returns documentId and counts.",
       inputSchema: {
         runId: z.string().uuid().describe("Run ID (UUID)"),
         text: z.string().min(1).describe("Raw text input"),
@@ -176,6 +234,7 @@ export function registerIngestText(server: McpServer) {
           charEnd: row.char_end as number,
           text: row.text as string,
           vectorId: row.vector_id as string | null,
+          sectionTitle: null,
         }));
 
         if (chunks.length === 0) {
@@ -235,6 +294,7 @@ export function registerIngestText(server: McpServer) {
               source_type: "text",
               content_type: "text/plain",
               title: title ?? null,
+              section_title: chunk.sectionTitle,
             },
           }));
 

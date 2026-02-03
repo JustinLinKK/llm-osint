@@ -8,8 +8,8 @@ Running services on a shared Docker network:
 
 - **PostgreSQL 16** – authoritative metadata & provenance ledger  
 - **MinIO (Erasure Mode + Versioning)** – immutable evidence storage  
-- **Qdrant** – vector database (ready, not yet wired)  
-- **Neo4j** – graph database (ready, not yet wired)  
+- **Qdrant** – vector database (wired via MCP ingest_text)  
+- **Neo4j** – graph database (wired via MCP graph ingest tool)  
 - **Redis** – cache / coordination  
 - **Temporal + Temporal UI** – workflow orchestration  
 - **API (Node 20, Yarn 4, Fastify)** – containerized, production‑style
@@ -54,17 +54,21 @@ End‑to‑end flow works:
 ### MCP + LangGraph (Working)
 
 - MCP server `fetch_url` tool (HTTP GET → MinIO + Postgres + run_events)
+- MCP server `ingest_text` tool (chunk → embed via OpenRouter → Qdrant + Postgres)
+- MCP server `ingest_graph_entity` tool (Neo4j ingest with normalization + location merge by lat/lon threshold)
 - LangGraph Planner (Python) with tool planning + MCP execution
 - OpenRouter LLM integration for planning (fallback to heuristic URL extraction)
 
 Planner test: OpenRouter → `fetch_url` → document stored in MinIO and logged in Postgres.
+Vector test: MCP `ingest_text` → chunks stored in Postgres + vectors upserted to Qdrant.
+Graph test: MCP `ingest_graph_entity` → nodes + evidence links in Neo4j.
 
 ---
 
 ## 🧠 What Is Intentionally Not Done Yet
 
-- Chunking + Qdrant embeddings
-- Neo4j entity/claim graph
+- Automated processing pipeline (chunking/embedding worker orchestration)
+- Graph extraction pipeline (automated entity/claim extraction)
 - LLM summarization & reasoning
 - Temporal orchestration of the LangGraph planner
 
@@ -205,8 +209,8 @@ Correct technical progression:
 
 1. Reliable **MinIO `version_id` capture** (AWS S3 SDK v3)  
 2. **Temporal wiring for LangGraph planner**  
-3. **Chunking + Qdrant embeddings**  
-4. **Neo4j graph schema (entities + claims)**  
+3. **Processing pipeline for chunking + Qdrant embeddings**  
+4. **Automated Neo4j extraction pipeline (entities + claims)**  
 5. **LLM evidence‑backed summarization & reflection**
 
 ---

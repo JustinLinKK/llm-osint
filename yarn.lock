@@ -1021,6 +1021,8 @@ __metadata:
     "@types/node": "npm:^22.10.2"
     dotenv: "npm:^17.2.3"
     minio: "npm:^7.1.4"
+    neo4j-driver: "npm:^5.27.0"
+    open-location-code: "npm:^1.0.3"
     pg: "npm:^8.12.0"
     tsx: "npm:^4.21.0"
     typescript: "npm:^5.9.3"
@@ -2081,6 +2083,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"base64-js@npm:^1.3.1":
+  version: 1.5.1
+  resolution: "base64-js@npm:1.5.1"
+  checksum: 10c0/f23823513b63173a001030fae4f2dabe283b99a9d324ade3ad3d148e218134676f1ee8568c877cd79ec1c53158dcf2d2ba527a97c606618928ba99dd930102bf
+  languageName: node
+  linkType: hard
+
 "baseline-browser-mapping@npm:^2.9.0":
   version: 2.9.19
   resolution: "baseline-browser-mapping@npm:2.9.19"
@@ -2149,6 +2158,16 @@ __metadata:
   version: 1.1.2
   resolution: "buffer-from@npm:1.1.2"
   checksum: 10c0/124fff9d66d691a86d3b062eff4663fe437a9d9ee4b47b1b9e97f5a5d14f6d5399345db80f796827be7c95e70a8e765dd404b7c3ff3b3324f98e9b0c8826cc34
+  languageName: node
+  linkType: hard
+
+"buffer@npm:^6.0.3":
+  version: 6.0.3
+  resolution: "buffer@npm:6.0.3"
+  dependencies:
+    base64-js: "npm:^1.3.1"
+    ieee754: "npm:^1.2.1"
+  checksum: 10c0/2a905fbbcde73cc5d8bd18d1caa23715d5f83a5935867c2329f0ac06104204ba7947be098fe1317fbd8830e26090ff8e764f08cd14fefc977bb248c3487bcbd0
   languageName: node
   linkType: hard
 
@@ -3213,6 +3232,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"ieee754@npm:^1.2.1":
+  version: 1.2.1
+  resolution: "ieee754@npm:1.2.1"
+  checksum: 10c0/b0782ef5e0935b9f12883a2e2aa37baa75da6e66ce6515c168697b42160807d9330de9a32ec1ed73149aea02e0d822e572bca6f1e22bdcbd2149e13b050b17bb
+  languageName: node
+  linkType: hard
+
 "imurmurhash@npm:^0.1.4":
   version: 0.1.4
   resolution: "imurmurhash@npm:0.1.4"
@@ -3735,6 +3761,35 @@ __metadata:
   languageName: node
   linkType: hard
 
+"neo4j-driver-bolt-connection@npm:5.28.3":
+  version: 5.28.3
+  resolution: "neo4j-driver-bolt-connection@npm:5.28.3"
+  dependencies:
+    buffer: "npm:^6.0.3"
+    neo4j-driver-core: "npm:5.28.3"
+    string_decoder: "npm:^1.3.0"
+  checksum: 10c0/80003b7a3544c8c28e7a0873acb7409283f839367b68cba801ee545858070f18912ee1a03cd10f9ec4aa1c440a4f81a84b979a3cb811b87b592d4585ac548d54
+  languageName: node
+  linkType: hard
+
+"neo4j-driver-core@npm:5.28.3":
+  version: 5.28.3
+  resolution: "neo4j-driver-core@npm:5.28.3"
+  checksum: 10c0/86f70793eef16e80334dc19c1d3321997048b9e8e14b0c77177dbac61e5a183fb05bede16e3ef81301b6deb7d5629cbfd2281428bb31b47e2439a6bb5dc596a9
+  languageName: node
+  linkType: hard
+
+"neo4j-driver@npm:^5.27.0":
+  version: 5.28.3
+  resolution: "neo4j-driver@npm:5.28.3"
+  dependencies:
+    neo4j-driver-bolt-connection: "npm:5.28.3"
+    neo4j-driver-core: "npm:5.28.3"
+    rxjs: "npm:^7.8.2"
+  checksum: 10c0/5a4f388e634f0ca6db72483ac91e1242af394938c055a4e1fe4a847b27f594d4c70ad9d266de80c5c058c8617762b44887b38f5a4dfea5bca60874c4cd19574d
+  languageName: node
+  linkType: hard
+
 "nexus-rpc@npm:^0.0.1":
   version: 0.0.1
   resolution: "nexus-rpc@npm:0.0.1"
@@ -3816,6 +3871,13 @@ __metadata:
   dependencies:
     wrappy: "npm:1"
   checksum: 10c0/5d48aca287dfefabd756621c5dfce5c91a549a93e9fdb7b8246bc4c4790aa2ec17b34a260530474635147aeb631a2dcc8b32c613df0675f96041cbb8244517d0
+  languageName: node
+  linkType: hard
+
+"open-location-code@npm:^1.0.3":
+  version: 1.0.3
+  resolution: "open-location-code@npm:1.0.3"
+  checksum: 10c0/46ec5c9ff3ce1dad7f713d5659d6211d9fdfe8d02297790ce91d7913192cae1702b5988e4edc324fc43fdb8bb4db2486ffc09389d2e4f388d501ef532622d9ec
   languageName: node
   linkType: hard
 
@@ -4381,7 +4443,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"rxjs@npm:^7.8.1":
+"rxjs@npm:^7.8.1, rxjs@npm:^7.8.2":
   version: 7.8.2
   resolution: "rxjs@npm:7.8.2"
   dependencies:
@@ -4760,7 +4822,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"string_decoder@npm:^1.1.1":
+"string_decoder@npm:^1.1.1, string_decoder@npm:^1.3.0":
   version: 1.3.0
   resolution: "string_decoder@npm:1.3.0"
   dependencies:

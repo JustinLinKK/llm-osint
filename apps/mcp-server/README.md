@@ -16,11 +16,19 @@ This is a **proper MCP server** following the [Model Context Protocol specificat
 
 ```
 src/
-├── index.ts              # MCP server (single file, following tutorial pattern)
+├── index.ts              # MCP server entrypoint
 ├── config.ts             # Environment configuration
+├── tools/                # MCP tools (one per file)
+│   ├── fetch_url.ts
+│   ├── ingest_text.ts
+│   └── ingest_graph_entity.ts
 └── clients/              # External service clients
     ├── pg.ts             # Postgres connection
     └── minio.ts          # MinIO client
+scripts/
+└── test-ingest-graph.ts   # MCP graph-ingest test script
+└── test-ingest-text.ts    # MCP vector ingest test script
+└── test-fetch-url.ts      # MCP fetch URL test script
 ```
 
 ## Endpoints
@@ -69,6 +77,19 @@ Fetches a URL via HTTP GET and stores raw response to MinIO + Postgres.
 - Emits `TOOL_CALL_STARTED` and `TOOL_CALL_FINISHED` events
 - Logs to `tool_calls` table
 
+### `ingest_text`
+Ingests raw text into Postgres + Qdrant (chunk → embed → upsert).
+
+### `ingest_graph_entity`
+Ingests graph entities and relationships with evidence. Locations merge by lat/lon with a distance threshold.
+
+**Mitigations applied:**
+- **Location**: requires `lat/lon` (or address to geocode) and merges within a distance threshold.
+- **Email**: normalized to lowercase before merge (`address_normalized`).
+- **Domain**: normalized to lowercase and strips leading `www.`.
+- **Article URL**: normalized (lowercased host, hash removed, trailing slash trimmed).
+- **Person/Organization name**: normalized (`name_normalized`) used when no stable ID is provided.
+
 ## Environment Variables
 
 ```bash
@@ -90,6 +111,26 @@ yarn dev
 ### Production (Docker)
 ```bash
 docker compose up mcp-server
+```
+
+## Test: Graph Ingest Tool
+
+Run the MCP graph-ingest test script (uses stdio transport and inserts a run if needed):
+
+```bash
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-graph.ts
+```
+
+## Test: Vector Ingest Tool
+
+```bash
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-text.ts
+```
+
+## Test: Fetch URL Tool
+
+```bash
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-fetch-url.ts
 ```
 
 ## Client Usage (Python)

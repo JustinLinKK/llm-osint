@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { registerFetchUrl } from "./tools/fetch_url.js";
 import { registerIngestText } from "./tools/ingest_text.js";
+import { registerIngestGraphEntity } from "./tools/ingest_graph_entity.js";
 
 // MCP Server setup
 const server = new McpServer(
@@ -18,6 +19,7 @@ const server = new McpServer(
 
 registerFetchUrl(server);
 registerIngestText(server);
+registerIngestGraphEntity(server);
 
 // Start server with stdio transport
 async function main() {

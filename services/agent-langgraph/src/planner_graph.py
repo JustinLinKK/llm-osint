@@ -34,6 +34,7 @@ class PlannerState(TypedDict):
     max_iterations: int
     done: bool
     enough_info: bool
+    noteboard: List[str]
 
 
 @dataclass
@@ -44,6 +45,7 @@ class PlannerResult:
     rationale: str
     tool_results: List[Dict[str, Any]]
     iterations: int
+    noteboard: List[str]
 
 
 def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = None) -> StateGraph:
@@ -77,7 +79,8 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
                 }
             ]
             try:
-                result = llm.plan_tools(state.get("prompt", ""), state.get("inputs", []), tool_catalog)
+                prompt = _inject_noteboard(state.get("prompt", ""), state.get("noteboard", []))
+                result = llm.plan_tools(prompt, state.get("inputs", []), tool_catalog)
                 rationale = result.get("rationale", "")
                 enough_info = bool(result.get("enough_info", False))
                 llm_urls = [url for url in result.get("urls", []) if isinstance(url, str)]
@@ -109,6 +112,7 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
     def execute_tools(state: PlannerState) -> PlannerState:
         results: List[Dict[str, Any]] = []
         documents_created = list(state.get("documents_created", []))
+        noteboard = list(state.get("noteboard", []))
 
         for item in state.get("tool_plan", []):
             result = mcp_client.call_tool(item.tool, item.arguments)
@@ -118,8 +122,22 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
                 document_id = result.content.get("documentId")
                 if document_id:
                     documents_created.append(document_id)
+                note = _format_tool_note(item.tool, result.content)
+                if note:
+                    noteboard.append(note)
 
-        return {**state, "tool_results": results, "documents_created": documents_created}
+        noteboard = _trim_noteboard(noteboard)
+        emit_run_event(
+            state["run_id"],
+            "NOTEBOARD_UPDATED",
+            {"notes": noteboard},
+        )
+        return {
+            **state,
+            "tool_results": results,
+            "documents_created": documents_created,
+            "noteboard": noteboard,
+        }
 
     def decide_stop_or_refine(state: PlannerState) -> PlannerState:
         iteration = state.get("iteration", 0) + 1
@@ -178,6 +196,7 @@ def run_planner(
             "max_iterations": max_iterations,
             "done": False,
             "enough_info": False,
+            "noteboard": [],
         }
 
         final_state = graph.compile().invoke(state)
@@ -188,6 +207,7 @@ def run_planner(
             rationale=final_state.get("rationale", ""),
             tool_results=final_state.get("tool_results", []),
             iterations=final_state.get("iteration", 0),
+            noteboard=final_state.get("noteboard", []),
         )
     finally:
         mcp_client.close()
@@ -207,3 +227,31 @@ def _dedupe(items: List[str]) -> List[str]:
         seen.add(normalized)
         ordered.append(normalized)
     return ordered
+
+
+def _format_tool_note(tool_name: str, result: Dict[str, Any]) -> str | None:
+    if tool_name == "fetch_url":
+        document_id = result.get("documentId")
+        source_type = result.get("sourceType")
+        url = result.get("url") or result.get("sourceUrl")
+        if document_id:
+            return f"Fetched {source_type or 'content'} from {url or 'url'} → document {document_id}"
+    if tool_name == "ingest_text":
+        document_id = result.get("documentId")
+        chunk_count = result.get("chunkCount")
+        if document_id:
+            return f"Ingested text → document {document_id} ({chunk_count} chunks)"
+    return None
+
+
+def _trim_noteboard(notes: List[str], max_items: int = 20) -> List[str]:
+    if len(notes) <= max_items:
+        return notes
+    return notes[-max_items:]
+
+
+def _inject_noteboard(prompt: str, notes: List[str]) -> str:
+    if not notes:
+        return prompt
+    summary = "\n".join(f"- {note}" for note in notes)
+    return f"{prompt}\n\nNoteboard (key findings so far):\n{summary}"

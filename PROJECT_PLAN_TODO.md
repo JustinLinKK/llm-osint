@@ -232,6 +232,8 @@ Deliverables:
 ## E) MCP server (TS) — minimal viable tools
 - [x] MCP server scaffolding + tool registry
 - [x] Tool: `fetch_url` (HTTP GET + store raw to MinIO)
+- [x] Tool: `ingest_text` (chunk + embed + Qdrant upsert)
+- [x] Tool: `ingest_graph_entity` (Neo4j ingest + normalization + location merge threshold)
 - [ ] Tool: `web_search` (stub initially; later real provider)
 - [x] Write tool call logs into Postgres `tool_calls`
 - [x] Emit events `TOOL_CALL_STARTED/FINISHED`

@@ -27,6 +27,7 @@ class Chunk:
     char_start: int
     char_end: int
     text: str
+    section_title: str | None
 
 
 def load_env() -> None:
@@ -41,35 +42,83 @@ def chunk_text(text: str, max_chars: int = DEFAULT_MAX_CHARS, overlap: int = DEF
     if not cleaned:
         return []
 
-    chunks: List[Chunk] = []
-    start = 0
-    index = 0
-    length = len(cleaned)
+    sections = split_sections(cleaned)
+    if not sections:
+        return []
 
-    while start < length:
-        end = min(start + max_chars, length)
-        if end < length:
-            window = cleaned[start:end]
-            last_break = max(window.rfind("\n"), window.rfind(" "))
-            if last_break > 0:
-                end = start + last_break
-        chunk_text_value = cleaned[start:end].strip()
-        if chunk_text_value:
-            chunks.append(
-                Chunk(
-                    chunk_id=str(uuid.uuid4()),
-                    chunk_index=index,
-                    char_start=start,
-                    char_end=end,
-                    text=chunk_text_value,
+    chunks: List[Chunk] = []
+    index = 0
+
+    for section in sections:
+        start = section["content_start"]
+        end_limit = section["content_end"]
+        while start < end_limit:
+            end = min(start + max_chars, end_limit)
+            if end < end_limit:
+                window = cleaned[start:end]
+                last_break = max(window.rfind("\n"), window.rfind(" "))
+                if last_break > 0:
+                    end = start + last_break
+            chunk_text_value = cleaned[start:end].strip()
+            if chunk_text_value:
+                chunks.append(
+                    Chunk(
+                        chunk_id=str(uuid.uuid4()),
+                        chunk_index=index,
+                        char_start=start,
+                        char_end=end,
+                        text=chunk_text_value,
+                        section_title=section["title"],
+                    )
                 )
-            )
-            index += 1
-        if end >= length:
-            break
-        start = max(0, end - overlap)
+                index += 1
+            if end >= end_limit:
+                break
+            start = max(section["content_start"], end - overlap)
 
     return chunks
+
+
+def split_sections(text: str) -> List[dict]:
+    lines = text.split("\n")
+    sections: List[dict] = []
+    offset = 0
+    current_title: str | None = None
+    current_start = 0
+
+    def push_section(end_offset: int) -> None:
+        trimmed_start = min(current_start, end_offset)
+        trimmed_end = max(trimmed_start, end_offset)
+        if trimmed_end > trimmed_start:
+            sections.append({"title": current_title, "content_start": trimmed_start, "content_end": trimmed_end})
+
+    for line in lines:
+        line_start = offset
+        line_end = offset + len(line)
+        normalized = line.strip()
+        if is_heading_line(normalized):
+            push_section(line_start)
+            current_title = normalized.lstrip("#").strip() or normalized
+            current_start = line_end + 1
+        offset = line_end + 1
+
+    push_section(len(text))
+
+    if not sections:
+        return [{"title": None, "content_start": 0, "content_end": len(text)}]
+
+    return sections
+
+
+def is_heading_line(line: str) -> bool:
+    if not line:
+        return False
+    if line.startswith("#") and line.lstrip("#").strip():
+        return True
+    if len(line) > 80:
+        return False
+    letters = "".join([ch for ch in line if ch.isalpha()])
+    return len(letters) >= 4 and letters.isupper()
 
 
 def insert_document(
@@ -203,6 +252,7 @@ def upsert_vectors(
             "source_type": "text",
             "content_type": "text/plain",
             "title": title,
+            "section_title": chunk.section_title,
         }
         points.append(PointStruct(id=chunk.chunk_id, vector=vector, payload=payload))
 

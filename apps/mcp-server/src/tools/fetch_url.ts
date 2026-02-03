@@ -100,7 +100,8 @@ export function registerFetchUrl(server: McpServer) {
   server.registerTool(
     "fetch_url",
     {
-      description: "Fetch a URL via HTTP GET and store the raw response to MinIO + Postgres",
+      description:
+        "Fetch a public URL via HTTP GET. Use when you need raw source bytes for evidence. Stores raw content to MinIO and provenance to Postgres. Returns documentId, objectKey, contentType, sha256.",
       inputSchema: {
         runId: z.string().uuid().describe("Run ID (UUID)"),
         url: z.string().url().describe("URL to fetch"),

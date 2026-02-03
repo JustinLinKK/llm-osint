@@ -21,6 +21,16 @@ export const cfg = {
     embedModel: process.env.OPENROUTER_EMBED_MODEL ?? "openai/text-embedding-3-small",
   },
 
+  location: {
+    mergeThresholdMeters: Number(process.env.LOCATION_MERGE_THRESHOLD_METERS ?? "1000"),
+  },
+
+  neo4j: {
+    uri: process.env.NEO4J_URI ?? "bolt://neo4j:7687",
+    user: process.env.NEO4J_USER ?? "neo4j",
+    password: process.env.NEO4J_PASSWORD ?? "neo4jpassword",
+  },
+
   minio: {
     endpoint: (process.env.MINIO_ENDPOINT ?? "http://minio:9000").replace(/^https?:\/\//, ""),
     useSSL: (process.env.MINIO_ENDPOINT ?? "http://minio:9000").startsWith("https://"),
