@@ -18,7 +18,7 @@ Running and verified:
 
 ### ✅ Postgres Provenance Schema
 Tables exist:
-- `runs`, `documents`, `document_objects`, `chunks`, `tool_calls`
+- `runs`, `documents`, `document_objects`, `chunks`, `tool_calls`, `run_events`, `reports`
 
 ---
 
@@ -87,8 +87,8 @@ Tables exist:
 - `runs/<run_id>/outputs/report.json|report.md`
 
 ### Postgres (ledger + indexing)
-Already: `runs, documents, document_objects, chunks, tool_calls`
-Add next: `run_events`, `reports`, `tasks` (optional)
+Already: `runs, documents, document_objects, chunks, tool_calls, run_events, reports`
+Add next: `tasks` (optional)
 
 ### Qdrant
 - Embeddings for `chunks`
@@ -206,19 +206,19 @@ Deliverables:
 # ✅ ToDo Checklist (Actionable)
 
 ## A) Repository structure
-- [ ] Create folders: `apps/web`, `apps/mcp-server`, `services/agent-langgraph`, `services/worker-temporal`, `services/worker-python`, `packages/shared`
+- [x] Create folders: `apps/web`, `apps/mcp-server`, `services/agent-langgraph`, `services/worker-temporal`, `services/worker-python`, `packages/shared`
 - [ ] Add shared types package (zod schemas for ToolPlan, ToolResult, RunEvent, Report)
 
 ## B) Postgres schema upgrades
-- [ ] Add migration `0002_run_events.sql` for `run_events` table
-- [ ] Add migration `0003_reports.sql` for `reports` table (report pointers + status)
-- [ ] Add indexes: `run_events(run_id, ts)` and `reports(run_id)`
+- [x] Add migration `0002_run_events.sql` for `run_events` table
+- [x] Add migration `0003_reports.sql` for `reports` table (report pointers + status)
+- [x] Add indexes: `run_events(run_id, ts)` and `reports(run_id)`
 
 ## C) API upgrades (Fastify)
-- [ ] SSE endpoint: `GET /runs/:runId/events`
-- [ ] Emit events on run creation and ingest endpoints
-- [ ] Endpoint: `GET /runs/:runId` (status + latest report pointer)
-- [ ] Endpoint: `GET /runs/:runId/report` (render markdown + citations)
+- [x] SSE endpoint: `GET /runs/:runId/events`
+- [x] Emit events on run creation and ingest endpoints
+- [x] Endpoint: `GET /runs/:runId` (status + latest report pointer)
+- [x] Endpoint: `GET /runs/:runId/report` (render markdown + citations)
 
 ## D) Temporal workflow skeleton (TS)
 - [ ] Define `RunWorkflow(run_id)` with steps:
@@ -230,14 +230,15 @@ Deliverables:
 - [ ] Add retry + timeout per activity
 
 ## E) MCP server (TS) — minimal viable tools
-- [ ] MCP server scaffolding + tool registry
-- [ ] Tool: `fetch_url` (HTTP GET + store raw to MinIO)
+- [x] MCP server scaffolding + tool registry
+- [x] Tool: `fetch_url` (HTTP GET + store raw to MinIO)
 - [ ] Tool: `web_search` (stub initially; later real provider)
-- [ ] Write tool call logs into Postgres `tool_calls`
-- [ ] Emit events `TOOL_CALL_STARTED/FINISHED`
+- [x] Write tool call logs into Postgres `tool_calls`
+- [x] Emit events `TOOL_CALL_STARTED/FINISHED`
 
 ## F) LangGraph Agent Service (Python)
-- [ ] `planner_graph.py` (tool planning + rationale + execute via MCP client)
+- [x] `planner_graph.py` (tool planning + rationale + execute via MCP client)
+- [x] OpenRouter LLM planning integration (direct HTTP)
 - [ ] `synth_graph.py` (retrieve via Qdrant/Neo4j + write report)
 - [ ] Define consistent state objects for graphs (pydantic models)
 - [ ] Add “evidence policy”: output must cite chunk/document IDs

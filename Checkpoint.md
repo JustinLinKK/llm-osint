@@ -51,12 +51,22 @@ End‑to‑end flow works:
 
 ---
 
+### MCP + LangGraph (Working)
+
+- MCP server `fetch_url` tool (HTTP GET → MinIO + Postgres + run_events)
+- LangGraph Planner (Python) with tool planning + MCP execution
+- OpenRouter LLM integration for planning (fallback to heuristic URL extraction)
+
+Planner test: OpenRouter → `fetch_url` → document stored in MinIO and logged in Postgres.
+
+---
+
 ## 🧠 What Is Intentionally Not Done Yet
 
-- MCP‑based URL fetching
 - Chunking + Qdrant embeddings
 - Neo4j entity/claim graph
 - LLM summarization & reasoning
+- Temporal orchestration of the LangGraph planner
 
 The foundation is now stable enough to add these without refactors.
 
@@ -194,7 +204,7 @@ docker compose -f infra/docker/docker-compose.yml down
 Correct technical progression:
 
 1. Reliable **MinIO `version_id` capture** (AWS S3 SDK v3)  
-2. **URL ingestion via MCP agent**  
+2. **Temporal wiring for LangGraph planner**  
 3. **Chunking + Qdrant embeddings**  
 4. **Neo4j graph schema (entities + claims)**  
 5. **LLM evidence‑backed summarization & reflection**
