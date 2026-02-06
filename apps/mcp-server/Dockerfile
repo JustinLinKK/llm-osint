@@ -2,6 +2,11 @@ FROM node:20-slim
 
 WORKDIR /app
 
+# Python runtime for tool bridges
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends python3 python3-pip \
+	&& rm -rf /var/lib/apt/lists/*
+
 # Enable Corepack to use Yarn 4.x
 RUN corepack enable && corepack prepare yarn@4.6.0 --activate
 
@@ -24,4 +29,4 @@ WORKDIR /app
 RUN yarn workspaces focus @osint/mcp-server --production
 
 # Run
-CMD ["node", "dist/index.js"]
+CMD ["node", "apps/mcp-server/dist/index.js"]

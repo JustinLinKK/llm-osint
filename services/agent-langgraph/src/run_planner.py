@@ -4,6 +4,9 @@ import argparse
 import json
 
 from planner_graph import run_planner
+from logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def main() -> None:
@@ -22,6 +25,8 @@ def main() -> None:
         max_iterations=args.max_iterations,
     )
 
+    logger.info("Planner CLI finished", extra={"run_id": result.run_id, "iterations": result.iterations})
+
     print(
         json.dumps(
             {
@@ -29,7 +34,7 @@ def main() -> None:
                 "toolPlan": [item.model_dump() for item in result.tool_plan],
                 "documentsCreated": result.documents_created,
                 "rationale": result.rationale,
-                "toolResults": result.tool_results,
+                "toolReceipts": [receipt.model_dump() for receipt in result.tool_receipts],
                 "iterations": result.iterations,
             },
             indent=2,

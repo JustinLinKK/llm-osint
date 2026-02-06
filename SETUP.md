@@ -39,35 +39,29 @@ The dev container includes:
 
 ## 2. Configure Environment Variables
 
-Copy the appropriate environment template based on your setup:
+Copy the default environment template:
 
-**Option A: Dev Container (Recommended)**
 ```bash
 # Uses Docker service names (postgres, minio, etc.)
 cp .env.example .env
 ```
 
-**Option B: Native Linux Host**
-```bash
-# Uses localhost for all services
-cp .env.linux .env
-```
+If running on a native host (Linux/Windows/macOS), update service hosts to `localhost`:
 
-**Option C: Windows Host**
-```powershell
-# Uses localhost for all services
-copy .env.windows .env
-```
-
-**Option D: macOS Host**
 ```bash
-# Uses localhost for all services
-cp .env.macos .env
+# Example
+DATABASE_URL=postgresql://osint:osint@localhost:5432/osint
+MINIO_ENDPOINT=http://localhost:9000
 ```
 
 **Important differences:**
 - **Dev container**: Uses service names, requires network connection (step 3)
 - **Native hosts**: Uses localhost, no network connection needed
+
+**Single root `.env` rule:**
+- The repo uses a single root `.env` by default.
+- Docker Compose reads `.env` from the current working directory.
+- Use `infra/docker/.env.example` only if you run compose from `infra/docker`.
 
 Review the configuration:
 ```bash

@@ -4,9 +4,13 @@ import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-dotenv.config({ path: resolve(__dirname, "../../..", ".env") });
+const repoRoot = resolve(__dirname, "../../..");
+dotenv.config({ path: resolve(repoRoot, ".env") });
 
 export const cfg = {
+  paths: {
+    repoRoot,
+  },
   databaseUrl:
     process.env.DATABASE_URL ??
     "postgresql://osint:osint@postgres:5432/osint",
@@ -37,5 +41,10 @@ export const cfg = {
     accessKey: process.env.MINIO_ACCESS_KEY ?? "minio",
     secretKey: process.env.MINIO_SECRET_KEY ?? "minio12345",
     bucket: process.env.MINIO_BUCKET ?? "osint-raw"
+  },
+
+  python: {
+    bin: process.env.PYTHON_BIN ?? "python3",
+    toolsJson: process.env.MCP_PYTHON_TOOLS ?? "[]",
   }
 };

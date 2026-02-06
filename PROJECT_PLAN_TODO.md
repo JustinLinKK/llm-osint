@@ -19,6 +19,7 @@ Running and verified:
 ### ✅ Postgres Provenance Schema
 Tables exist:
 - `runs`, `documents`, `document_objects`, `chunks`, `tool_calls`, `run_events`, `reports`
+- `artifacts`, `artifact_summaries`, `tool_call_receipts`, `run_notes`
 
 ---
 
@@ -156,7 +157,7 @@ Deliverables:
   1. `analyze_input`
   2. `plan_tools`
   3. `explain_plan` (for UI)
-  4. `execute_tools` (MCP client calls)
+  4. `execute_tools` (tool-worker subgraph)
   5. `decide_stop_or_refine`
 - Emits `TOOLS_SELECTED` with rationale
 - Returns `documents_created[]`
@@ -213,6 +214,7 @@ Deliverables:
 - [x] Add migration `0002_run_events.sql` for `run_events` table
 - [x] Add migration `0003_reports.sql` for `reports` table (report pointers + status)
 - [x] Add indexes: `run_events(run_id, ts)` and `reports(run_id)`
+- [x] Add migration `0004_micro_agent_schema.sql` for artifacts + receipts
 
 ## C) API upgrades (Fastify)
 - [x] SSE endpoint: `GET /runs/:runId/events`
@@ -231,6 +233,7 @@ Deliverables:
 
 ## E) MCP server (TS) — minimal viable tools
 - [x] MCP server scaffolding + tool registry
+- [x] Streamable HTTP transport (network MCP server on port 3001)
 - [x] Tool: `fetch_url` (HTTP GET + store raw to MinIO)
 - [x] Tool: `ingest_text` (chunk + embed + Qdrant upsert)
 - [x] Tool: `ingest_graph_entity` (Neo4j ingest + normalization + location merge threshold)
@@ -241,14 +244,16 @@ Deliverables:
 ## F) LangGraph Agent Service (Python)
 - [x] `planner_graph.py` (tool planning + rationale + execute via MCP client)
 - [x] OpenRouter LLM planning integration (direct HTTP)
+- [x] Tool worker subgraph (execute tool, store artifacts, write receipts)
+- [x] Load root `.env` for agent + pipeline test runs
 - [ ] `synth_graph.py` (retrieve via Qdrant/Neo4j + write report)
 - [ ] Define consistent state objects for graphs (pydantic models)
 - [ ] Add “evidence policy”: output must cite chunk/document IDs
 
 ## G) Processing workers (Python)
-- [ ] Parser/normalizer reading from MinIO based on `document_objects(kind='raw')`
-- [ ] Chunker writes `chunks`
-- [ ] Embedder writes Qdrant and stores `vector_id` back to Postgres
+- [x] Parser/normalizer reading from MinIO based on `document_objects(kind='raw')`
+- [x] Chunker writes `chunks`
+- [x] Embedder writes Qdrant and stores `vector_id` back to Postgres
 - [ ] (Optional) entity/claim extractor writes to Neo4j
 
 ## H) UI (Web)

@@ -6,6 +6,7 @@ import { pool } from "../clients/pg.js";
 import { minio, ensureBucket } from "../clients/minio.js";
 import { cfg } from "../config.js";
 import { emitRunEvent, logToolCall } from "./helpers.js";
+import { logger } from "../utils/logger.js";
 
 const USER_AGENT = "osint-mcp-bot/1.0";
 
@@ -109,6 +110,7 @@ export function registerFetchUrl(server: McpServer) {
     },
     async ({ runId, url }) => {
       await emitRunEvent(runId, "TOOL_CALL_STARTED", { tool: "fetch_url", url });
+      logger.info("fetch_url started", { runId, url });
 
       try {
         const result = await makeHttpRequest(url);
@@ -130,14 +132,26 @@ export function registerFetchUrl(server: McpServer) {
           bucket: cfg.minio.bucket,
           objectKey,
           etag,
+          versionId: null,
           sizeBytes: bytes.length,
           contentType,
           sourceType,
           sha256,
+          evidence: {
+            documentId,
+            bucket: cfg.minio.bucket,
+            objectKey,
+            versionId: null,
+            etag,
+            sizeBytes: bytes.length,
+            contentType,
+            sha256,
+          },
         };
 
         await logToolCall(runId, "fetch_url", { url }, output, "ok");
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "fetch_url", url, ok: true, documentId });
+        logger.info("fetch_url finished", { runId, documentId, bytes: bytes.length });
 
         return {
           content: [
@@ -152,6 +166,7 @@ export function registerFetchUrl(server: McpServer) {
 
         await logToolCall(runId, "fetch_url", { url }, { error: errorMsg }, "error", errorMsg);
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "fetch_url", url, ok: false, error: errorMsg });
+        logger.error("fetch_url failed", { runId, error: errorMsg });
 
         return {
           content: [

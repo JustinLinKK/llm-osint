@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from "uuid";
 import { pool } from "../clients/pg.js";
 import { cfg } from "../config.js";
 import { emitRunEvent, logToolCall } from "./helpers.js";
+import { logger } from "../utils/logger.js";
 
 type Chunk = {
   chunkId: string;
@@ -15,6 +16,46 @@ type Chunk = {
   vectorId: string | null;
   sectionTitle: string | null;
 };
+
+type EvidenceObjectRef = {
+  bucket?: string;
+  objectKey?: string;
+  versionId?: string;
+  etag?: string;
+  documentId?: string;
+};
+
+type EvidenceProps = {
+  evidence_bucket?: string;
+  evidence_object_key?: string;
+  evidence_version_id?: string;
+  evidence_etag?: string;
+  evidence_document_id?: string;
+};
+
+function parseJson<T>(label: string, value?: string): T | undefined {
+  if (!value) return undefined;
+  try {
+    return JSON.parse(value) as T;
+  } catch (error) {
+    throw new Error(`Invalid ${label} JSON`);
+  }
+}
+
+function buildEvidenceProps(ref?: EvidenceObjectRef): EvidenceProps | null {
+  if (!ref) return null;
+  const props: EvidenceProps = {};
+  if (ref.bucket) props.evidence_bucket = ref.bucket;
+  if (ref.objectKey) props.evidence_object_key = ref.objectKey;
+  if (ref.versionId) props.evidence_version_id = ref.versionId;
+  if (ref.etag) props.evidence_etag = ref.etag;
+  if (ref.documentId) props.evidence_document_id = ref.documentId;
+  return Object.keys(props).length ? props : null;
+}
+
+function hasEvidenceLink(ref?: EvidenceObjectRef): boolean {
+  return Boolean((ref?.bucket && ref?.objectKey) || ref?.documentId);
+}
 
 function chunkText(text: string, maxChars = 2000, overlap = 200) {
   const cleaned = text.replace(/\r\n/g, "\n").trim();
@@ -192,12 +233,24 @@ export function registerIngestText(server: McpServer) {
         title: z.string().optional().describe("Optional title"),
         maxChars: z.number().int().min(200).max(10000).optional().describe("Max characters per chunk"),
         overlap: z.number().int().min(0).max(2000).optional().describe("Overlap characters"),
+        evidenceJson: z
+          .string()
+          .optional()
+          .describe("JSON string evidence link to MinIO (bucket, objectKey, versionId, etag, documentId)"),
       },
     },
-    async ({ runId, text, sourceUrl, title, maxChars, overlap }) => {
+    async ({ runId, text, sourceUrl, title, maxChars, overlap, evidenceJson }) => {
       await emitRunEvent(runId, "TOOL_CALL_STARTED", { tool: "ingest_text" });
+      logger.info("ingest_text started", { runId, sourceUrl: sourceUrl ?? null });
 
       try {
+        const warnings: string[] = [];
+        const evidenceRef = parseJson<EvidenceObjectRef>("evidence", evidenceJson);
+        if (!hasEvidenceLink(evidenceRef)) {
+          warnings.push("Missing evidence reference for vector chunks");
+        }
+        const evidenceProps = buildEvidenceProps(evidenceRef);
+
         const sha256 = crypto.createHash("sha256").update(text).digest("hex");
         const sourceDomain = sourceUrl ? new URL(sourceUrl).hostname : null;
 
@@ -249,8 +302,9 @@ export function registerIngestText(server: McpServer) {
             for (const chunk of chunks) {
               await pool.query(
                 `INSERT INTO chunks(
-                  chunk_id, document_id, kind, chunk_index, char_start, char_end, text
-                ) VALUES ($1, $2, 'body', $3, $4, $5, $6)
+                  chunk_id, document_id, kind, chunk_index, char_start, char_end, text,
+                  evidence_bucket, evidence_object_key, evidence_version_id, evidence_etag, evidence_document_id
+                ) VALUES ($1, $2, 'body', $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (document_id, kind, chunk_index) DO NOTHING`,
                 [
                   chunk.chunkId,
@@ -259,6 +313,11 @@ export function registerIngestText(server: McpServer) {
                   chunk.charStart,
                   chunk.charEnd,
                   chunk.text,
+                  evidenceProps?.evidence_bucket ?? null,
+                  evidenceProps?.evidence_object_key ?? null,
+                  evidenceProps?.evidence_version_id ?? null,
+                  evidenceProps?.evidence_etag ?? null,
+                  evidenceProps?.evidence_document_id ?? null,
                 ]
               );
             }
@@ -267,6 +326,24 @@ export function registerIngestText(server: McpServer) {
             await pool.query("ROLLBACK");
             throw err;
           }
+        } else if (evidenceProps) {
+          await pool.query(
+            `UPDATE chunks
+             SET evidence_bucket = $2,
+                 evidence_object_key = $3,
+                 evidence_version_id = $4,
+                 evidence_etag = $5,
+                 evidence_document_id = $6
+             WHERE document_id = $1`,
+            [
+              documentId,
+              evidenceProps.evidence_bucket ?? null,
+              evidenceProps.evidence_object_key ?? null,
+              evidenceProps.evidence_version_id ?? null,
+              evidenceProps.evidence_etag ?? null,
+              evidenceProps.evidence_document_id ?? null,
+            ]
+          );
         }
 
         const chunksToEmbed = chunks.filter((chunk) => !chunk.vectorId);
@@ -290,11 +367,15 @@ export function registerIngestText(server: McpServer) {
               chunk_index: chunk.chunkIndex,
               char_start: chunk.charStart,
               char_end: chunk.charEnd,
-              source_url: sourceUrl ?? null,
               source_type: "text",
               content_type: "text/plain",
               title: title ?? null,
               section_title: chunk.sectionTitle,
+              evidence_bucket: evidenceProps?.evidence_bucket ?? null,
+              evidence_object_key: evidenceProps?.evidence_object_key ?? null,
+              evidence_version_id: evidenceProps?.evidence_version_id ?? null,
+              evidence_etag: evidenceProps?.evidence_etag ?? null,
+              evidence_document_id: evidenceProps?.evidence_document_id ?? null,
             },
           }));
 
@@ -314,10 +395,13 @@ export function registerIngestText(server: McpServer) {
           vectorCount: embeddings.length,
           collection: cfg.qdrant.collection,
           embeddingModel: cfg.openrouter.embedModel,
+          evidenceLinked: hasEvidenceLink(evidenceRef),
+          warnings,
         };
 
-        await logToolCall(runId, "ingest_text", { sourceUrl, title, maxChars, overlap }, output, "ok");
+        await logToolCall(runId, "ingest_text", { sourceUrl, title, maxChars, overlap, evidence: evidenceRef }, output, "ok");
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "ingest_text", ok: true, documentId });
+        logger.info("ingest_text finished", { runId, documentId, chunkCount: chunks.length });
 
         return {
           content: [
@@ -331,6 +415,7 @@ export function registerIngestText(server: McpServer) {
         const errorMsg = (error as Error).message;
         await logToolCall(runId, "ingest_text", { sourceUrl, title, maxChars, overlap }, { error: errorMsg }, "error", errorMsg);
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "ingest_text", ok: false, error: errorMsg });
+        logger.error("ingest_text failed", { runId, error: errorMsg });
 
         return {
           content: [

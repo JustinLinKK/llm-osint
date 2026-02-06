@@ -6,10 +6,10 @@
 
 | File | Purpose | URLs Used | Network Setup Required |
 |------|---------|-----------|------------------------|
-| `.env.example` | **Dev Container** (default) | Docker service names (`postgres:5432`) | ✅ Yes - `docker network connect` |
-| `.env.linux` | **Native Linux** host | localhost (`localhost:5432`) | ❌ No |
-| `.env.windows` | **Windows** + Docker Desktop | localhost (`localhost:5432`) | ❌ No |
-| `.env.macos` | **macOS** + Docker Desktop | localhost (`localhost:5432`) | ❌ No |
+| `.env.example` | **Default template** (dev container) | Docker service names (`postgres:5432`) | ✅ Yes - `docker network connect` |
+| `.env.linux` | Deprecated (Linux host reference) | localhost (`localhost:5432`) | ❌ No |
+| `.env.windows` | Deprecated (Windows host reference) | localhost (`localhost:5432`) | ❌ No |
+| `.env.macos` | Deprecated (macOS host reference) | localhost (`localhost:5432`) | ❌ No |
 
 ### Documentation Files
 
@@ -41,45 +41,19 @@ docker network connect docker_default $(hostname)
 cd apps/mcp-server && yarn example
 ```
 
-### Native Linux
+### Native Host (Linux/Windows/macOS)
 
 ```bash
-# 1. Copy template  
-cp .env.linux .env
+# 1. Copy default template
+cp .env.example .env
 
-# 2. Start services
+# 2. Update service hosts to localhost
+# Example: DATABASE_URL=postgresql://osint:osint@localhost:5432/osint
+
+# 3. Start services
 docker compose -f infra/docker/docker-compose.yml up -d
 
-# 3. Verify (no network setup needed)
-./test-env-setup.sh
-cd apps/mcp-server && yarn example
-```
-
-### Windows
-
-```powershell
-# 1. Copy template
-copy .env.windows .env
-
-# 2. Start services
-docker compose -f infra\docker\docker-compose.yml up -d
-
-# 3. Verify
-.\test-env-setup.sh
-cd apps\mcp-server
-yarn example
-```
-
-### macOS
-
-```bash
-# 1. Copy template
-cp .env.macos .env
-
-# 2. Start services
-docker compose -f infra/docker/docker-compose.yml up -d
-
-# 3. Verify
+# 4. Verify
 ./test-env-setup.sh
 cd apps/mcp-server && yarn example
 ```
@@ -136,13 +110,14 @@ docker compose -f infra/docker/docker-compose.yml ps
 ### "Wrong .env file for my setup"
 
 ```bash
-# Dev container using .env.linux by mistake?
+# Dev container using localhost values by mistake?
 rm .env
 cp .env.example .env
 
-# Native host using .env.example by mistake?
+# Native host using service names by mistake?
 rm .env
-cp .env.linux .env  # or .env.windows or .env.macos
+cp .env.example .env
+# Then update service hosts to localhost
 ```
 
 ### MCP Client Can't Connect
@@ -202,13 +177,18 @@ load_dotenv()
 - `.env.linux`
 - `.env.windows`
 - `.env.macos`
-- `infra/docker/.env`
 - `infra/docker/.env.example`
 
 ❌ **Not Committed** (gitignored):
 - `.env` (your active config)
 - `.env.local`
 - `.env.*.local`
+
+## Single Root .env Rule
+
+By default, the repo uses a single root `.env`. The Docker Compose file reads the `.env`
+from the current working directory. Use `infra/docker/.env.example` only if you run
+compose from `infra/docker`.
 
 ## 🎓 Further Reading
 

@@ -29,6 +29,10 @@ Verified tables:
 - `tool_calls` – agentic audit log  
 - `run_events` – observability events (SSE source)
 - `reports` – report pointers + status
+- `artifacts` – tool output storage pointers (bucket/key/version/etag)
+- `artifact_summaries` – compact summaries + key facts
+- `tool_call_receipts` – per-tool receipts (summary + ids + upsert stats)
+- `run_notes` – noteboard notes with citations
 
 This schema is:
 - Auditable  
@@ -56,12 +60,17 @@ End‑to‑end flow works:
 - MCP server `fetch_url` tool (HTTP GET → MinIO + Postgres + run_events)
 - MCP server `ingest_text` tool (chunk → embed via OpenRouter → Qdrant + Postgres)
 - MCP server `ingest_graph_entity` tool (Neo4j ingest with normalization + location merge by lat/lon threshold)
+- MCP server runs in Docker via Streamable HTTP transport on port 3001
+- LangGraph pipeline uses network MCP client (no local stdio server)
 - LangGraph Planner (Python) with tool planning + MCP execution
+- LangGraph tool-worker subgraph (per-tool micro-agent receipts + storage)
 - OpenRouter LLM integration for planning (fallback to heuristic URL extraction)
 
 Planner test: OpenRouter → `fetch_url` → document stored in MinIO and logged in Postgres.
+Receipt test: planner → tool worker → `tool_call_receipts` row + `run_notes` entry.
 Vector test: MCP `ingest_text` → chunks stored in Postgres + vectors upserted to Qdrant.
 Graph test: MCP `ingest_graph_entity` → nodes + evidence links in Neo4j.
+Network test: pipeline calls MCP over HTTP (containerized server) end-to-end.
 
 ---
 
@@ -121,6 +130,19 @@ done
 ```
 
 Re-run this after adding new migrations.
+
+## 2.2 Verify Micro-agent Receipts
+
+Tool workers write receipts and noteboard notes to Postgres:
+
+```bash
+PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
+NET=$(docker inspect "$PG_CID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+
+docker run --rm --network "$NET" -e PGPASSWORD=osint postgres:16 \
+  psql -h postgres -U osint -d osint \
+  -c "SELECT tool_name, ok, created_at FROM tool_call_receipts ORDER BY created_at DESC LIMIT 5;"
+```
 
 ## 3. Verify Core Services
 

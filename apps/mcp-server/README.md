@@ -22,6 +22,7 @@ src/
 │   ├── fetch_url.ts
 │   ├── ingest_text.ts
 │   └── ingest_graph_entity.ts
+│   └── tools_python/      # Python tools used via MCP bridge
 └── clients/              # External service clients
     ├── pg.ts             # Postgres connection
     └── minio.ts          # MinIO client
@@ -29,6 +30,7 @@ scripts/
 └── test-ingest-graph.ts   # MCP graph-ingest test script
 └── test-ingest-text.ts    # MCP vector ingest test script
 └── test-fetch-url.ts      # MCP fetch URL test script
+└── test-python-tools.ts    # MCP Python tool bridge test script
 ```
 
 ## Endpoints
@@ -99,6 +101,73 @@ MINIO_ENDPOINT=http://minio:9000
 MINIO_ACCESS_KEY=minio
 MINIO_SECRET_KEY=minio12345
 MINIO_BUCKET=osint-raw
+PYTHON_BIN=python3                                 # Optional override
+MCP_PYTHON_TOOLS='[]'                              # Optional JSON tool config
+X_BEARER_TOKEN=                                    # Optional, X API
+BROWSERBASE_API_KEY=                               # Optional, Browserbase
+BROWSERBASE_PROJECT_ID=                            # Optional, Browserbase
+LINKEDIN_EMAIL=                                    # Optional, LinkedIn scraping
+LINKEDIN_PASSWORD=                                 # Optional, LinkedIn scraping
+X_TEST_USERNAME=                                   # Optional, test helper
+```
+
+See the example environment file in
+[apps/mcp-server/src/tools/tools_python/env.example](apps/mcp-server/src/tools/tools_python/env.example).
+
+## Python Tool Bridge (Option B)
+
+You can keep the Node MCP server and call Python tools as subprocesses.
+Define tools in `MCP_PYTHON_TOOLS` and provide a Python script path. Each script reads JSON
+from stdin and returns JSON on stdout.
+
+Example config:
+
+```bash
+MCP_PYTHON_TOOLS='[
+  {
+    "name": "x_get_user_posts",
+    "description": "Fetch X posts via API",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_user_posts.py",
+    "timeoutMs": 30000
+  },
+  {
+    "name": "x_get_user_posts_browserbase",
+    "description": "Fetch X posts via Browserbase",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_user_posts_browserbase.py",
+    "timeoutMs": 60000
+  },
+  {
+    "name": "linkedin_get_posts_browserbase",
+    "description": "Fetch LinkedIn posts via Browserbase",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_linkedin_posts_browserbase.py",
+    "timeoutMs": 90000
+  }
+]'
+```
+
+Python tool protocol:
+
+- **stdin**: `{ "tool": "extract_entities", "input": { ... } }`
+- **stdout**: `{ "ok": true, "result": { ... } }` or `{ "ok": false, "error": "..." }`
+
+Minimal Python wrapper:
+
+```python
+import json
+import sys
+
+def main():
+    payload = json.load(sys.stdin)
+    tool = payload.get("tool")
+    input_data = payload.get("input", {})
+
+    # TODO: call your actual tool code here.
+    result = {"echo": input_data, "tool": tool}
+
+    json.dump({"ok": True, "result": result}, sys.stdout)
+
+if __name__ == "__main__":
+    main()
 ```
 
 ## Running
@@ -131,6 +200,15 @@ RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-text.ts
 
 ```bash
 RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-fetch-url.ts
+```
+
+## Test: Python Tool Bridge
+
+Configure a tool in `MCP_PYTHON_TOOLS` and ensure required credentials exist in `.env`.
+For the default test, set `X_TEST_USERNAME` (and `X_BEARER_TOKEN` for the API tool).
+
+```bash
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-python-tools.ts
 ```
 
 ## Client Usage (Python)

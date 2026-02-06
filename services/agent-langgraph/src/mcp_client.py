@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import requests
+
+from logger import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class McpCallResult:
@@ -31,11 +37,20 @@ class StdioMcpClient:
         env_cmd = os.getenv("MCP_SERVER_CMD")
         if env_cmd:
             return env_cmd.split(" ")
+
+        container = os.getenv("MCP_SERVER_CONTAINER")
+        if container:
+            node_cmd = os.getenv("MCP_SERVER_CONTAINER_NODE", "node")
+            entrypoint = os.getenv("MCP_SERVER_CONTAINER_ENTRYPOINT", "apps/mcp-server/dist/index.js")
+            return ["docker", "exec", "-i", container, node_cmd, entrypoint]
+
         return ["node", "dist/index.js"]
 
     def start(self) -> None:
         if self._process is not None:
             return
+        env = dict(os.environ)
+        env.setdefault("DOTENV_CONFIG_QUIET", "true")
         self._process = subprocess.Popen(
             self._command,
             cwd=self._cwd,
@@ -44,7 +59,9 @@ class StdioMcpClient:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=env,
         )
+        logger.info("MCP client started", extra={"tool": "mcp_client", "cwd": self._cwd})
 
     def close(self) -> None:
         if self._process is None:
@@ -53,6 +70,7 @@ class StdioMcpClient:
             self._process.terminate()
         finally:
             self._process = None
+            logger.info("MCP client closed", extra={"tool": "mcp_client"})
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> McpCallResult:
         if self._process is None or self._process.stdin is None or self._process.stdout is None:
@@ -65,22 +83,41 @@ class StdioMcpClient:
             "method": "tools/call",
             "params": {"name": name, "arguments": arguments},
         }
+        logger.info("MCP tool call", extra={"tool": name, "request_id": request_id})
 
         with self._lock:
             self._process.stdin.write(json.dumps(request) + "\n")
             self._process.stdin.flush()
-            response_line = self._process.stdout.readline().strip()
 
-        if not response_line:
-            return McpCallResult(ok=False, content={"error": "empty response"}, raw={})
+            response = None
+            last_line = ""
+            for _ in range(8):
+                line = self._process.stdout.readline()
+                if not line:
+                    break
+                last_line = line.strip()
+                if not last_line:
+                    continue
+                try:
+                    response = json.loads(last_line)
+                    break
+                except json.JSONDecodeError:
+                    continue
 
-        response = json.loads(response_line)
+        if response is None:
+            logger.error("MCP empty response", extra={"tool": name, "request_id": request_id})
+            return McpCallResult(ok=False, content={"error": "empty or invalid response", "raw": last_line}, raw={})
         if "error" in response:
+            logger.error("MCP tool error", extra={"tool": name, "request_id": request_id, "error": response.get("error")})
             return McpCallResult(ok=False, content=response["error"], raw=response)
 
         result = response.get("result", {})
         content = _parse_mcp_content(result)
         is_error = bool(result.get("isError"))
+        if is_error:
+            logger.error("MCP tool returned error", extra={"tool": name, "request_id": request_id})
+        else:
+            logger.info("MCP tool returned", extra={"tool": name, "request_id": request_id})
         return McpCallResult(ok=not is_error, content=content, raw=response)
 
 
@@ -98,3 +135,118 @@ def _parse_mcp_content(result: Dict[str, Any]) -> Dict[str, Any]:
             return {"text": text}
 
     return {"content": content_items}
+
+
+class StreamableHttpMcpClient:
+    def __init__(self, server_url: Optional[str] = None) -> None:
+        self._server_url = server_url or os.getenv("MCP_SERVER_URL", "http://mcp-server:3001/mcp")
+        self._protocol_version = os.getenv("MCP_PROTOCOL_VERSION", "2025-11-25")
+        self._session_id: Optional[str] = None
+        self._started = False
+
+    def start(self) -> None:
+        if self._started:
+            return
+
+        init_request = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": self._protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "agent-langgraph", "version": "1.0.0"},
+            },
+        }
+
+        response = self._post(init_request, include_session=False, include_protocol=False)
+        if response is None:
+            raise RuntimeError("MCP initialize returned no response")
+
+        self._session_id = response.headers.get("mcp-session-id")
+        body = response.json()
+
+        if "error" in body:
+            raise RuntimeError(f"MCP initialize failed: {body['error']}")
+
+        self._started = True
+        self._send_initialized_notification()
+        logger.info(
+            "MCP HTTP client started",
+            extra={"tool": "mcp_client", "url": self._server_url, "session_id": self._session_id},
+        )
+
+    def close(self) -> None:
+        if not self._started:
+            return
+        try:
+            if self._session_id:
+                headers = self._headers(include_session=True, include_protocol=True)
+                requests.delete(self._server_url, headers=headers, timeout=10)
+        finally:
+            logger.info("MCP HTTP client closed", extra={"tool": "mcp_client"})
+            self._started = False
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> McpCallResult:
+        if not self._started:
+            raise RuntimeError("MCP client not started")
+
+        request_id = str(uuid.uuid4())
+        request = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }
+        logger.info("MCP tool call", extra={"tool": name, "request_id": request_id})
+
+        response = self._post(request, include_session=True, include_protocol=True)
+        if response is None:
+            logger.error("MCP empty response", extra={"tool": name, "request_id": request_id})
+            return McpCallResult(ok=False, content={"error": "empty response"}, raw={})
+
+        try:
+            payload = response.json()
+        except ValueError:
+            logger.error("MCP invalid JSON response", extra={"tool": name, "request_id": request_id})
+            return McpCallResult(ok=False, content={"error": "invalid JSON response"}, raw={})
+
+        if "error" in payload:
+            logger.error("MCP tool error", extra={"tool": name, "request_id": request_id, "error": payload.get("error")})
+            return McpCallResult(ok=False, content=payload.get("error", {}), raw=payload)
+
+        result = payload.get("result", {})
+        content = _parse_mcp_content(result)
+        is_error = bool(result.get("isError"))
+        if is_error:
+            logger.error("MCP tool returned error", extra={"tool": name, "request_id": request_id})
+        else:
+            logger.info("MCP tool returned", extra={"tool": name, "request_id": request_id})
+
+        return McpCallResult(ok=not is_error, content=content, raw=payload)
+
+    def _headers(self, include_session: bool, include_protocol: bool) -> Dict[str, str]:
+        headers = {
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+        }
+        if include_session and self._session_id:
+            headers["mcp-session-id"] = self._session_id
+        if include_protocol:
+            headers["mcp-protocol-version"] = self._protocol_version
+        return headers
+
+    def _post(self, payload: Dict[str, Any], include_session: bool, include_protocol: bool) -> Optional[requests.Response]:
+        headers = self._headers(include_session=include_session, include_protocol=include_protocol)
+        response = requests.post(self._server_url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 202:
+            return None
+        return response
+
+    def _send_initialized_notification(self) -> None:
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }
+        self._post(notification, include_session=True, include_protocol=True)

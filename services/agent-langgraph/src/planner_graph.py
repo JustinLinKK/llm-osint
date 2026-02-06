@@ -8,9 +8,15 @@ from typing import Any, Dict, List, TypedDict
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from mcp_client import StdioMcpClient
+from mcp_client import StreamableHttpMcpClient
 from openrouter_llm import OpenRouterLLM
 from run_events import emit_run_event
+from system_prompts import WORK_PLANNER_SYSTEM_PROMPT
+from tool_worker_graph import ToolReceipt, run_tool_worker
+from logger import get_logger
+from env import load_env
+
+logger = get_logger(__name__)
 
 URL_REGEX = re.compile(r"https?://[^\s\]]+")
 
@@ -29,7 +35,7 @@ class PlannerState(TypedDict):
     tool_plan: List[ToolPlanItem]
     rationale: str
     documents_created: List[str]
-    tool_results: List[Dict[str, Any]]
+    tool_receipts: List[ToolReceipt]
     iteration: int
     max_iterations: int
     done: bool
@@ -43,12 +49,12 @@ class PlannerResult:
     tool_plan: List[ToolPlanItem]
     documents_created: List[str]
     rationale: str
-    tool_results: List[Dict[str, Any]]
+    tool_receipts: List[ToolReceipt]
     iterations: int
     noteboard: List[str]
 
 
-def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = None) -> StateGraph:
+def build_planner_graph(mcp_client: StreamableHttpMcpClient, llm: OpenRouterLLM | None = None) -> StateGraph:
     graph = StateGraph(PlannerState)
 
     def analyze_input(state: PlannerState) -> PlannerState:
@@ -58,6 +64,7 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
             input_urls.extend(_extract_urls(item))
 
         seed_urls = _dedupe(prompt_urls + input_urls)
+        logger.info("Planner input analyzed", extra={"seed_urls": seed_urls})
         return {
             **state,
             "seed_urls": seed_urls,
@@ -80,12 +87,18 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
             ]
             try:
                 prompt = _inject_noteboard(state.get("prompt", ""), state.get("noteboard", []))
-                result = llm.plan_tools(prompt, state.get("inputs", []), tool_catalog)
+                result = llm.plan_tools(
+                    prompt,
+                    state.get("inputs", []),
+                    tool_catalog,
+                    system_prompt=WORK_PLANNER_SYSTEM_PROMPT,
+                )
                 rationale = result.get("rationale", "")
                 enough_info = bool(result.get("enough_info", False))
                 llm_urls = [url for url in result.get("urls", []) if isinstance(url, str)]
                 seed_urls = _dedupe(seed_urls + llm_urls)
             except Exception:
+                logger.error("Planner LLM failed", extra={"error": str(exc)})
                 rationale = "LLM planning failed, using heuristic URL extraction."
 
         plan: List[ToolPlanItem] = []
@@ -98,6 +111,7 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
                 )
             )
 
+        logger.info("Planner tool plan created", extra={"count": len(plan)})
         return {**state, "tool_plan": plan, "rationale": rationale, "enough_info": enough_info}
 
     def explain_plan(state: PlannerState) -> PlannerState:
@@ -107,24 +121,25 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
             else "\n".join([item.rationale for item in state["tool_plan"]])
         )
         emit_run_event(state["run_id"], "TOOLS_SELECTED", {"rationale": rationale, "tools": [item.model_dump() for item in state.get("tool_plan", [])]})
+        logger.info("Planner plan explained", extra={"tool_count": len(state.get("tool_plan", []))})
         return {**state, "rationale": rationale}
 
     def execute_tools(state: PlannerState) -> PlannerState:
-        results: List[Dict[str, Any]] = []
+        receipts: List[ToolReceipt] = []
         documents_created = list(state.get("documents_created", []))
         noteboard = list(state.get("noteboard", []))
 
         for item in state.get("tool_plan", []):
-            result = mcp_client.call_tool(item.tool, item.arguments)
-            payload = {"tool": item.tool, "arguments": item.arguments, "ok": result.ok, "result": result.content}
-            results.append(payload)
-            if result.ok:
-                document_id = result.content.get("documentId")
+            worker_result = run_tool_worker(mcp_client, state["run_id"], item.tool, item.arguments)
+            receipt = worker_result.receipt
+            receipts.append(receipt)
+            for document_id in receipt.document_ids:
                 if document_id:
                     documents_created.append(document_id)
-                note = _format_tool_note(item.tool, result.content)
-                if note:
-                    noteboard.append(note)
+            note = _format_receipt_note(receipt)
+            if note:
+                noteboard.append(note)
+            logger.info("Planner executed tool", extra={"tool": item.tool, "ok": receipt.ok})
 
         noteboard = _trim_noteboard(noteboard)
         emit_run_event(
@@ -132,9 +147,10 @@ def build_planner_graph(mcp_client: StdioMcpClient, llm: OpenRouterLLM | None = 
             "NOTEBOARD_UPDATED",
             {"notes": noteboard},
         )
+        logger.info("Planner noteboard updated", extra={"note_count": len(noteboard)})
         return {
             **state,
-            "tool_results": results,
+            "tool_receipts": receipts,
             "documents_created": documents_created,
             "noteboard": noteboard,
         }
@@ -173,12 +189,14 @@ def run_planner(
     inputs: List[str] | None = None,
     max_iterations: int = 1,
 ) -> PlannerResult:
+    load_env()
     emit_run_event(run_id, "PLANNER_STARTED", {})
     llm: OpenRouterLLM | None = None
     if os.getenv("OPENROUTER_API_KEY"):
-        llm = OpenRouterLLM()
+        planner_model = os.getenv("OPENROUTER_PLANNER_MODEL") or os.getenv("OPENROUTER_MODEL")
+        llm = OpenRouterLLM(model=planner_model)
 
-    mcp_client = StdioMcpClient()
+    mcp_client = StreamableHttpMcpClient()
     mcp_client.start()
 
     try:
@@ -191,7 +209,7 @@ def run_planner(
             "tool_plan": [],
             "rationale": "",
             "documents_created": [],
-            "tool_results": [],
+            "tool_receipts": [],
             "iteration": 0,
             "max_iterations": max_iterations,
             "done": False,
@@ -200,12 +218,13 @@ def run_planner(
         }
 
         final_state = graph.compile().invoke(state)
+        logger.info("Planner run complete", extra={"run_id": run_id, "iterations": final_state.get("iteration", 0)})
         return PlannerResult(
             run_id=run_id,
             tool_plan=final_state.get("tool_plan", []),
             documents_created=final_state.get("documents_created", []),
             rationale=final_state.get("rationale", ""),
-            tool_results=final_state.get("tool_results", []),
+            tool_receipts=final_state.get("tool_receipts", []),
             iterations=final_state.get("iteration", 0),
             noteboard=final_state.get("noteboard", []),
         )
@@ -229,19 +248,22 @@ def _dedupe(items: List[str]) -> List[str]:
     return ordered
 
 
-def _format_tool_note(tool_name: str, result: Dict[str, Any]) -> str | None:
-    if tool_name == "fetch_url":
-        document_id = result.get("documentId")
-        source_type = result.get("sourceType")
-        url = result.get("url") or result.get("sourceUrl")
-        if document_id:
-            return f"Fetched {source_type or 'content'} from {url or 'url'} → document {document_id}"
-    if tool_name == "ingest_text":
-        document_id = result.get("documentId")
-        chunk_count = result.get("chunkCount")
-        if document_id:
-            return f"Ingested text → document {document_id} ({chunk_count} chunks)"
-    return None
+def _format_receipt_note(receipt: ToolReceipt) -> str | None:
+    if not receipt.ok:
+        return None
+    if receipt.tool_name == "fetch_url" and receipt.document_ids:
+        return f"Fetched content → document {receipt.document_ids[0]}"
+    if receipt.tool_name == "ingest_text" and receipt.document_ids:
+        chunk_count = None
+        for fact in receipt.key_facts:
+            if "chunkCount" in fact:
+                chunk_count = fact.get("chunkCount")
+        if chunk_count is not None:
+            return f"Ingested text → document {receipt.document_ids[0]} ({chunk_count} chunks)"
+        return f"Ingested text → document {receipt.document_ids[0]}"
+    if receipt.tool_name == "ingest_graph_entity":
+        return "Ingested graph entity"
+    return receipt.summary
 
 
 def _trim_noteboard(notes: List[str], max_items: int = 20) -> List[str]:

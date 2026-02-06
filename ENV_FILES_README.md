@@ -6,41 +6,32 @@ This directory contains environment configuration templates for different deploy
 
 | File | Use Case | Service URLs |
 |------|----------|--------------|
-| `.env.example` | **VS Code Dev Container** (default) | `postgres:5432`, `minio:9000` |
-| `.env.linux` | Native Linux host | `localhost:5432`, `localhost:9000` |
-| `.env.windows` | Windows + Docker Desktop | `localhost:5432`, `localhost:9000` |
-| `.env.macos` | macOS + Docker Desktop | `localhost:5432`, `localhost:9000` |
+| `.env.example` | **Default template** (dev container) | `postgres:5432`, `minio:9000` |
+| `.env.linux` | Deprecated (Linux host reference) | `localhost:5432`, `localhost:9000` |
+| `.env.windows` | Deprecated (Windows host reference) | `localhost:5432`, `localhost:9000` |
+| `.env.macos` | Deprecated (macOS host reference) | `localhost:5432`, `localhost:9000` |
+| `infra/docker/.env.example` | Optional compose override | Same as above |
 
 ## Quick Setup
 
 ### 1. Choose Your Template
 
-**Dev Container (Recommended):**
+**Recommended (all setups):**
 ```bash
 cp .env.example .env
-docker network connect docker_default $(hostname)
 ```
 
-**Native Linux:**
-```bash
-cp .env.linux .env
-```
-
-**Windows:**
-```powershell
-copy .env.windows .env
-```
-
-**macOS:**
-```bash
-cp .env.macos .env
-```
+**If running on a native host (Linux/Windows/macOS):**
+- After copying, replace service hosts (`postgres`, `minio`, etc.) with `localhost`.
+- The deprecated OS templates can be used as a reference for the localhost values.
 
 ### 2. Start Services
 
 ```bash
 docker compose -f infra/docker/docker-compose.yml up -d
 ```
+
+**Note:** The repo uses a single root `.env` by default. The compose file reads the `.env` from the current working directory. Use `infra/docker/.env.example` only if you run compose from `infra/docker`.
 
 ### 3. Test Connection
 
@@ -58,7 +49,7 @@ cd apps/mcp-server && yarn example
 - Services resolved via Docker DNS
 - Example: `DATABASE_URL=postgresql://osint:osint@postgres:5432/osint`
 
-**Native Host** (`.env.linux`, `.env.windows`, `.env.macos`):
+**Native Host** (edit `.env`):
 - Uses `localhost` for all services
 - No network connection required
 - Services accessed via exposed ports on host
@@ -115,7 +106,7 @@ llm-osint/
 ├── .env.windows      # Windows host template
 ├── .env.macos        # macOS host template
 └── infra/docker/
-    └── .env          # Docker Compose internal config
+    └── .env.example  # Optional compose override if running from infra/docker
 ```
 
 ## What Gets Configured
