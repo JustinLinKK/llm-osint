@@ -70,7 +70,7 @@ The frontend (localhost) allows users to:
 ### Languages
 - **TypeScript** — APIs, MCP server, orchestration, frontend
 - **Python** — parsing, extraction, embeddings, graph mining
-- **C++ (optional)** — future performance-critical paths
+
 
 ### Infrastructure
 - Docker + Docker Compose (local dev)
