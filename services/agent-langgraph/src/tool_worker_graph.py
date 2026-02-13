@@ -8,7 +8,7 @@ from typing import Any, Dict, List, TypedDict
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
-from mcp_client import StreamableHttpMcpClient
+from mcp_client import McpClientProtocol
 from openrouter_llm import OpenRouterLLM
 from receipt_store import insert_artifact, insert_artifact_summary, insert_run_note, insert_tool_receipt
 from run_events import emit_run_event
@@ -46,7 +46,7 @@ class ToolWorkerResult:
     receipt: ToolReceipt
 
 
-def build_tool_worker_graph(mcp_client: StreamableHttpMcpClient) -> StateGraph:
+def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
     graph = StateGraph(ToolWorkerState)
 
     def execute_tool(state: ToolWorkerState) -> ToolWorkerState:
@@ -130,7 +130,7 @@ def _maybe_refine_arguments(tool_name: str, arguments: Dict[str, Any]) -> Dict[s
 
 
 def run_tool_worker(
-    mcp_client: StreamableHttpMcpClient,
+    mcp_client: McpClientProtocol,
     run_id: str,
     tool_name: str,
     arguments: Dict[str, Any],
@@ -200,6 +200,24 @@ def _summarize_result(
         summary = "Linked graph relations."
         key_facts.append({"count": result.get("count")})
         graph_upserts = {"count": result.get("count")}
+        return summary, key_facts, vector_upserts, graph_upserts, next_hints
+
+    if tool_name.startswith("osint_"):
+        summary = f"Executed {tool_name}."
+        if isinstance(result, dict):
+            for key in (
+                "foundCount",
+                "usedServiceCount",
+                "breachCount",
+                "subdomainCount",
+                "recordCountApprox",
+                "openPortCount",
+                "post_count",
+                "tweet_count",
+                "returncode",
+            ):
+                if key in result:
+                    key_facts.append({key: result.get(key)})
         return summary, key_facts, vector_upserts, graph_upserts, next_hints
 
     summary = f"Executed {tool_name}."
@@ -309,6 +327,8 @@ def _note_from_receipt(receipt: ToolReceipt) -> str | None:
         return "Ingested graph entities"
     if receipt.tool_name == "ingest_graph_relations":
         return "Linked graph relations"
+    if receipt.tool_name.startswith("osint_"):
+        return f"OSINT run completed: {receipt.tool_name}"
     return receipt.summary
 
 

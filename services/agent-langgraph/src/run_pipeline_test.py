@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from logger import get_logger
 from env import load_env
-from mcp_client import StreamableHttpMcpClient
+from mcp_client import RoutedMcpClient
 from planner_graph import run_planner
 
 logger = get_logger(__name__)
@@ -145,7 +145,7 @@ def main() -> None:
     else:
         text = _fetch_text(args.url, args.max_chars)
 
-    client = StreamableHttpMcpClient()
+    client = RoutedMcpClient()
     client.start()
     try:
         ingest_text = client.call_tool(

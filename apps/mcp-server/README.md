@@ -103,11 +103,14 @@ MINIO_SECRET_KEY=minio12345
 MINIO_BUCKET=osint-raw
 PYTHON_BIN=python3                                 # Optional override
 MCP_PYTHON_TOOLS='[]'                              # Optional JSON tool config
+MCP_TOOLSET=default                                # Optional preset (default | kali-osint)
 X_BEARER_TOKEN=                                    # Optional, X API
 BROWSERBASE_API_KEY=                               # Optional, Browserbase
 BROWSERBASE_PROJECT_ID=                            # Optional, Browserbase
 LINKEDIN_EMAIL=                                    # Optional, LinkedIn scraping
 LINKEDIN_PASSWORD=                                 # Optional, LinkedIn scraping
+HIBP_API_KEY=                                      # Optional, HaveIBeenPwned API
+SHODAN_API_KEY=                                    # Optional, Shodan API
 X_TEST_USERNAME=                                   # Optional, test helper
 ```
 
@@ -170,6 +173,31 @@ if __name__ == "__main__":
     main()
 ```
 
+### Built-in Kali OSINT preset
+
+Set `MCP_TOOLSET=kali-osint` to auto-register a curated CLI wrapper set (no `MCP_PYTHON_TOOLS` JSON required):
+
+- `osint_sherlock_username`
+- `osint_maigret_username`
+- `osint_holehe_email`
+- `osint_hibp_email` (requires `HIBP_API_KEY`)
+- `osint_theharvester_email_domain`
+- `osint_reconng_domain`
+- `osint_spiderfoot_scan`
+- `osint_amass_domain`
+- `osint_sublist3r_domain`
+- `osint_dnsdumpster_domain`
+- `osint_shodan_host` (requires `SHODAN_API_KEY`)
+- `osint_whatweb_target`
+- `osint_exiftool_extract`
+- `osint_phoneinfoga_number`
+- `osint_whatsmyname_username`
+- `osint_maltego_manual` (manual handoff placeholder)
+- `osint_foca_manual` (manual handoff placeholder)
+
+The preset routes all tools through:
+`apps/mcp-server/src/tools/tools_python/osint_tool_runner.py`.
+
 ## Running
 
 ### Development
@@ -180,6 +208,11 @@ yarn dev
 ### Production (Docker)
 ```bash
 docker compose up mcp-server
+```
+
+### Dual server setup (normal + kali tools)
+```bash
+docker compose up mcp-server mcp-server-kali
 ```
 
 ## Test: Graph Ingest Tool

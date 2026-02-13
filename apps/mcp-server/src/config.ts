@@ -46,5 +46,6 @@ export const cfg = {
   python: {
     bin: process.env.PYTHON_BIN ?? "python3",
     toolsJson: process.env.MCP_PYTHON_TOOLS ?? "[]",
+    toolset: process.env.MCP_TOOLSET ?? "default",
   }
 };

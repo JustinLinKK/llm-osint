@@ -4,17 +4,31 @@ import { pool } from "../clients/pg.js";
 import { minio, ensureBucket } from "../clients/minio.js";
 import { cfg } from "../config.js";
 import { emitEvent } from "./events.js";
+import { launchLangGraphRun } from "./langgraph.js";
 
 export type Seed = { type: string; value: string };
 
+function deriveRunTitle(prompt: string): string {
+  const normalized = prompt.trim().replace(/\s+/g, " ");
+  if (!normalized) return "Untitled investigation";
+  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+}
+
 export async function createRun(prompt: string, seeds: Seed[] = [], constraints: Record<string, unknown> = {}) {
   const runId = uuidv4();
+  const title = deriveRunTitle(prompt);
   await pool.query(
-    `INSERT INTO runs(run_id, prompt, seeds, constraints, status)
-     VALUES ($1, $2, $3::jsonb, $4::jsonb, 'created')`,
-    [runId, prompt, JSON.stringify(seeds), JSON.stringify(constraints)]
+    `INSERT INTO runs(run_id, title, prompt, seeds, constraints, status)
+     VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'created')`,
+    [runId, title, prompt, JSON.stringify(seeds), JSON.stringify(constraints)]
   );
-  await emitEvent(runId, "RUN_CREATED", { prompt, seeds, constraints });
+  await emitEvent(runId, "RUN_CREATED", { title, prompt, seeds, constraints });
+  void launchLangGraphRun({ runId, prompt }).catch(async (error) => {
+    await emitEvent(runId, "RUN_FAILED", {
+      phase: "launch",
+      error: error instanceof Error ? error.message : "Unknown launch error"
+    });
+  });
   return runId;
 }
 

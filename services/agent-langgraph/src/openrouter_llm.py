@@ -125,3 +125,52 @@ class OpenRouterLLM:
         if isinstance(refined, dict):
             return refined
         return arguments
+
+    def generate_run_title(self, prompt: str, inputs: List[str]) -> str | None:
+        system = (
+            "You generate concise investigation titles. "
+            "Return JSON only with schema: {\"title\":\"string\"}. "
+            "Rules: 4-10 words, specific, no quotes, no trailing period."
+        )
+        user = {
+            "prompt": prompt,
+            "inputs": inputs[:8],
+        }
+
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user)},
+            ],
+            "temperature": 0.2,
+        }
+
+        response = requests.post(
+            f"{self._base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            data=json.dumps(payload),
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        content = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "{}")
+        )
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+        title = parsed.get("title") if isinstance(parsed, dict) else None
+        if not isinstance(title, str):
+            return None
+        normalized = " ".join(title.strip().split())
+        if not normalized:
+            return None
+        return normalized[:160]

@@ -7,7 +7,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol
 
 import requests
 
@@ -21,6 +21,17 @@ class McpCallResult:
     ok: bool
     content: Dict[str, Any]
     raw: Dict[str, Any]
+
+
+class McpClientProtocol(Protocol):
+    def start(self) -> None:
+        ...
+
+    def close(self) -> None:
+        ...
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> McpCallResult:
+        ...
 
 
 class StdioMcpClient:
@@ -250,3 +261,90 @@ class StreamableHttpMcpClient:
             "params": {},
         }
         self._post(notification, include_session=True, include_protocol=True)
+
+
+def _load_tool_server_map() -> Dict[str, str]:
+    default_map = {
+        "fetch_url": "normal",
+        "ingest_text": "normal",
+        "ingest_graph_entity": "normal",
+        "ingest_graph_entities": "normal",
+        "ingest_graph_relations": "normal",
+        "osint_sherlock_username": "kali",
+        "osint_maigret_username": "kali",
+        "osint_whatsmyname_username": "kali",
+        "osint_holehe_email": "kali",
+        # Disabled by default (requires API key).
+        # HIBP key: https://haveibeenpwned.com/API/Key
+        # "osint_hibp_email": "kali",
+        "osint_theharvester_email_domain": "kali",
+        "osint_reconng_domain": "kali",
+        "osint_spiderfoot_scan": "kali",
+        "osint_amass_domain": "kali",
+        "osint_sublist3r_domain": "kali",
+        "osint_dnsdumpster_domain": "kali",
+        "osint_maltego_manual": "kali",
+        "osint_foca_manual": "kali",
+        # Disabled by default (requires API key).
+        # Shodan key: https://account.shodan.io/
+        # "osint_shodan_host": "kali",
+        "osint_whatweb_target": "kali",
+        "osint_exiftool_extract": "kali",
+        "osint_phoneinfoga_number": "kali",
+    }
+    raw = os.getenv("MCP_TOOL_SERVER_MAP")
+    if not raw:
+        return default_map
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.error("Invalid MCP_TOOL_SERVER_MAP JSON; using defaults")
+        return default_map
+    if not isinstance(parsed, dict):
+        logger.error("MCP_TOOL_SERVER_MAP must be a JSON object; using defaults")
+        return default_map
+    merged = dict(default_map)
+    for key, value in parsed.items():
+        if isinstance(key, str) and isinstance(value, str) and value in {"normal", "kali"}:
+            merged[key] = value
+    return merged
+
+
+class RoutedMcpClient:
+    def __init__(self) -> None:
+        normal_url = os.getenv("MCP_SERVER_URL", "http://mcp-server:3001/mcp")
+        kali_url = os.getenv("MCP_SERVER_KALI_URL", "http://mcp-server-kali:3002/mcp")
+        self._clients: Dict[str, StreamableHttpMcpClient] = {
+            "normal": StreamableHttpMcpClient(server_url=normal_url),
+            "kali": StreamableHttpMcpClient(server_url=kali_url),
+        }
+        self._tool_server_map = _load_tool_server_map()
+        self._started_servers: set[str] = set()
+
+    def start(self) -> None:
+        # Keep startup lightweight; connect lazily per route.
+        return
+
+    def close(self) -> None:
+        for server_name in list(self._started_servers):
+            client = self._clients.get(server_name)
+            if client is not None:
+                client.close()
+        self._started_servers.clear()
+
+    def call_tool(self, name: str, arguments: Dict[str, Any]) -> McpCallResult:
+        server_name = self._tool_server_map.get(name, "normal")
+        client = self._clients.get(server_name)
+        if client is None:
+            return McpCallResult(
+                ok=False,
+                content={"error": f"No MCP client configured for server '{server_name}'"},
+                raw={},
+            )
+        if server_name not in self._started_servers:
+            client.start()
+            self._started_servers.add(server_name)
+            logger.info("MCP route started", extra={"tool": name, "server": server_name})
+
+        logger.info("MCP tool routed", extra={"tool": name, "server": server_name})
+        return client.call_tool(name, arguments)

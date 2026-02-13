@@ -1,0 +1,104 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #020617;
+}
+
+.grid-bg {
+  background-image: linear-gradient(rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+  background-size: 36px 36px;
+}
+
+.prompt-composer .prompt-textarea textarea,
+.prompt-composer .prompt-textarea [data-slot="input"] {
+  background: transparent !important;
+  color: rgb(207 250 254);
+  resize: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.5) rgba(2, 6, 23, 0.9);
+}
+
+.prompt-composer .prompt-textarea [data-slot="input-wrapper"],
+.prompt-composer .prompt-textarea [data-slot="inner-wrapper"] {
+  background: rgb(2 6 23) !important;
+}
+
+.prompt-composer .prompt-textarea [data-slot="input-wrapper"] {
+  border: 1px solid rgba(103, 232, 249, 0.35) !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+.prompt-composer .prompt-textarea [data-slot="input-wrapper"][data-focus="true"] {
+  border-color: rgba(165, 243, 252, 0.7) !important;
+}
+
+.prompt-composer .prompt-textarea textarea::-webkit-resizer {
+  background: transparent;
+}
+
+.prompt-composer .prompt-textarea textarea::-webkit-scrollbar {
+  width: 10px;
+}
+
+.prompt-composer .prompt-textarea textarea::-webkit-scrollbar-track {
+  background: rgba(2, 6, 23, 0.92);
+  border-left: 1px solid rgba(34, 211, 238, 0.2);
+}
+
+.prompt-composer .prompt-textarea textarea::-webkit-scrollbar-thumb {
+  background: linear-gradient(to bottom, rgba(34, 211, 238, 0.55), rgba(14, 116, 144, 0.75));
+  border-radius: 999px;
+  border: 2px solid rgba(2, 6, 23, 0.92);
+}
+
+.prompt-composer .prompt-textarea textarea::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(to bottom, rgba(103, 232, 249, 0.65), rgba(6, 182, 212, 0.85));
+}
+
+.themed-scroll,
+.themed-scroll * {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(34, 211, 238, 0.5) rgba(2, 6, 23, 0.9);
+}
+
+.themed-scroll::-webkit-scrollbar,
+.themed-scroll *::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.themed-scroll::-webkit-scrollbar-track,
+.themed-scroll *::-webkit-scrollbar-track {
+  background: rgba(2, 6, 23, 0.92);
+  border-left: 1px solid rgba(34, 211, 238, 0.2);
+}
+
+.themed-scroll::-webkit-scrollbar-thumb,
+.themed-scroll *::-webkit-scrollbar-thumb {
+  background: linear-gradient(to bottom, rgba(34, 211, 238, 0.55), rgba(14, 116, 144, 0.75));
+  border-radius: 999px;
+  border: 2px solid rgba(2, 6, 23, 0.92);
+}
+
+.themed-scroll::-webkit-scrollbar-thumb:hover,
+.themed-scroll *::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(to bottom, rgba(103, 232, 249, 0.65), rgba(6, 182, 212, 0.85));
+}

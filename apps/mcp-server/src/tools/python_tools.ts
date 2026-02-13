@@ -37,7 +37,124 @@ const configSchema = z.array(
   })
 );
 
+function kaliOsintToolPreset(): PythonToolConfig[] {
+  const runnerPath = "apps/mcp-server/src/tools/tools_python/osint_tool_runner.py";
+  return [
+    {
+      name: "osint_sherlock_username",
+      description: "Enumerate username presence across social platforms with Sherlock",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    {
+      name: "osint_maigret_username",
+      description: "Deep username profiling with Maigret metadata",
+      scriptPath: runnerPath,
+      timeoutMs: 240000,
+    },
+    {
+      name: "osint_holehe_email",
+      description: "Check service registrations linked to an email with holehe",
+      scriptPath: runnerPath,
+      timeoutMs: 120000,
+    },
+    {
+      name: "osint_theharvester_email_domain",
+      description: "Harvest emails, names, and hosts for a domain via theHarvester",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    {
+      name: "osint_amass_domain",
+      description: "Perform passive domain intel and subdomain enumeration with Amass",
+      scriptPath: runnerPath,
+      timeoutMs: 240000,
+    },
+    {
+      name: "osint_sublist3r_domain",
+      description: "Discover subdomains with Sublist3r",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    {
+      name: "osint_whatweb_target",
+      description: "Fingerprint web technologies used by a target with WhatWeb",
+      scriptPath: runnerPath,
+      timeoutMs: 120000,
+    },
+    {
+      name: "osint_exiftool_extract",
+      description: "Extract EXIF/metadata from a local file with ExifTool",
+      scriptPath: runnerPath,
+      timeoutMs: 60000,
+    },
+    {
+      name: "osint_phoneinfoga_number",
+      description: "Collect phone number intelligence with PhoneInfoga",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    {
+      name: "osint_reconng_domain",
+      description: "Run Recon-ng modules for domain/entity profiling",
+      scriptPath: runnerPath,
+      timeoutMs: 240000,
+    },
+    {
+      name: "osint_spiderfoot_scan",
+      description: "Run SpiderFoot scan for target footprint expansion",
+      scriptPath: runnerPath,
+      timeoutMs: 300000,
+    },
+    {
+      name: "osint_whatsmyname_username",
+      description: "Cross-platform username checks using WhatsMyName data",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    // Disabled by default (requires API key).
+    // HIBP key: https://haveibeenpwned.com/API/Key
+    // {
+    //   name: "osint_hibp_email",
+    //   description: "Check email exposure in breaches via Have I Been Pwned API",
+    //   scriptPath: runnerPath,
+    //   timeoutMs: 120000,
+    // },
+    // Disabled by default (requires API key).
+    // Shodan key: https://account.shodan.io/
+    // {
+    //   name: "osint_shodan_host",
+    //   description: "Look up exposed services for an IP via Shodan API",
+    //   scriptPath: runnerPath,
+    //   timeoutMs: 120000,
+    // },
+    {
+      name: "osint_dnsdumpster_domain",
+      description: "Passive DNS and host mapping via DNSDumpster client",
+      scriptPath: runnerPath,
+      timeoutMs: 180000,
+    },
+    {
+      name: "osint_maltego_manual",
+      description: "Manual Maltego transform placeholder (GUI workflow)",
+      scriptPath: runnerPath,
+      timeoutMs: 60000,
+    },
+    {
+      name: "osint_foca_manual",
+      description: "Manual FOCA workflow placeholder (Windows GUI workflow)",
+      scriptPath: runnerPath,
+      timeoutMs: 60000,
+    },
+  ];
+}
+
 function parsePythonToolConfig(): PythonToolConfig[] {
+  const toolset = (cfg.python.toolset || "default").toLowerCase();
+  if (toolset === "kali-osint") {
+    return kaliOsintToolPreset();
+  }
+
   if (!cfg.python.toolsJson) return [];
 
   try {
