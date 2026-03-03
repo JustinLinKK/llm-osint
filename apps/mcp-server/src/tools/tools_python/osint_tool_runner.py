@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import re
 import shutil
 import subprocess
 import sys
@@ -11,7 +13,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+REPO_ROOT = Path(__file__).resolve().parents[5]
 
 
 def _run_cmd(cmd: List[str], timeout_seconds: int) -> Dict[str, Any]:
@@ -29,11 +34,27 @@ def _run_cmd(cmd: List[str], timeout_seconds: int) -> Dict[str, Any]:
     }
 
 
-def _require_cmd(name: str) -> str:
-    path = shutil.which(name)
-    if not path:
-        raise RuntimeError(f"Required command not found in PATH: {name}")
-    return path
+def _find_cmd(candidates: List[str]) -> Optional[str]:
+    for name in candidates:
+        path = shutil.which(name)
+        if path:
+            return path
+
+        # In our Kali container, many tools are installed in this virtualenv.
+        venv_cmd = Path("/opt/osint-venv/bin") / name
+        if venv_cmd.exists() and os.access(venv_cmd, os.X_OK):
+            return str(venv_cmd)
+    return None
+
+
+def _require_cmd(name: str, aliases: Optional[List[str]] = None) -> str:
+    candidates = [name]
+    if aliases:
+        candidates.extend(aliases)
+    path = _find_cmd(candidates)
+    if path:
+        return path
+    raise RuntimeError(f"Required command not found in PATH: {name}")
 
 
 def _payload_error(error: str) -> Dict[str, Any]:
@@ -56,18 +77,74 @@ def _http_get_json(url: str, headers: Dict[str, str] | None = None, timeout_seco
     return json.loads(body)
 
 
+def _resolve_input_path(raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+
+    if not candidate.is_absolute():
+        repo_candidate = (REPO_ROOT / candidate).resolve()
+        if repo_candidate.exists():
+            return repo_candidate
+
+    # When caller passes host workspace paths, remap them to /app paths in container.
+    raw = str(candidate)
+    marker = "/workspaces/llm-osint/"
+    if marker in raw:
+        suffix = raw.split(marker, 1)[1]
+        mapped = (REPO_ROOT / suffix).resolve()
+        if mapped.exists():
+            return mapped
+
+    raise RuntimeError(
+        f"File not found: {candidate}. "
+        "If calling from outside the container, pass a path under the repo (e.g. apps/...)."
+    )
+
+
+def _query_crtsh_subdomains(domain: str, timeout_seconds: int = 30) -> List[str]:
+    url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
+    try:
+        payload = _http_get_json(url, timeout_seconds=timeout_seconds)
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    names: set[str] = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw = item.get("name_value")
+        if not isinstance(raw, str):
+            continue
+        for part in raw.splitlines():
+            host = part.strip().lower()
+            if not host:
+                continue
+            host = host.removeprefix("*.").rstrip(".")
+            if host == domain or host.endswith(f".{domain}"):
+                names.add(host)
+    return sorted(names)[:5000]
+
+
+def _extract_emails(text: str, domain: str) -> List[str]:
+    pattern = re.compile(r"[A-Za-z0-9._%+-]+@" + re.escape(domain) + r"\b")
+    found = {m.group(0).lower() for m in pattern.finditer(text)}
+    return sorted(found)[:2000]
+
+
 def _tool_sherlock(input_data: Dict[str, Any]) -> Dict[str, Any]:
     username = str(input_data.get("username", "")).strip().lstrip("@")
     if not username:
         raise RuntimeError("Missing required input: username")
 
-    _require_cmd("sherlock")
+    sherlock_cmd = _require_cmd("sherlock")
     with tempfile.TemporaryDirectory() as tmpdir:
         out_dir = Path(tmpdir) / "sherlock"
         out_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
-            "sherlock",
+            sherlock_cmd,
             username,
             "--print-found",
             "--folderoutput",
@@ -97,29 +174,33 @@ def _tool_maigret(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not username:
         raise RuntimeError("Missing required input: username")
 
-    _require_cmd("maigret")
+    maigret_cmd = _require_cmd("maigret")
     with tempfile.TemporaryDirectory() as tmpdir:
-        json_file = Path(tmpdir) / "maigret.json"
-        txt_file = Path(tmpdir) / "maigret.txt"
+        out_dir = Path(tmpdir) / "maigret"
+        out_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
-            "maigret",
+            maigret_cmd,
             username,
+            "--folderoutput",
+            str(out_dir),
             "--json",
-            str(json_file),
+            "simple",
             "--txt",
-            str(txt_file),
+            "--no-progressbar",
         ]
         result = _run_cmd(cmd, timeout_seconds=240)
         parsed = None
-        if json_file.exists():
+        json_files = sorted(out_dir.glob("*.json"))
+        if json_files:
             try:
-                parsed = _read_json_file(json_file)
+                parsed = _read_json_file(json_files[0])
             except Exception:
                 parsed = None
         return {
             "command": cmd,
             "returncode": result["returncode"],
             "parsed": parsed,
+            "outputFiles": [str(p) for p in out_dir.glob("*") if p.is_file()],
             "stdout": result["stdout"][:20000],
             "stderr": result["stderr"][:10000],
         }
@@ -130,8 +211,8 @@ def _tool_holehe(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not email:
         raise RuntimeError("Missing required input: email")
 
-    _require_cmd("holehe")
-    cmd = ["holehe", email, "--only-used"]
+    holehe_cmd = _require_cmd("holehe")
+    cmd = [holehe_cmd, email, "--only-used"]
     result = _run_cmd(cmd, timeout_seconds=120)
     used = []
     for line in result["stdout"].splitlines():
@@ -155,32 +236,86 @@ def _tool_theharvester(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not domain:
         raise RuntimeError("Missing required input: domain")
 
-    _require_cmd("theHarvester")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        out_base = str(Path(tmpdir) / "theharvester")
-        cmd = [
-            "theHarvester",
-            "-d",
-            domain,
-            "-b",
-            source,
-            "-l",
-            str(limit),
-            "-f",
-            out_base,
-        ]
-        result = _run_cmd(cmd, timeout_seconds=180)
-        generated = [str(p) for p in Path(tmpdir).glob("*") if p.is_file()]
-        return {
-            "command": cmd,
-            "returncode": result["returncode"],
-            "domain": domain,
-            "source": source,
-            "limit": limit,
-            "generatedFiles": generated,
-            "stdout": result["stdout"][:30000],
-            "stderr": result["stderr"][:10000],
-        }
+    tool_cmd = _find_cmd(["theHarvester", "theHarvester.py", "theharvester"])
+    venv_harvester = Path("/opt/osint-venv/bin/theHarvester")
+    if (
+        tool_cmd
+        and "/usr/local/bin/" in tool_cmd
+        and venv_harvester.exists()
+        and os.access(venv_harvester, os.X_OK)
+    ):
+        tool_cmd = str(venv_harvester)
+    if tool_cmd:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_base = str(Path(tmpdir) / "theharvester")
+            cmd = [
+                tool_cmd,
+                "-d",
+                domain,
+                "-b",
+                source,
+                "-l",
+                str(limit),
+                "-f",
+                out_base,
+            ]
+            result = _run_cmd(cmd, timeout_seconds=180)
+            generated = [str(p) for p in Path(tmpdir).glob("*") if p.is_file()]
+            response = {
+                "command": cmd,
+                "returncode": result["returncode"],
+                "domain": domain,
+                "source": source,
+                "limit": limit,
+                "generatedFiles": generated,
+                "stdout": result["stdout"][:30000],
+                "stderr": result["stderr"][:10000],
+            }
+            # Broken wrapper path from older images: retry with venv script.
+            if (
+                result["returncode"] != 0
+                and "/opt/theHarvester/theHarvester.py" in result["stderr"]
+                and venv_harvester.exists()
+                and os.access(venv_harvester, os.X_OK)
+                and str(venv_harvester) != tool_cmd
+            ):
+                retry_cmd = [
+                    str(venv_harvester),
+                    "-d",
+                    domain,
+                    "-b",
+                    source,
+                    "-l",
+                    str(limit),
+                    "-f",
+                    out_base,
+                ]
+                retry_result = _run_cmd(retry_cmd, timeout_seconds=180)
+                response = {
+                    "command": retry_cmd,
+                    "returncode": retry_result["returncode"],
+                    "domain": domain,
+                    "source": source,
+                    "limit": limit,
+                    "generatedFiles": generated,
+                    "stdout": retry_result["stdout"][:30000],
+                    "stderr": retry_result["stderr"][:10000],
+                }
+            return response
+
+    # Fallback: passive CT search when CLI is missing.
+    subdomains = _query_crtsh_subdomains(domain)
+    return {
+        "supported": True,
+        "fallback": "crtsh",
+        "domain": domain,
+        "source": source,
+        "limit": limit,
+        "subdomainCount": len(subdomains),
+        "subdomains": subdomains[:5000],
+        "emails": [],
+        "warning": "theHarvester command is not installed; returned passive crt.sh results.",
+    }
 
 
 def _tool_amass(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -189,38 +324,48 @@ def _tool_amass(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not domain:
         raise RuntimeError("Missing required input: domain")
 
-    _require_cmd("amass")
-    with tempfile.TemporaryDirectory() as tmpdir:
-        json_out = Path(tmpdir) / "amass.json"
-        cmd = ["amass", "enum", "-d", domain, "-json", str(json_out)]
-        if passive:
-            cmd.insert(2, "-passive")
-        result = _run_cmd(cmd, timeout_seconds=240)
-        entries: List[Dict[str, Any]] = []
-        if json_out.exists():
-            for line in json_out.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        names = []
-        for item in entries:
-            name = item.get("name")
-            if isinstance(name, str):
-                names.append(name)
-        return {
-            "command": cmd,
-            "returncode": result["returncode"],
-            "domain": domain,
-            "passive": passive,
-            "subdomainCount": len(names),
-            "subdomains": sorted(set(names))[:5000],
-            "stdout": result["stdout"][:20000],
-            "stderr": result["stderr"][:10000],
-        }
+    amass_cmd = _find_cmd(["amass"])
+    if amass_cmd:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            txt_out = Path(tmpdir) / "amass.txt"
+            cmd_base = [amass_cmd, "enum", "-d", domain]
+            if passive:
+                cmd_base.insert(2, "-passive")
+            cmd = cmd_base + ["-o", str(txt_out)]
+            result = _run_cmd(cmd, timeout_seconds=240)
+            names = []
+            if txt_out.exists():
+                for line in txt_out.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    host = line.strip().lower().rstrip(".")
+                    if host and (host == domain or host.endswith(f".{domain}")):
+                        names.append(host)
+            # Some versions print results to stdout even when -o fails silently.
+            for line in result["stdout"].splitlines():
+                host = line.strip().lower().rstrip(".")
+                if host and (host == domain or host.endswith(f".{domain}")):
+                    names.append(host)
+            return {
+                "command": cmd,
+                "returncode": result["returncode"],
+                "domain": domain,
+                "passive": passive,
+                "subdomainCount": len(names),
+                "subdomains": sorted(set(names))[:5000],
+                "warning": "",
+                "stdout": result["stdout"][:20000],
+                "stderr": result["stderr"][:10000],
+            }
+
+    subdomains = _query_crtsh_subdomains(domain)
+    return {
+        "supported": True,
+        "fallback": "crtsh",
+        "domain": domain,
+        "passive": passive,
+        "subdomainCount": len(subdomains),
+        "subdomains": subdomains[:5000],
+        "warning": "amass command is not installed; returned passive crt.sh results.",
+    }
 
 
 def _tool_sublist3r(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -228,11 +373,11 @@ def _tool_sublist3r(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not domain:
         raise RuntimeError("Missing required input: domain")
 
-    _require_cmd("sublist3r")
+    sublist3r_cmd = _require_cmd("sublist3r")
     with tempfile.TemporaryDirectory() as tmpdir:
         out_file = Path(tmpdir) / "subdomains.txt"
         cmd = [
-            "sublist3r",
+            sublist3r_cmd,
             "-d",
             domain,
             "-o",
@@ -262,10 +407,10 @@ def _tool_whatweb(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not target:
         raise RuntimeError("Missing required input: target")
 
-    _require_cmd("whatweb")
+    whatweb_cmd = _require_cmd("whatweb")
     with tempfile.TemporaryDirectory() as tmpdir:
         json_file = Path(tmpdir) / "whatweb.json"
-        cmd = ["whatweb", target, "--log-json", str(json_file)]
+        cmd = [whatweb_cmd, target, "--log-json", str(json_file)]
         result = _run_cmd(cmd, timeout_seconds=120)
         parsed = None
         if json_file.exists():
@@ -285,22 +430,32 @@ def _tool_whatweb(input_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def _tool_exiftool(input_data: Dict[str, Any]) -> Dict[str, Any]:
     path = str(input_data.get("path", "")).strip()
-    if not path:
-        raise RuntimeError("Missing required input: path")
+    content_b64 = str(input_data.get("contentBase64", "")).strip()
+    if not path and not content_b64:
+        raise RuntimeError("Missing required input: path or contentBase64")
 
-    resolved = Path(path).resolve()
-    if not resolved.exists():
-        raise RuntimeError(f"File not found: {resolved}")
+    temp_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+    if path:
+        resolved = _resolve_input_path(path)
+    else:
+        try:
+            payload = base64.b64decode(content_b64, validate=True)
+        except Exception:
+            raise RuntimeError("contentBase64 is not valid base64 data")
+        temp_dir = tempfile.TemporaryDirectory()
+        filename = str(input_data.get("filename", "input.bin")).strip() or "input.bin"
+        resolved = Path(temp_dir.name) / filename
+        resolved.write_bytes(payload)
 
-    _require_cmd("exiftool")
-    cmd = ["exiftool", "-json", str(resolved)]
+    exiftool_cmd = _require_cmd("exiftool")
+    cmd = [exiftool_cmd, "-json", str(resolved)]
     result = _run_cmd(cmd, timeout_seconds=60)
     parsed = None
     try:
         parsed = json.loads(result["stdout"])
     except Exception:
         parsed = None
-    return {
+    response = {
         "command": cmd,
         "returncode": result["returncode"],
         "path": str(resolved),
@@ -308,6 +463,9 @@ def _tool_exiftool(input_data: Dict[str, Any]) -> Dict[str, Any]:
         "stdout": result["stdout"][:20000],
         "stderr": result["stderr"][:10000],
     }
+    if temp_dir is not None:
+        temp_dir.cleanup()
+    return response
 
 
 def _tool_phoneinfoga(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -315,15 +473,29 @@ def _tool_phoneinfoga(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not number:
         raise RuntimeError("Missing required input: number")
 
-    _require_cmd("phoneinfoga")
-    cmd = ["phoneinfoga", "scan", "-n", number]
-    result = _run_cmd(cmd, timeout_seconds=180)
+    phoneinfoga_cmd = _find_cmd(["phoneinfoga"])
+    if phoneinfoga_cmd:
+        cmd = [phoneinfoga_cmd, "scan", "-n", number]
+        result = _run_cmd(cmd, timeout_seconds=180)
+        return {
+            "command": cmd,
+            "returncode": result["returncode"],
+            "number": number,
+            "stdout": result["stdout"][:30000],
+            "stderr": result["stderr"][:10000],
+        }
+
+    digits = "".join(ch for ch in number if ch.isdigit())
+    e164_guess = f"+{digits}" if digits else number
     return {
-        "command": cmd,
-        "returncode": result["returncode"],
+        "supported": False,
         "number": number,
-        "stdout": result["stdout"][:30000],
-        "stderr": result["stderr"][:10000],
+        "normalized": e164_guess,
+        "warning": "phoneinfoga command is not installed in this container.",
+        "nextSteps": [
+            "Install phoneinfoga binary in the kali image.",
+            "Re-run this tool for carrier/OSINT enrichment.",
+        ],
     }
 
 
@@ -332,44 +504,81 @@ def _tool_reconng(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not domain:
         raise RuntimeError("Missing required input: domain")
 
-    _require_cmd("recon-ng")
+    recon_cmd = _find_cmd(["recon-ng"])
     module = str(input_data.get("module", "recon/domains-hosts/hackertarget")).strip() or "recon/domains-hosts/hackertarget"
     source = str(input_data.get("source", domain)).strip() or domain
+    if recon_cmd:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = "ws_osint"
+            resource_path = Path(tmpdir) / "recon-ng.rc"
+            script = "\n".join(
+                [
+                    f"workspaces create {workspace}",
+                    f"workspaces select {workspace}",
+                    f"modules load {module}",
+                    f"options set SOURCE {source}",
+                    "run",
+                    "show hosts",
+                    "show contacts",
+                    "show credentials",
+                    "exit",
+                ]
+            )
+            resource_path.write_text(script, encoding="utf-8")
+            cmd = [recon_cmd, "-r", str(resource_path)]
+            result = _run_cmd(cmd, timeout_seconds=240)
+            stdout = result["stdout"]
+            if (
+                "Invalid module name" in stdout
+                or "No modules enabled/installed" in stdout
+                or "Invalid option name" in stdout
+            ):
+                # Module marketplace isn't initialized; fall back to passive data.
+                result = {"returncode": result["returncode"], "stdout": stdout, "stderr": result["stderr"]}
+            else:
+                return {
+                    "command": cmd,
+                    "returncode": result["returncode"],
+                    "domain": domain,
+                    "module": module,
+                    "stdout": stdout[:40000],
+                    "stderr": result["stderr"][:10000],
+                }
+            # fall through to whois+dig fallback with warning below
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        workspace = "ws_osint"
-        resource_path = Path(tmpdir) / "recon-ng.rc"
-        script = "\n".join(
-            [
-                f"workspaces create {workspace}",
-                f"workspaces select {workspace}",
-                f"modules load {module}",
-                f"options set SOURCE {source}",
-                "run",
-                "show hosts",
-                "show contacts",
-                "show credentials",
-                "exit",
-            ]
-        )
-        resource_path.write_text(script, encoding="utf-8")
-        cmd = ["recon-ng", "-r", str(resource_path)]
-        result = _run_cmd(cmd, timeout_seconds=240)
-        return {
-            "command": cmd,
-            "returncode": result["returncode"],
-            "domain": domain,
-            "module": module,
-            "stdout": result["stdout"][:40000],
-            "stderr": result["stderr"][:10000],
-        }
+    whois_cmd = _find_cmd(["whois"])
+    dig_cmd = _find_cmd(["dig"])
+    whois_text = ""
+    if whois_cmd:
+        whois_res = _run_cmd([whois_cmd, domain], timeout_seconds=30)
+        whois_text = whois_res["stdout"][:40000]
+    ns_records: List[str] = []
+    mx_records: List[str] = []
+    if dig_cmd:
+        ns_res = _run_cmd([dig_cmd, "+short", "NS", domain], timeout_seconds=20)
+        mx_res = _run_cmd([dig_cmd, "+short", "MX", domain], timeout_seconds=20)
+        ns_records = [line.strip() for line in ns_res["stdout"].splitlines() if line.strip()]
+        mx_records = [line.strip() for line in mx_res["stdout"].splitlines() if line.strip()]
+    return {
+        "supported": True,
+        "fallback": "whois+dig",
+        "domain": domain,
+        "module": module,
+        "whois_excerpt": whois_text,
+        "ns_records": ns_records[:100],
+        "mx_records": mx_records[:100],
+        "subdomains": _query_crtsh_subdomains(domain)[:1000],
+        "warning": "recon-ng module unavailable; returned passive fallback data.",
+    }
 
 
 def _find_spiderfoot_cmd() -> str:
-    for candidate in ("spiderfoot", "sf.py"):
-        path = shutil.which(candidate)
-        if path:
-            return path
+    found = _find_cmd(["spiderfoot", "sf.py"])
+    if found:
+        return found
+    sf_path = Path("/opt/spiderfoot/sf.py")
+    if sf_path.exists() and os.access(sf_path, os.X_OK):
+        return str(sf_path)
     raise RuntimeError("SpiderFoot command not found (expected spiderfoot or sf.py)")
 
 
@@ -383,47 +592,15 @@ def _tool_spiderfoot(input_data: Dict[str, Any]) -> Dict[str, Any]:
     else:
         module_str = str(modules).strip() or "sfp_dnsresolve,sfp_email,sfp_accounts"
 
-    cmd_name = _find_spiderfoot_cmd()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        output_file = Path(tmpdir) / "spiderfoot.json"
-        if cmd_name.endswith("sf.py"):
-            cmd = [
-                cmd_name,
-                "-s",
-                target,
-                "-m",
-                module_str,
-                "-o",
-                "json",
-                "-q",
-            ]
-        else:
-            cmd = [
-                cmd_name,
-                "-s",
-                target,
-                "-m",
-                module_str,
-                "-o",
-                "json",
-                "-q",
-            ]
-        result = _run_cmd(cmd, timeout_seconds=300)
-        parsed = None
-        try:
-            parsed = json.loads(result["stdout"])
-        except Exception:
-            parsed = None
-        return {
-            "command": cmd,
-            "returncode": result["returncode"],
-            "target": target,
-            "modules": module_str,
-            "parsed": parsed,
-            "rawOutputPath": str(output_file),
-            "stdout": result["stdout"][:40000],
-            "stderr": result["stderr"][:12000],
-        }
+    # SpiderFoot CLI behavior is unstable in this headless container; keep output deterministic.
+    return {
+        "supported": True,
+        "fallback": "passive_dns",
+        "target": target,
+        "modules": module_str,
+        "subdomains": _query_crtsh_subdomains(target)[:1000],
+        "warning": "SpiderFoot execution disabled in this container; returned passive DNS fallback.",
+    }
 
 
 def _tool_whatsmyname(input_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -431,8 +608,9 @@ def _tool_whatsmyname(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not username:
         raise RuntimeError("Missing required input: username")
 
-    max_sites = int(input_data.get("maxSites", 300))
-    timeout_seconds = int(input_data.get("timeoutSeconds", 8))
+    # Keep default latency bounded; this tool performs one HTTP request per site.
+    max_sites = int(input_data.get("maxSites", 40))
+    timeout_seconds = int(input_data.get("timeoutSeconds", 2))
     data_url = str(
         input_data.get(
             "dataUrl",
@@ -547,37 +725,23 @@ def _tool_dnsdumpster(input_data: Dict[str, Any]) -> Dict[str, Any]:
     if not domain:
         raise RuntimeError("Missing required input: domain")
 
-    cmd = shutil.which("dnsdumpster")
-    if cmd:
-        result = _run_cmd([cmd, domain], timeout_seconds=180)
-        return {
-            "command": [cmd, domain],
-            "returncode": result["returncode"],
-            "domain": domain,
-            "stdout": result["stdout"][:40000],
-            "stderr": result["stderr"][:12000],
-        }
-
-    try:
-        from dnsdumpster.DNSDumpsterAPI import DNSDumpsterAPI  # type: ignore
-    except Exception as exc:
-        raise RuntimeError(f"dnsdumpster library unavailable: {exc}")
-
-    api = DNSDumpsterAPI()
-    response = api.search(domain)
-    if not isinstance(response, dict):
-        raise RuntimeError("Invalid DNSDumpster response")
-    dns_records = response.get("dns_records", {}) if isinstance(response.get("dns_records"), dict) else {}
-    host_count = 0
-    for key in ("host", "dns", "mx", "txt"):
-        value = dns_records.get(key)
-        if isinstance(value, list):
-            host_count += len(value)
+    # Keep deterministic passive fallback to avoid no-output failures from CLI/library variants.
+    dig_cmd = _find_cmd(["dig"])
+    ns_records: List[str] = []
+    mx_records: List[str] = []
+    if dig_cmd:
+        ns_res = _run_cmd([dig_cmd, "+short", "NS", domain], timeout_seconds=20)
+        mx_res = _run_cmd([dig_cmd, "+short", "MX", domain], timeout_seconds=20)
+        ns_records = [line.strip() for line in ns_res["stdout"].splitlines() if line.strip()]
+        mx_records = [line.strip() for line in mx_res["stdout"].splitlines() if line.strip()]
     return {
+        "supported": True,
+        "fallback": "dig+crtsh",
         "domain": domain,
-        "recordGroups": list(dns_records.keys()),
-        "recordCountApprox": host_count,
-        "dns_records": dns_records,
+        "ns_records": ns_records[:100],
+        "mx_records": mx_records[:100],
+        "subdomains": _query_crtsh_subdomains(domain)[:1000],
+        "warning": "dnsdumpster CLI/library disabled; returned passive DNS fallback.",
     }
 
 

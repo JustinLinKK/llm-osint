@@ -7,12 +7,10 @@ import {
   Chip,
   ScrollShadow,
   Spinner,
-  Tab,
-  Tabs,
   Textarea
 } from "@heroui/react";
 
-type ViewMode = "chat" | "evidence";
+type ViewMode = "chat" | "report" | "evidence";
 type EvidenceView = "files" | "graph";
 
 type RunSummary = {
@@ -31,6 +29,8 @@ type RunEvent = {
   ts: string;
   payload: Record<string, unknown>;
 };
+
+type EventChipColor = "default" | "primary" | "secondary" | "success" | "warning" | "danger";
 
 type RunFile = {
   documentId: string;
@@ -53,6 +53,7 @@ type GraphNode = {
   id: string;
   labels: string[];
   display: string;
+  properties?: Record<string, unknown>;
 };
 
 type GraphEdge = {
@@ -60,6 +61,57 @@ type GraphEdge = {
   source: string;
   target: string;
   type: string;
+  display?: string;
+  properties?: Record<string, unknown>;
+};
+
+type ReportPayload = {
+  reportId: string;
+  runId: string;
+  status: string;
+  createdAt: string;
+  markdown: string | null;
+  json: {
+    reportType?: string;
+    qualityOk?: boolean;
+    refineRound?: number;
+    finalReport?: string;
+    evidenceAppendix?: string;
+    sectionDrafts?: Array<{
+      sectionId: string;
+      sectionOrder: number;
+      title: string;
+      content: string;
+      citationKeys: string[];
+      createdAt: string;
+    }>;
+    claimLedger?: Array<{
+      claimId: string;
+      sectionId: string;
+      text: string;
+      confidence: number;
+      impact: string;
+      evidenceKeys: string[];
+      conflictFlags: string[];
+      createdAt: string;
+    }>;
+    evidenceRefs?: Array<{
+      citationKey: string;
+      sectionId: string;
+      documentId: string | null;
+      snippet: string;
+      sourceUrl: string | null;
+      score: number | null;
+      objectRef: Record<string, unknown>;
+      createdAt: string;
+    }>;
+  } | null;
+  citations?: Array<{
+    citationKey: string;
+    sectionId: string;
+    sourceUrl: string | null;
+    documentId: string | null;
+  }> | null;
 };
 
 const RUNS_STORAGE_KEY = "osint-ui-runs";
@@ -101,6 +153,74 @@ function selectExistingRunId(prev: string | null, items: RunSummary[]): string |
   return items[0]?.runId ?? null;
 }
 
+function classifyEventStage(eventType: string): { label: string; color: EventChipColor } {
+  const normalized = eventType.toUpperCase();
+
+  const customLabels: Record<string, { label: string; color: EventChipColor }> = {
+    PLANNER_STARTED: { label: "Planning", color: "warning" },
+    TOOLS_SELECTED: { label: "Tools Selected", color: "warning" },
+    TOOL_WORKER_STARTED: { label: "Tool Running", color: "warning" },
+    TOOL_RECEIPT_READY: { label: "Tool Complete", color: "warning" },
+    SYNTHESIS_STARTED: { label: "Stage 2: Synthesis", color: "secondary" },
+    REPORT_READY: { label: "Stage 2: Ready", color: "secondary" },
+    RUN_STARTED: { label: "Run Started", color: "primary" },
+    RUN_FINISHED: { label: "Run Finished", color: "success" },
+    RUN_FAILED: { label: "Run Failed", color: "danger" }
+  };
+
+  const exact = customLabels[normalized];
+  if (exact) return exact;
+
+  if (normalized.includes("FAIL") || normalized.includes("ERROR")) {
+    return { label: "Error", color: "danger" };
+  }
+
+  if (
+    normalized.includes("SYNTHESIS") ||
+    normalized.includes("REPORT") ||
+    normalized.includes("STAGE2") ||
+    normalized.includes("STAGE_2")
+  ) {
+    return { label: "Stage 2", color: "secondary" };
+  }
+
+  if (
+    normalized.includes("PLANNER") ||
+    normalized.includes("TOOL") ||
+    normalized.includes("PROCESS") ||
+    normalized.includes("CHUNK") ||
+    normalized.includes("EMBEDD") ||
+    normalized.includes("GRAPH")
+  ) {
+    return { label: "Stage 1", color: "warning" };
+  }
+
+  if (normalized.startsWith("RUN_")) {
+    return { label: "Run", color: "primary" };
+  }
+
+  return { label: "Event", color: "default" };
+}
+
+function buildReportFallback(report: ReportPayload | null): string {
+  const sectionDrafts = report?.json?.sectionDrafts ?? [];
+  if (!sectionDrafts.length) return "";
+
+  return sectionDrafts
+    .map((section) => {
+      const title = section.title?.trim() || section.sectionId;
+      const content = section.content?.trim() || "No content yet.";
+      return `${title}\n\n${content}`;
+    })
+    .join("\n\n---\n\n");
+}
+
+function truncateGraphLabel(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
 export default function App() {
   const [runs, setRuns] = useState<RunSummary[]>(() => loadRuns());
   const [selectedRunId, setSelectedRunId] = useState<string | null>(runs[0]?.runId ?? null);
@@ -115,7 +235,39 @@ export default function App() {
   const [isLoadingRun, setIsLoadingRun] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
+  const [isLoadingReport, setIsLoadingReport] = useState(false);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+  const [report, setReport] = useState<ReportPayload | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const graphNodeMap = useMemo(
+    () => new Map(graphNodes.map((node) => [node.id, node])),
+    [graphNodes]
+  );
+
+  const graphLayout = useMemo(() => {
+    const columnCount = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(Math.max(graphNodes.length, 1)))));
+    const rowCount = Math.max(1, Math.ceil(graphNodes.length / columnCount));
+    const xSpacing = 190;
+    const ySpacing = 150;
+    const startX = 110;
+    const startY = 85;
+
+    return {
+      width: Math.max(820, startX * 2 + (columnCount - 1) * xSpacing),
+      height: Math.max(320, startY * 2 + (rowCount - 1) * ySpacing),
+      positions: graphNodes.map((node, index) => ({
+        id: node.id,
+        x: startX + (index % columnCount) * xSpacing,
+        y: startY + Math.floor(index / columnCount) * ySpacing
+      }))
+    };
+  }, [graphNodes]);
+
+  const graphPositionMap = useMemo(
+    () => new Map(graphLayout.positions.map((position) => [position.id, position])),
+    [graphLayout]
+  );
 
   useEffect(() => {
     localStorage.setItem(RUNS_STORAGE_KEY, JSON.stringify(runs));
@@ -183,6 +335,7 @@ export default function App() {
     setFiles([]);
     setGraphNodes([]);
     setGraphEdges([]);
+    setReport(null);
     setErrorMessage(null);
     setIsLoadingRun(true);
 
@@ -349,6 +502,68 @@ export default function App() {
     }
   };
 
+  const deleteRun = async (runId: string) => {
+    setDeletingRunId(runId);
+    setErrorMessage(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/runs/${runId}`, { method: "DELETE" });
+      if (!res.ok) {
+        throw new Error(`Failed to delete run (${res.status})`);
+      }
+
+      setRuns((prev) => {
+        const next = prev.filter((run) => run.runId !== runId);
+        setSelectedRunId((current) => (current === runId ? (next[0]?.runId ?? null) : current));
+        return next;
+      });
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to delete run");
+    } finally {
+      setDeletingRunId((current) => (current === runId ? null : current));
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedRunId) return;
+
+    let disposed = false;
+
+    const loadReport = async () => {
+      setIsLoadingReport(true);
+      try {
+        const res = await fetch(`${API_BASE}/runs/${selectedRunId}/report`);
+        if (res.status === 404) {
+          if (!disposed) setReport(null);
+          return;
+        }
+        if (!res.ok) throw new Error("Failed to load report");
+        const payload = (await res.json()) as ReportPayload;
+        if (!disposed) setReport(payload);
+      } catch (error) {
+        if (!disposed) setErrorMessage(error instanceof Error ? error.message : "Failed to load report");
+      } finally {
+        if (!disposed) setIsLoadingReport(false);
+      }
+    };
+
+    if (selectedRun?.reportStatus || runIsFinished) {
+      void loadReport();
+    }
+
+    return () => {
+      disposed = true;
+    };
+  }, [selectedRunId, selectedRun?.reportStatus, runIsFinished]);
+
+  const reportContent =
+    report?.json?.finalReport?.trim() ||
+    report?.markdown?.trim() ||
+    buildReportFallback(report) ||
+    report?.json?.evidenceAppendix?.trim() ||
+    "";
+  const reportAvailable = Boolean(report?.status || selectedRun?.reportStatus || runIsFinished);
+
   return (
     <main className="grid-bg h-screen overflow-hidden bg-background text-foreground">
       <div className="h-full bg-gradient-to-br from-slate-950 via-slate-900 to-cyan-950/40">
@@ -365,30 +580,46 @@ export default function App() {
                   <p className="text-sm text-cyan-100/80">No runs yet. Start one from the prompt composer.</p>
                 ) : (
                   runs.map((run) => (
-                    <button
+                    <div
                       key={run.runId}
-                      type="button"
-                      onClick={() => setSelectedRunId(run.runId)}
-                      className={`w-full rounded-xl border p-3 text-left transition ${
+                      className={`relative rounded-xl border transition ${
                         run.runId === selectedRunId
                           ? "border-cyan-400 bg-cyan-500/10"
                           : "border-white/10 bg-slate-900/40 hover:border-white/20"
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="font-mono text-sm text-cyan-50">#{shortRunId(run.runId)}</p>
-                        <Chip
-                          color={statusColor(run.reportStatus ?? run.status)}
-                          size="sm"
-                          variant="flat"
-                          classNames={{ content: "font-medium text-slate-50" }}
-                        >
-                          {run.reportStatus ?? run.status}
-                        </Chip>
-                      </div>
-                      <p className="mt-2 line-clamp-2 text-sm text-cyan-100">{run.title || deriveTitle(run.prompt)}</p>
-                      <p className="mt-1 line-clamp-2 text-xs text-cyan-100/75">{run.prompt}</p>
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedRunId(run.runId)}
+                        className="w-full rounded-xl p-3 pr-11 text-left"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="font-mono text-sm text-cyan-50">#{shortRunId(run.runId)}</p>
+                          <Chip
+                            color={statusColor(run.reportStatus ?? run.status)}
+                            size="sm"
+                            variant="flat"
+                            classNames={{ content: "font-medium text-slate-50" }}
+                          >
+                            {run.reportStatus ?? run.status}
+                          </Chip>
+                        </div>
+                        <p className="mt-2 line-clamp-2 text-sm text-cyan-100">{run.title || deriveTitle(run.prompt)}</p>
+                        <p className="mt-1 line-clamp-2 text-xs text-cyan-100/75">{run.prompt}</p>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`Delete run ${shortRunId(run.runId)}`}
+                        disabled={deletingRunId === run.runId}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          void deleteRun(run.runId);
+                        }}
+                        className="absolute right-2 top-2 flex h-7 w-7 items-center justify-center rounded-full border border-white/10 bg-slate-950/70 text-sm text-cyan-100/80 transition hover:border-danger/50 hover:text-danger disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {deletingRunId === run.runId ? <Spinner size="sm" color="danger" /> : "×"}
+                      </button>
+                    </div>
                   ))
                 )}
               </div>
@@ -407,20 +638,48 @@ export default function App() {
               {isLoadingRun ? <Spinner size="sm" color="secondary" /> : null}
             </div>
 
-            <Tabs
-              selectedKey={mode}
-              onSelectionChange={(key) => setMode(String(key) as ViewMode)}
-              color="primary"
-              radius="full"
-              variant="bordered"
-            >
-              <Tab key="chat" title="Chat Mode" />
-              <Tab key="evidence" title="Evidence" isDisabled={!runIsFinished} />
-            </Tabs>
+            <div className="inline-flex w-fit rounded-lg border border-white/15 bg-slate-900/70 p-1">
+              <button
+                type="button"
+                onClick={() => setMode("chat")}
+                className={`h-10 min-w-[140px] rounded-md px-4 text-sm font-medium tracking-[0.01em] transition ${
+                  mode === "chat"
+                    ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(103,232,249,0.45)]"
+                    : "text-cyan-100/75 hover:text-cyan-100"
+                }`}
+              >
+                Chat Mode
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("report")}
+                disabled={!reportAvailable}
+                className={`h-10 min-w-[140px] rounded-md px-4 text-sm font-medium tracking-[0.01em] transition ${
+                  mode === "report"
+                    ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(103,232,249,0.45)]"
+                    : "text-cyan-100/75 hover:text-cyan-100"
+                } disabled:cursor-not-allowed disabled:text-cyan-100/35`}
+              >
+                Report
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("evidence")}
+                disabled={!runIsFinished}
+                className={`h-10 min-w-[140px] rounded-md px-4 text-sm font-medium tracking-[0.01em] transition ${
+                  mode === "evidence"
+                    ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(103,232,249,0.45)]"
+                    : "text-cyan-100/75 hover:text-cyan-100"
+                } disabled:cursor-not-allowed disabled:text-cyan-100/35`}
+              >
+                Evidence
+              </button>
+            </div>
 
-            {!runIsFinished ? (
+            {!reportAvailable && !runIsFinished ? (
               <p className="mt-2 text-xs text-default-500">
-                File list and graph views unlock when the selected run reaches `done` / `failed` or the report is `ready`.
+                Report unlocks after Stage 2 writes a draft or ready snapshot. Evidence unlocks when the run reaches
+                `done` / `failed` or the report is `ready`.
               </p>
             ) : null}
 
@@ -439,19 +698,120 @@ export default function App() {
                         {events.length === 0 ? (
                           <p className="text-sm text-default-500">Run events will stream here in real time.</p>
                         ) : (
-                          events.map((event) => (
-                            <Card key={event.event_id} className="border border-white/10 bg-slate-900/50" shadow="none">
-                              <CardHeader className="flex items-center justify-between pb-0">
-                                <p className="font-mono text-xs text-cyan-200">{event.type}</p>
-                                <p className="text-xs text-default-500">{new Date(event.ts).toLocaleString()}</p>
+                          events.map((event) => {
+                            const stage = classifyEventStage(event.type);
+                            return (
+                              <Card key={event.event_id} className="border border-white/10 bg-slate-900/50" shadow="none">
+                                <CardHeader className="flex items-center justify-between pb-0">
+                                  <div className="flex items-center gap-2">
+                                    <p className="font-mono text-xs text-cyan-200">{event.type}</p>
+                                    <Chip size="sm" variant="flat" color={stage.color} classNames={{ content: "font-medium" }}>
+                                      {stage.label}
+                                    </Chip>
+                                  </div>
+                                  <p className="text-xs text-default-500">{new Date(event.ts).toLocaleString()}</p>
+                                </CardHeader>
+                                <CardBody>
+                                  <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs text-default-600">
+                                    {JSON.stringify(event.payload, null, 2)}
+                                  </pre>
+                                </CardBody>
+                              </Card>
+                            );
+                          })
+                        )}
+                      </div>
+                    </ScrollShadow>
+                  </CardBody>
+                </Card>
+              )}
+
+              {mode === "report" && (
+                <Card className="h-full border border-white/10 bg-slate-950/40" shadow="none">
+                  <CardBody className="h-full">
+                    <ScrollShadow className="themed-scroll h-full pr-2">
+                      <div className="space-y-3">
+                        {isLoadingReport ? <Spinner size="sm" color="secondary" /> : null}
+                        {!reportContent ? (
+                          <p className="text-sm text-default-500">No report snapshot is available for this run yet.</p>
+                        ) : (
+                          <>
+                            <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                              <CardBody className="flex flex-wrap gap-2 text-sm">
+                                <Chip size="sm" color={statusColor(report?.status ?? "draft")} variant="flat">
+                                  {report?.status ?? "draft"}
+                                </Chip>
+                                {report?.json?.reportType ? (
+                                  <Chip size="sm" variant="flat" color="secondary">
+                                    {report.json.reportType}
+                                  </Chip>
+                                ) : null}
+                                {typeof report?.json?.qualityOk === "boolean" ? (
+                                  <Chip size="sm" variant="flat" color={report.json.qualityOk ? "success" : "warning"}>
+                                    {report.json.qualityOk ? "quality ok" : "needs review"}
+                                  </Chip>
+                                ) : null}
+                                {typeof report?.json?.refineRound === "number" ? (
+                                  <Chip size="sm" variant="flat" color="default">
+                                    refine {report.json.refineRound}
+                                  </Chip>
+                                ) : null}
+                              </CardBody>
+                            </Card>
+
+                            <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                              <CardHeader className="pb-0">
+                                <p className="text-sm font-semibold text-cyan-100">
+                                  {report?.json?.finalReport?.trim() || report?.markdown?.trim()
+                                    ? "Final Report"
+                                    : "Draft Sections"}
+                                </p>
                               </CardHeader>
                               <CardBody>
-                                <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs text-default-600">
-                                  {JSON.stringify(event.payload, null, 2)}
+                                <pre className="overflow-x-auto whitespace-pre-wrap break-words font-sans text-sm leading-7 text-cyan-50">
+                                  {reportContent}
                                 </pre>
                               </CardBody>
                             </Card>
-                          ))
+
+                            {report?.json?.evidenceRefs?.length ? (
+                              <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                                <CardHeader className="pb-0">
+                                  <p className="text-sm font-semibold text-cyan-100">Evidence References</p>
+                                </CardHeader>
+                                <CardBody className="space-y-3">
+                                  {report.json.evidenceRefs.slice(0, 12).map((item) => (
+                                    <div key={`${item.citationKey}-${item.createdAt}`} className="rounded-lg border border-white/10 p-3">
+                                      <div className="flex flex-wrap gap-2">
+                                        <Chip size="sm" variant="flat" color="secondary">
+                                          {item.citationKey}
+                                        </Chip>
+                                        {item.sourceUrl ? (
+                                          <Chip size="sm" variant="flat" color="default">
+                                            {item.sourceUrl}
+                                          </Chip>
+                                        ) : null}
+                                      </div>
+                                      <p className="mt-2 text-sm text-default-200">{item.snippet || "No snippet"}</p>
+                                    </div>
+                                  ))}
+                                </CardBody>
+                              </Card>
+                            ) : null}
+
+                            {report?.json?.evidenceAppendix?.trim() ? (
+                              <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                                <CardHeader className="pb-0">
+                                  <p className="text-sm font-semibold text-cyan-100">Evidence Appendix</p>
+                                </CardHeader>
+                                <CardBody>
+                                  <pre className="overflow-x-auto whitespace-pre-wrap break-words font-sans text-sm leading-7 text-default-200">
+                                    {report.json.evidenceAppendix}
+                                  </pre>
+                                </CardBody>
+                              </Card>
+                            ) : null}
+                          </>
                         )}
                       </div>
                     </ScrollShadow>
@@ -524,41 +884,136 @@ export default function App() {
                     ) : (
                       <>
                         {isLoadingGraph ? <Spinner size="sm" color="secondary" /> : null}
-                        {graphNodes.length < 2 ? (
+                        {graphNodes.length === 0 ? (
                           <p className="text-sm text-default-500">No graph nodes with this run's evidence pointers yet.</p>
                         ) : (
-                          <svg viewBox="0 0 820 440" className="h-full w-full">
-                            {graphEdges.map((edge, index) => {
-                              const sourceIndex = graphNodes.findIndex((node) => node.id === edge.source);
-                              const targetIndex = graphNodes.findIndex((node) => node.id === edge.target);
-                              const x1 = 80 + Math.max(sourceIndex, 0) * 70;
-                              const y1 = 90 + ((Math.max(sourceIndex, 0) % 2) * 180);
-                              const x2 = 80 + Math.max(targetIndex, 0) * 70;
-                              const y2 = 90 + ((Math.max(targetIndex, 0) % 2) * 180);
+                          <ScrollShadow className="themed-scroll h-full pr-2">
+                            <div className="space-y-4">
+                              <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                                <CardBody className="flex flex-wrap gap-2 text-sm">
+                                  <Chip size="sm" variant="flat" color="secondary">
+                                    {graphNodes.length} node{graphNodes.length === 1 ? "" : "s"}
+                                  </Chip>
+                                  <Chip size="sm" variant="flat" color="default">
+                                    {graphEdges.length} edge{graphEdges.length === 1 ? "" : "s"}
+                                  </Chip>
+                                </CardBody>
+                              </Card>
 
-                              return (
-                                <g key={edge.id ?? `${edge.source}-${edge.target}-${index}`}>
-                                  <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="rgba(34,211,238,0.45)" strokeWidth="2" />
-                                  <text x={(x1 + x2) / 2} y={(y1 + y2) / 2 - 6} fill="#94a3b8" fontSize="10">
-                                    {edge.type}
-                                  </text>
-                                </g>
-                              );
-                            })}
+                              {graphNodes.length > 1 ? (
+                                <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                                  <CardBody>
+                                    <svg
+                                      viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
+                                      className="h-[360px] w-full"
+                                    >
+                                      {graphEdges.map((edge, index) => {
+                                        const sourcePosition = graphPositionMap.get(edge.source);
+                                        const targetPosition = graphPositionMap.get(edge.target);
+                                        if (!sourcePosition || !targetPosition) return null;
 
-                            {graphNodes.map((node, index) => {
-                              const x = 80 + index * 70;
-                              const y = 90 + ((index % 2) * 180);
-                              return (
-                                <g key={node.id}>
-                                  <circle cx={x} cy={y} r="24" fill="rgba(6,182,212,0.3)" stroke="rgba(34,211,238,0.9)" />
-                                  <text x={x} y={y + 4} fill="#e2e8f0" fontSize="10" textAnchor="middle">
-                                    {node.display.slice(0, 12)}
-                                  </text>
-                                </g>
-                              );
-                            })}
-                          </svg>
+                                        const x1 = sourcePosition.x;
+                                        const y1 = sourcePosition.y;
+                                        const x2 = targetPosition.x;
+                                        const y2 = targetPosition.y;
+
+                                        return (
+                                          <g key={edge.id ?? `${edge.source}-${edge.target}-${index}`}>
+                                            <line
+                                              x1={x1}
+                                              y1={y1}
+                                              x2={x2}
+                                              y2={y2}
+                                              stroke="rgba(34,211,238,0.45)"
+                                              strokeWidth="2"
+                                            />
+                                            <text
+                                              x={(x1 + x2) / 2}
+                                              y={(y1 + y2) / 2 - 8}
+                                              fill="#94a3b8"
+                                              fontSize="10"
+                                              textAnchor="middle"
+                                            >
+                                              {truncateGraphLabel(edge.display ?? edge.type, 22)}
+                                            </text>
+                                          </g>
+                                        );
+                                      })}
+
+                                      {graphNodes.map((node) => {
+                                        const position = graphPositionMap.get(node.id);
+                                        if (!position) return null;
+                                        const x = position.x;
+                                        const y = position.y;
+                                        return (
+                                          <g key={node.id}>
+                                            <circle
+                                              cx={x}
+                                              cy={y}
+                                              r="34"
+                                              fill="rgba(6,182,212,0.3)"
+                                              stroke="rgba(34,211,238,0.9)"
+                                            />
+                                            <text
+                                              x={x}
+                                              y={y + 4}
+                                              fill="#e2e8f0"
+                                              fontSize="11"
+                                              textAnchor="middle"
+                                            >
+                                              {truncateGraphLabel(node.display, 18)}
+                                            </text>
+                                          </g>
+                                        );
+                                      })}
+                                    </svg>
+                                  </CardBody>
+                                </Card>
+                              ) : null}
+
+                              {graphEdges.length ? (
+                                <Card className="border border-white/10 bg-slate-900/50" shadow="none">
+                                  <CardBody className="space-y-3 text-sm">
+                                    {graphEdges.map((edge) => {
+                                      const sourceNode = graphNodeMap.get(edge.source);
+                                      const targetNode = graphNodeMap.get(edge.target);
+                                      return (
+                                        <div
+                                          key={edge.id}
+                                          className="rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2"
+                                        >
+                                          <p className="text-cyan-100">
+                                            {sourceNode?.display ?? edge.source}
+                                          </p>
+                                          <p className="my-1 text-xs uppercase tracking-[0.18em] text-default-400">
+                                            {edge.display ?? edge.type}
+                                          </p>
+                                          <p className="text-cyan-100">
+                                            {targetNode?.display ?? edge.target}
+                                          </p>
+                                        </div>
+                                      );
+                                    })}
+                                  </CardBody>
+                                </Card>
+                              ) : null}
+
+                              {graphNodes.map((node) => (
+                                <Card key={node.id} className="border border-white/10 bg-slate-900/50" shadow="none">
+                                  <CardBody className="text-sm">
+                                    <p className="font-medium text-cyan-100">{node.display}</p>
+                                    <div className="mt-2 flex flex-wrap gap-2">
+                                      {node.labels.map((label) => (
+                                        <Chip key={`${node.id}-${label}`} size="sm" variant="flat" color="secondary">
+                                          {label}
+                                        </Chip>
+                                      ))}
+                                    </div>
+                                  </CardBody>
+                                </Card>
+                              ))}
+                            </div>
+                          </ScrollShadow>
                         )}
                       </>
                     )}

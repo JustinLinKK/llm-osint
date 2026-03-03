@@ -84,11 +84,9 @@ The frontend (localhost) allows users to:
 - Neo4j Community (graph database)
 - Redis (cache)
 
-### LLM Providers
-- OpenAI
-- Gemini
-- Grok  
-(via a unified internal LLM gateway)
+### LLM Integration
+- OpenRouter-backed planning, embeddings, and Stage 2 drafting/retrieval helpers
+- Heuristic fallbacks where LLM calls are unavailable
 
 ---
 
@@ -137,21 +135,24 @@ This brings up:
 
 ---
 
-## 📂 Repository Structure (Simplified)
+## 📂 Repository Structure (Current)
 
 ```
 apps/
-  web/            # Frontend UI (React + Vite)
-  api/            # Backend API gateway (Fastify)
-  mcp-server/     # Agentic tool server
-  llm-gateway/    # Multi-LLM router
+  web/            # Analyst UI (React + Vite)
+  api/            # Fastify API + run/event endpoints + LangGraph launcher
+  mcp-server/     # MCP tool server (HTTP) + Python tool bridge
 services/
-  extractor/      # Entity + claim extraction (Python)
-  embedding/      # Vectorization (Python)
-  graph-miner/    # Identity resolution & graph analytics
+  agent-langgraph/ # Planner graph, tool worker graph, Stage 2 report graph
+  worker-embedding/ # vLLM OpenAI-compatible embedding service
+  worker-python/   # Deterministic ingestion/chunk/embed helpers
+  worker-temporal/ # Temporal worker skeleton
+packages/
+  shared/          # Shared package placeholder
 infra/
-  docker/         # Docker Compose (local dev)
-.devcontainer/    # VS Code Dev Container config
+  docker/          # Docker Compose (local dev)
+  db/              # Postgres + Neo4j schema migrations
+.devcontainer/     # VS Code Dev Container config
 ```
 
 ---
@@ -159,13 +160,22 @@ infra/
 ## 🧪 Project Status
 
 **Current stage:**  
-🟡 Active development — core infrastructure + dev environment setup
+🟡 Foundation complete, Stage 1 pipeline working, Stage 2 reporting prototyped
 
-**Next milestones:**
-- Agentic collection MVP
-- Graph schema + identity resolution
-- Evidence-grounded report generation
-- UI graph visualization
+**Implemented now:**
+- Docker-based local stack for Postgres, MinIO, Qdrant, Neo4j, Redis, Temporal, API, and MCP servers
+- Fastify API with run creation, run listing, SSE events, file listing, graph listing, and report retrieval endpoints
+- MCP server over **Streamable HTTP** with working `fetch_url`, `ingest_text`, graph ingest, report-query, and Python-bridge tools
+- LangGraph **planner graph** plus **tool worker graph** with receipts, noteboard notes, vector ingest, and graph ingest hooks
+- LangGraph **Stage 2 report graph** with outline/draft/claim/evidence persistence to Stage 2 tables
+- Web UI for starting runs, monitoring live events, and inspecting file/graph evidence after completion
+
+**Still incomplete or only partially wired:**
+- Temporal workflow is still a stub; it is not orchestrating the real pipeline yet
+- `worker-python` exists for ingestion logic, but there is no standalone background processing service wired into runs
+- Stage 2 reporting exists in Python, but API autostart currently launches only Stage 1 unless Stage 2 is invoked explicitly
+- No dedicated analyst report viewer in the web app yet
+- CI, broader tests, rate limiting, and stronger safety controls are still pending
 
 ---
 

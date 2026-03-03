@@ -9,17 +9,30 @@ This document is the **detailed plan** for the OSINT pipeline, using:
 
 ---
 
-## 0) Current State (Done)
+## 0) Current State (Actual)
 
 ### ✅ Infrastructure (Docker Compose)
 Running and verified:
 - Postgres, MinIO (erasure + versioning), Redis, Qdrant, Neo4j, Temporal, Temporal UI
-- API container (Node 20, Yarn 4, Fastify) running on port 3000
+- API container (Node 20, Yarn 4, Fastify) on port 3000
+- MCP server on port 3001 and Kali/preset MCP server on port 3002
 
 ### ✅ Postgres Provenance Schema
 Tables exist:
 - `runs`, `documents`, `document_objects`, `chunks`, `tool_calls`, `run_events`, `reports`
 - `artifacts`, `artifact_summaries`, `tool_call_receipts`, `run_notes`
+- `report_runs`, `section_drafts`, `claim_ledger`, `evidence_refs`
+
+### ✅ Working Application Surfaces
+- API endpoints for runs, SSE events, files, graph snapshots, and latest report retrieval
+- Web UI can create runs, stream events, and inspect file + graph evidence for completed runs
+- LangGraph planner + tool-worker path is launched by the API on run creation
+- Stage 2 report subgraph exists in `services/agent-langgraph/src/report_graph.py`
+
+### ⚠️ Important Gaps
+- Temporal worker is still emitting placeholder events, not orchestrating the real planner/collection/report flow
+- Stage 2 report generation is implemented but not yet triggered by default from API autostart
+- `reports` table / MinIO-backed final report persistence exists separately from the newer Stage 2 snapshot tables
 
 ---
 
@@ -178,19 +191,20 @@ Deliverables:
 - write entities/relations to Neo4j
 - store evidence refs on edges
 
-### Milestone F — LangGraph Synthesizer (Python)
+### Milestone F — LangGraph Synthesizer / Stage 2 Report (Python)
 Goal: evidence-backed report + reflection
 
 Deliverables:
-- `synth_graph.py`
+- `report_graph.py` (current implementation path)
 - Nodes:
   1. `retrieve_evidence` (Qdrant + Neo4j)
   2. `draft_summary`
   3. `resolve_conflicts`
   4. `reflection`
   5. `finalize_report`
-- Writes report artifacts to MinIO + `reports` table
-- emits `REPORT_READY`
+- Current status:
+  - graph/report state persistence exists in Stage 2 tables
+  - automatic final artifact publication to `reports` / MinIO is still pending wiring
 
 ### Milestone G — Hardening for production
 Goal: safer and scalable deployment
@@ -228,7 +242,7 @@ Deliverables:
   - collect (MCP tools)
   - process (chunk + embed + graph)
   - synthesize (LangGraph Synthesizer)
-- [ ] Each activity emits `run_events`
+- [x] Placeholder activities emit `run_events`
 - [ ] Add retry + timeout per activity
 
 ## E) MCP server (TS) — minimal viable tools
@@ -237,7 +251,11 @@ Deliverables:
 - [x] Tool: `fetch_url` (HTTP GET + store raw to MinIO)
 - [x] Tool: `ingest_text` (chunk + embed + Qdrant upsert)
 - [x] Tool: `ingest_graph_entity` (Neo4j ingest + normalization + location merge threshold)
-- [ ] Tool: `web_search` (stub initially; later real provider)
+- [x] Graph query tools (`graph_get_entity`, `graph_neighbors`, `graph_search_entities`)
+- [x] Vector query tools (`vector_search`, `vector_get_document`)
+- [x] Python bridge with research-integration preset tools
+- [x] Python bridge with curated Kali/preset OSINT tools
+- [ ] Tool: `web_search` (generic search provider abstraction)
 - [x] Write tool call logs into Postgres `tool_calls`
 - [x] Emit events `TOOL_CALL_STARTED/FINISHED`
 
@@ -246,27 +264,48 @@ Deliverables:
 - [x] OpenRouter LLM planning integration (direct HTTP)
 - [x] Tool worker subgraph (execute tool, store artifacts, write receipts)
 - [x] Load root `.env` for agent + pipeline test runs
-- [ ] `synth_graph.py` (retrieve via Qdrant/Neo4j + write report)
-- [ ] Define consistent state objects for graphs (pydantic models)
-- [ ] Add “evidence policy”: output must cite chunk/document IDs
+- [x] `report_graph.py` Stage 2 subgraph (outline, retrieval, claims, drafting, refinement, finalize)
+- [x] Stage 2 report state/models (`report_models.py`)
+- [ ] Unify planner + Stage 2 states/contracts across the whole service
+- [ ] Enforce stronger claim-to-chunk/document citation policy in final outputs
 
 ## G) Processing workers (Python)
-- [x] Parser/normalizer reading from MinIO based on `document_objects(kind='raw')`
+- [x] Ingestion/chunk/embed helper implemented in `services/worker-python/src/ingest_text.py`
 - [x] Chunker writes `chunks`
-- [x] Embedder writes Qdrant and stores `vector_id` back to Postgres
-- [ ] (Optional) entity/claim extractor writes to Neo4j
+- [x] Embedder writes Qdrant
+- [x] Graph ingest path exists through MCP tools
+- [ ] Standalone background worker orchestration
+- [ ] Automated entity/claim extraction pipeline from stored evidence
 
 ## H) UI (Web)
 - [ ] Upload form (text + file)
-- [ ] Run dashboard page: SSE stream shows event timeline + tool rationale
+- [x] Prompt composer for starting runs
+- [x] Run dashboard page: SSE stream shows event timeline
+- [x] Evidence views for file artifacts and graph nodes/edges
 - [ ] Report view: markdown render + citation links to evidence
 
 ## I) Production hardening
 - [ ] Replace MinIO SDK with AWS S3 SDK v3 to capture `version_id` reliably
 - [ ] Tool allowlists + rate limiting
-- [ ] Secrets handling via env + `.env.example`
-- [ ] Add basic tests for schema + ingest
+- [x] Secrets handling via env + `.env.example`
+- [x] Add basic import/regression test for agent service
 - [ ] Add CI: lint, typecheck, unit tests
+
+---
+
+## Current Demo Path
+
+What works today:
+1. Create a run from the API or web UI
+2. API autostarts the LangGraph planner
+3. Planner selects MCP tools and executes them over HTTP
+4. Tool worker stores artifacts, receipts, notes, vector data, and graph data
+5. UI streams run events and can inspect stored files/graph evidence after completion
+
+What still needs wiring for the intended end-to-end product:
+1. Temporal owning the real workflow
+2. Stage 2 report generation being triggered automatically
+3. Report rendering in the web UI
 
 ---
 

@@ -1,0 +1,119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://llm-osint.local/schemas/academic_person_results.json",
+  "title": "AcademicPersonSearchResults",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "query",
+    "candidates"
+  ],
+  "properties": {
+    "tool": {
+      "type": "string",
+      "minLength": 1
+    },
+    "query": {
+      "type": "object"
+    },
+    "status": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "canonical_name",
+          "source",
+          "source_id",
+          "confidence",
+          "match_features",
+          "affiliations",
+          "topics",
+          "external_ids",
+          "works_summary",
+          "evidence"
+        ],
+        "properties": {
+          "canonical_name": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "match_features": {
+            "type": "object"
+          },
+          "affiliations": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "topics": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "external_ids": {
+            "type": "object"
+          },
+          "works_summary": {
+            "type": "object"
+          },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "url",
+                "snippet",
+                "retrieved_at",
+                "fields_matched"
+              ],
+              "properties": {
+                "url": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                },
+                "retrieved_at": {
+                  "type": "string"
+                },
+                "fields_matched": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  }
+}

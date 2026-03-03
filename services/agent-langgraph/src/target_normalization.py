@@ -1,0 +1,246 @@
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List
+
+URL_REGEX = re.compile(r"https?://[^\s\]]+")
+EMAIL_REGEX = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+DOMAIN_REGEX = re.compile(
+    r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE
+)
+USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,32})")
+CAPITALIZED_NAME_REGEX = re.compile(r"\b[A-Z][a-z]+(?:[\s-]+[A-Z][a-z]+){0,3}\b")
+PERSON_HINT_REGEX = re.compile(
+    r"(?i)\b(?:investigate|investigation(?:\s+into)?|profile|research|look\s+into|find\s+info\s+on|osint(?:\s+on)?)\b[:\s-]*([A-Za-z][A-Za-z'\s-]{1,79})"
+)
+
+PERSON_CANDIDATE_STOPWORDS = {
+    "please",
+    "investigate",
+    "investigation",
+    "profile",
+    "research",
+    "look",
+    "into",
+    "find",
+    "info",
+    "osint",
+    "person",
+    "target",
+    "public",
+    "records",
+    "social",
+    "domain",
+    "email",
+    "phone",
+    "website",
+    "company",
+    "organization",
+}
+PERSON_CANDIDATE_BREAKWORDS = {
+    "and",
+    "or",
+    "with",
+    "for",
+    "about",
+    "gather",
+    "collect",
+    "find",
+    "look",
+    "into",
+}
+
+PERSON_CANDIDATE_REJECT_TOKENS = {
+    "search",
+    "through",
+    "internet",
+    "confidence",
+    "score",
+    "google",
+    "serp",
+    "queried",
+    "query",
+    "ran",
+    "searched",
+    "fetched",
+    "discovered",
+    "reviewed",
+    "found",
+    "result",
+    "results",
+    "source",
+    "sources",
+    "types",
+    "public",
+    "web",
+    "profile",
+    "profiles",
+    "person",
+    "people",
+    "target",
+    "targets",
+    "evidence",
+    "summary",
+    "summaries",
+    "pivots",
+    "pivot",
+    "archive",
+    "archived",
+    "downloaded",
+    "download",
+    "history",
+    "contact",
+    "relationship",
+    "relationships",
+    "biography",
+    "biographic",
+}
+
+PERSON_CANDIDATE_REJECT_PHRASES = (
+    "search through the internet",
+    "confidence score",
+    "ran google",
+    "ran google serp",
+    "searched public web",
+    "public web sources",
+    "queried arxiv",
+    "source types include",
+)
+
+
+def _dedupe(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for item in items:
+        normalized = item.strip().rstrip(".,)")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def normalize_person_candidate(value: str) -> str | None:
+    normalized = " ".join(value.strip(" \t\r\n:;,.!?-").split())
+    if not normalized:
+        return None
+
+    words = normalized.split()
+    collected: List[str] = []
+    for word in words:
+        lower_word = word.lower()
+        if lower_word in PERSON_CANDIDATE_STOPWORDS:
+            if collected:
+                break
+            continue
+        if lower_word in PERSON_CANDIDATE_BREAKWORDS and collected:
+            break
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'-]*", word):
+            break
+        collected.append(word)
+        if len(collected) >= 4:
+            break
+
+    if not collected:
+        return None
+
+    if len(collected) < 2:
+        return None
+
+    if all(word.islower() for word in collected):
+        collected = [word.capitalize() for word in collected]
+
+    candidate = " ".join(collected)
+    if not _is_valid_person_candidate(candidate):
+        return None
+    return candidate
+
+
+def _is_valid_person_candidate(value: str) -> bool:
+    normalized = " ".join(value.strip().split())
+    if not normalized:
+        return False
+
+    lowered = normalized.casefold()
+    if any(phrase in lowered for phrase in PERSON_CANDIDATE_REJECT_PHRASES):
+        return False
+
+    words = normalized.split()
+    if len(words) < 2 or len(words) > 4:
+        return False
+
+    reject_hits = sum(1 for word in words if word.casefold() in PERSON_CANDIDATE_REJECT_TOKENS)
+    if reject_hits:
+        return False
+
+    if any(len(word) == 1 for word in words):
+        return False
+
+    return True
+
+
+def extract_person_targets(text: str) -> List[str]:
+    scrubbed = text or ""
+    scrubbed = URL_REGEX.sub(" ", scrubbed)
+    scrubbed = EMAIL_REGEX.sub(" ", scrubbed)
+    scrubbed = DOMAIN_REGEX.sub(" ", scrubbed)
+    scrubbed = USERNAME_REGEX.sub(" ", scrubbed)
+
+    candidates: List[str] = []
+    for match in PERSON_HINT_REGEX.findall(scrubbed):
+        normalized = normalize_person_candidate(match)
+        if normalized:
+            candidates.append(normalized)
+
+    for match in CAPITALIZED_NAME_REGEX.findall(scrubbed):
+        normalized = normalize_person_candidate(match)
+        if normalized:
+            candidates.append(normalized)
+
+    direct = normalize_person_candidate(scrubbed)
+    if direct:
+        candidates.append(direct)
+
+    return _dedupe(candidates)
+
+
+def sanitize_search_tool_arguments(
+    tool_name: str,
+    arguments: Dict[str, Any],
+    fallback_person_targets: List[str] | None = None,
+) -> Dict[str, Any]:
+    normalized = dict(arguments)
+    fallback = next((item for item in (fallback_person_targets or []) if isinstance(item, str) and item.strip()), None)
+
+    def coerce_target(*keys: str) -> str | None:
+        for key in keys:
+            value = normalized.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates = extract_person_targets(value)
+                if candidates:
+                    return candidates[0]
+        return fallback
+
+    if tool_name == "person_search":
+        target = coerce_target("name", "query")
+        if target:
+            normalized["name"] = target
+            if "query" in normalized:
+                normalized["query"] = target
+
+    if tool_name == "google_serp_person_search":
+        target = coerce_target("target_name", "query")
+        if target:
+            normalized["target_name"] = target
+            if "query" in normalized:
+                normalized["query"] = target
+
+    if tool_name == "tavily_person_search":
+        target = coerce_target("target_name", "query", "name")
+        if target:
+            normalized["target_name"] = target
+            normalized["query"] = target
+            if "name" in normalized:
+                normalized["name"] = target
+
+    return normalized

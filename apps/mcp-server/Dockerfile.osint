@@ -3,6 +3,12 @@ FROM node:20-slim
 WORKDIR /app
 ENV PATH="/opt/osint-venv/bin:${PATH}"
 
+# Ensure Node/Python HTTPS clients trust public CAs for fetch_url and API calls.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && update-ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 # Install Python runtime and curated OSINT CLI stack.
 COPY infra/docker/install-osint-tools.sh /tmp/install-osint-tools.sh
 RUN chmod +x /tmp/install-osint-tools.sh && /tmp/install-osint-tools.sh
@@ -16,6 +22,13 @@ COPY .yarn ./.yarn
 
 # Copy apps/mcp-server
 COPY apps/mcp-server ./apps/mcp-server
+
+# Install Python dependencies for MCP Python tools into OSINT venv,
+# then provision the Playwright browser runtime used by LinkedIn capture.
+RUN /opt/osint-venv/bin/pip install --no-cache-dir \
+  -r /app/apps/mcp-server/src/tools/tools_python/person_search/requirements.txt \
+  -r /app/apps/mcp-server/src/tools/tools_python/research_integration/requirements.txt \
+  && /opt/osint-venv/bin/python -m playwright install --with-deps chromium
 
 # Install dependencies (including dev dependencies for build)
 RUN yarn workspaces focus @osint/mcp-server

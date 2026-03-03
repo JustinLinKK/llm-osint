@@ -4,6 +4,8 @@ import crypto from "node:crypto";
 import { v4 as uuidv4 } from "uuid";
 import { pool } from "../clients/pg.js";
 import { cfg } from "../config.js";
+import { embedTexts } from "../embeddings.js";
+import { ensureQdrantCollection } from "../qdrant.js";
 import { emitRunEvent, logToolCall } from "./helpers.js";
 import { logger } from "../utils/logger.js";
 
@@ -151,59 +153,6 @@ function isHeadingLine(line: string) {
   return false;
 }
 
-async function ensureQdrantCollection(vectorSize: number) {
-  const url = cfg.qdrant.url.replace(/\/$/, "");
-  const collection = cfg.qdrant.collection;
-
-  const getRes = await fetch(`${url}/collections/${collection}`);
-  if (getRes.ok) return;
-  if (getRes.status !== 404) {
-    throw new Error(`Qdrant check failed: ${getRes.status}`);
-  }
-
-  const createRes = await fetch(`${url}/collections/${collection}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      vectors: {
-        size: vectorSize,
-        distance: "Cosine",
-      },
-    }),
-  });
-
-  if (!createRes.ok) {
-    const errorText = await createRes.text();
-    throw new Error(`Qdrant create failed: ${createRes.status} ${errorText}`);
-  }
-}
-
-async function embedTexts(texts: string[]) {
-  if (!cfg.openrouter.apiKey) {
-    throw new Error("OPENROUTER_API_KEY not set");
-  }
-
-  const response = await fetch("https://openrouter.ai/api/v1/embeddings", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${cfg.openrouter.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: cfg.openrouter.embedModel,
-      input: texts,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenRouter embeddings failed: ${response.status} ${errorText}`);
-  }
-
-  const data = await response.json();
-  return (data.data || []).map((item: { embedding: number[] }) => item.embedding);
-}
-
 async function upsertQdrantPoints(points: Array<{ id: string; vector: number[]; payload: Record<string, unknown> }>) {
   const url = cfg.qdrant.url.replace(/\/$/, "");
   const collection = cfg.qdrant.collection;
@@ -225,7 +174,7 @@ export function registerIngestText(server: McpServer) {
     "ingest_text",
     {
       description:
-        "Ingest plain text evidence. Use when you already have text (e.g., LLM-parsed, OCR output, or extracted content). Chunks by section headings, embeds via OpenRouter, upserts to Qdrant, and writes chunks to Postgres. Returns documentId and counts.",
+        "Ingest plain text evidence. Use when you already have text (e.g., LLM-parsed, OCR output, or extracted content). Chunks by section headings, embeds via the configured embedding service, upserts to Qdrant, and writes chunks to Postgres. Returns documentId and counts.",
       inputSchema: {
         runId: z.string().uuid().describe("Run ID (UUID)"),
         text: z.string().min(1).describe("Raw text input"),
@@ -384,7 +333,7 @@ export function registerIngestText(server: McpServer) {
           for (const chunk of chunksToEmbed) {
             await pool.query(
               "UPDATE chunks SET vector_id = $1, embedding_model = $2 WHERE chunk_id = $3",
-              [chunk.chunkId, cfg.openrouter.embedModel, chunk.chunkId]
+              [chunk.chunkId, cfg.embeddings.model, chunk.chunkId]
             );
           }
         }
@@ -394,7 +343,7 @@ export function registerIngestText(server: McpServer) {
           chunkCount: chunks.length,
           vectorCount: embeddings.length,
           collection: cfg.qdrant.collection,
-          embeddingModel: cfg.openrouter.embedModel,
+          embeddingModel: cfg.embeddings.model,
           evidenceLinked: hasEvidenceLink(evidenceRef),
           warnings,
         };

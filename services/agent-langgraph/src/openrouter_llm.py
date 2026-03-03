@@ -25,6 +25,7 @@ class OpenRouterLLM:
         prompt: str,
         inputs: List[str],
         tool_catalog: List[Dict[str, Any]],
+        prior_tool_calls: List[Dict[str, Any]] | None = None,
         system_prompt: str | None = None,
     ) -> Dict[str, Any]:
         system = system_prompt or (
@@ -35,45 +36,25 @@ class OpenRouterLLM:
             "prompt": prompt,
             "inputs": inputs,
             "tool_catalog": tool_catalog,
+            "prior_tool_calls": prior_tool_calls or [],
             "output_schema": {
+                "plan": [{"tool": "string", "args": "object", "rationale": "string"}],
+                "reasoning": "string",
                 "rationale": "string",
                 "urls": ["string"],
                 "enough_info": "boolean"
             },
         }
 
-        payload = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user)},
-            ],
-            "temperature": 0.2,
-        }
+        data = self.complete_json(system, user, temperature=0.2, timeout=30)
 
-        response = requests.post(
-            f"{self._base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(payload),
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "{}")
-        )
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError:
-            data = {}
+        plan = data.get("plan") if isinstance(data.get("plan"), list) else []
+        reasoning = data.get("reasoning")
+        rationale = data.get("rationale")
 
         return {
-            "rationale": str(data.get("rationale", "")),
+            "plan": plan,
+            "rationale": str(reasoning or rationale or ""),
             "urls": data.get("urls", []) if isinstance(data.get("urls"), list) else [],
             "enough_info": bool(data.get("enough_info", False)),
         }
@@ -91,13 +72,27 @@ class OpenRouterLLM:
             "instructions": "Return JSON only. Keep runId unchanged.",
         }
 
+        parsed = self.complete_json(system_prompt, user, temperature=0.1, timeout=30)
+
+        refined = parsed.get("arguments") if isinstance(parsed, dict) else None
+        if isinstance(refined, dict):
+            return refined
+        return arguments
+
+    def complete_json(
+        self,
+        system_prompt: str,
+        user_payload: Dict[str, Any],
+        temperature: float = 0.1,
+        timeout: int = 30,
+    ) -> Dict[str, Any]:
         payload = {
             "model": self._model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user)},
+                {"role": "user", "content": json.dumps(user_payload)},
             ],
-            "temperature": 0.1,
+            "temperature": temperature,
         }
 
         response = requests.post(
@@ -107,7 +102,7 @@ class OpenRouterLLM:
                 "Content-Type": "application/json",
             },
             data=json.dumps(payload),
-            timeout=30,
+            timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
@@ -119,12 +114,8 @@ class OpenRouterLLM:
         try:
             parsed = json.loads(content)
         except json.JSONDecodeError:
-            return arguments
-
-        refined = parsed.get("arguments") if isinstance(parsed, dict) else None
-        if isinstance(refined, dict):
-            return refined
-        return arguments
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def generate_run_title(self, prompt: str, inputs: List[str]) -> str | None:
         system = (
@@ -137,35 +128,7 @@ class OpenRouterLLM:
             "inputs": inputs[:8],
         }
 
-        payload = {
-            "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(user)},
-            ],
-            "temperature": 0.2,
-        }
-
-        response = requests.post(
-            f"{self._base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(payload),
-            timeout=30,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "{}")
-        )
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            return None
+        parsed = self.complete_json(system, user, temperature=0.2, timeout=30)
 
         title = parsed.get("title") if isinstance(parsed, dict) else None
         if not isinstance(title, str):

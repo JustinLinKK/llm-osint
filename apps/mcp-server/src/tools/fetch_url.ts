@@ -8,28 +8,226 @@ import { cfg } from "../config.js";
 import { emitRunEvent, logToolCall } from "./helpers.js";
 import { logger } from "../utils/logger.js";
 
-const USER_AGENT = "osint-mcp-bot/1.0";
+const MAX_EXTRACTED_LINKS = 200;
+const RETRYABLE_STATUS_CODES = new Set([403, 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
 
-async function makeHttpRequest(url: string): Promise<{ bytes: Buffer; contentType: string } | null> {
-  const headers = {
-    "User-Agent": USER_AGENT,
-    Accept: "*/*",
-  };
+type RequestProfile = {
+  name: string;
+  headers: Record<string, string>;
+};
 
-  try {
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status} ${response.statusText}`);
+type HttpResult = {
+  bytes: Buffer;
+  contentType: string;
+  finalUrl: string;
+  statusCode: number;
+  attempts: number;
+  requestProfile: string;
+};
+
+class FetchRequestError extends Error {
+  statusCode?: number;
+  retryable: boolean;
+  profile: string;
+
+  constructor(message: string, options: { statusCode?: number; retryable?: boolean; profile: string }) {
+    super(message);
+    this.name = "FetchRequestError";
+    this.statusCode = options.statusCode;
+    this.retryable = options.retryable ?? false;
+    this.profile = options.profile;
+  }
+}
+
+const REQUEST_PROFILES: RequestProfile[] = [
+  {
+    name: "chrome-desktop",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.9,image/avif,image/webp,image/apng,image/svg+xml,image/*;q=0.8,*/*;q=0.7",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+    },
+  },
+  {
+    name: "firefox-desktop",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (X11; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0",
+      Accept:
+        "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.7",
+      "Accept-Language": "en-US,en;q=0.8",
+      "Cache-Control": "no-cache",
+      Pragma: "no-cache",
+    },
+  },
+];
+
+function normalizeHost(hostname: string): string {
+  return hostname.toLowerCase().replace(/^www\./, "");
+}
+
+function decodeHtmlEntities(value: string): string {
+  return value
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+
+function dedupeStrings(items: string[]): string[] {
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const item of items) {
+    const normalized = item.trim();
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    ordered.push(normalized);
+  }
+  return ordered;
+}
+
+function extractHtmlHints(html: string, pageUrl: string): {
+  title: string | null;
+  links: string[];
+  sameHostLinks: string[];
+} {
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch ? decodeHtmlEntities(titleMatch[1].replace(/\s+/g, " ").trim()) : null;
+  const sourceHost = normalizeHost(new URL(pageUrl).hostname);
+  const linkMatches = html.matchAll(/<a\b[^>]*?\bhref\s*=\s*["']([^"'#]+)["']/gi);
+  const links: string[] = [];
+
+  for (const match of linkMatches) {
+    const href = decodeHtmlEntities((match[1] ?? "").trim());
+    if (!href || href.startsWith("javascript:") || href.startsWith("mailto:") || href.startsWith("tel:")) {
+      continue;
     }
 
-    const bytes = Buffer.from(await response.arrayBuffer());
-    const contentType = response.headers.get("content-type") ?? "application/octet-stream";
-
-    return { bytes, contentType };
-  } catch (error) {
-    console.error("Error making HTTP request:", error);
-    return null;
+    try {
+      const normalized = new URL(href, pageUrl);
+      if (!["http:", "https:"].includes(normalized.protocol)) {
+        continue;
+      }
+      normalized.hash = "";
+      links.push(normalized.toString());
+      if (links.length >= MAX_EXTRACTED_LINKS) {
+        break;
+      }
+    } catch {
+      continue;
+    }
   }
+
+  const dedupedLinks = dedupeStrings(links);
+  const sameHostLinks = dedupedLinks.filter((candidate) => {
+    try {
+      return normalizeHost(new URL(candidate).hostname) === sourceHost;
+    } catch {
+      return false;
+    }
+  });
+
+  return {
+    title,
+    links: dedupedLinks,
+    sameHostLinks,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isTimeoutError(error: unknown): boolean {
+  return error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+}
+
+function getRetryDelayMs(attempt: number): number {
+  return cfg.fetchUrl.retryDelayMs * Math.max(1, attempt);
+}
+
+async function makeSingleHttpRequest(url: string, profile: RequestProfile): Promise<HttpResult> {
+  const response = await fetch(url, {
+    headers: profile.headers,
+    redirect: "follow",
+    signal: AbortSignal.timeout(cfg.fetchUrl.timeoutMs),
+  });
+  if (!response.ok) {
+    throw new FetchRequestError(`HTTP error ${response.status} ${response.statusText}`, {
+      statusCode: response.status,
+      retryable: RETRYABLE_STATUS_CODES.has(response.status),
+      profile: profile.name,
+    });
+  }
+
+  const bytes = Buffer.from(await response.arrayBuffer());
+  const contentType = response.headers.get("content-type") ?? "application/octet-stream";
+  const finalUrl = response.url || url;
+
+  return {
+    bytes,
+    contentType,
+    finalUrl,
+    statusCode: response.status,
+    attempts: 1,
+    requestProfile: profile.name,
+  };
+}
+
+async function makeHttpRequest(url: string): Promise<HttpResult> {
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= cfg.fetchUrl.maxAttempts; attempt += 1) {
+    const profile = REQUEST_PROFILES[(attempt - 1) % REQUEST_PROFILES.length]!;
+    try {
+      const result = await makeSingleHttpRequest(url, profile);
+      return {
+        ...result,
+        attempts: attempt,
+      };
+    } catch (error) {
+      const err =
+        error instanceof FetchRequestError
+          ? error
+          : new FetchRequestError(
+              isTimeoutError(error)
+                ? `Request timed out after ${cfg.fetchUrl.timeoutMs}ms`
+                : error instanceof Error
+                ? error.message
+                : "Unknown fetch error",
+              {
+                retryable: isTimeoutError(error) || error instanceof TypeError,
+                profile: profile.name,
+              }
+            );
+      lastError = err;
+
+      logger.warn("fetch_url attempt failed", {
+        url,
+        attempt,
+        maxAttempts: cfg.fetchUrl.maxAttempts,
+        requestProfile: profile.name,
+        statusCode: err.statusCode,
+        retryable: err.retryable,
+        error: err.message,
+      });
+
+      if (!err.retryable || attempt >= cfg.fetchUrl.maxAttempts) {
+        break;
+      }
+
+      await sleep(getRetryDelayMs(attempt));
+    }
+  }
+
+  throw lastError ?? new Error("Failed to fetch URL");
 }
 
 async function storeDocument(
@@ -114,15 +312,17 @@ export function registerFetchUrl(server: McpServer) {
 
       try {
         const result = await makeHttpRequest(url);
-        if (!result) {
-          throw new Error("Failed to fetch URL");
-        }
-
-        const { bytes, contentType } = result;
+        const { bytes, contentType, finalUrl, statusCode, attempts, requestProfile } = result;
+        const htmlText = contentType.startsWith("text/html") ? bytes.toString("utf-8") : null;
+        const crawlHints = htmlText ? extractHtmlHints(htmlText, finalUrl) : {
+          title: null,
+          links: [],
+          sameHostLinks: [],
+        };
 
         const { documentId, objectKey, etag, sourceType, sha256 } = await storeDocument(
           runId,
-          url,
+          finalUrl,
           bytes,
           contentType
         );
@@ -136,7 +336,16 @@ export function registerFetchUrl(server: McpServer) {
           sizeBytes: bytes.length,
           contentType,
           sourceType,
+          url,
+          finalUrl,
+          statusCode,
+          requestAttempts: attempts,
+          requestProfile,
+          timeoutMs: cfg.fetchUrl.timeoutMs,
           sha256,
+          title: crawlHints.title,
+          links: crawlHints.links,
+          sameHostLinks: crawlHints.sameHostLinks,
           evidence: {
             documentId,
             bucket: cfg.minio.bucket,

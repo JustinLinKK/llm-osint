@@ -1,0 +1,17 @@
+.env
+.claude/
+.DS_Store
+openapi.json
+
+# Persistent session files
+.linkedin_context_id
+
+# Output files
+results/
+elonmusk_media/
+linkedin_html/
+my_media/
+
+# Python
+__pycache__/
+*.pyc

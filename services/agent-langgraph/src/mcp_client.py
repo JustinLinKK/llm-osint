@@ -152,6 +152,8 @@ class StreamableHttpMcpClient:
     def __init__(self, server_url: Optional[str] = None) -> None:
         self._server_url = server_url or os.getenv("MCP_SERVER_URL", "http://mcp-server:3001/mcp")
         self._protocol_version = os.getenv("MCP_PROTOCOL_VERSION", "2025-11-25")
+        self._init_timeout_seconds = float(os.getenv("MCP_HTTP_INIT_TIMEOUT_SECONDS", "30"))
+        self._request_timeout_seconds = float(os.getenv("MCP_HTTP_TIMEOUT_SECONDS", "300"))
         self._session_id: Optional[str] = None
         self._started = False
 
@@ -170,7 +172,12 @@ class StreamableHttpMcpClient:
             },
         }
 
-        response = self._post(init_request, include_session=False, include_protocol=False)
+        response = self._post(
+            init_request,
+            include_session=False,
+            include_protocol=False,
+            timeout_seconds=self._init_timeout_seconds,
+        )
         if response is None:
             raise RuntimeError("MCP initialize returned no response")
 
@@ -211,7 +218,12 @@ class StreamableHttpMcpClient:
         }
         logger.info("MCP tool call", extra={"tool": name, "request_id": request_id})
 
-        response = self._post(request, include_session=True, include_protocol=True)
+        response = self._post(
+            request,
+            include_session=True,
+            include_protocol=True,
+            timeout_seconds=self._request_timeout_seconds,
+        )
         if response is None:
             logger.error("MCP empty response", extra={"tool": name, "request_id": request_id})
             return McpCallResult(ok=False, content={"error": "empty response"}, raw={})
@@ -247,9 +259,23 @@ class StreamableHttpMcpClient:
             headers["mcp-protocol-version"] = self._protocol_version
         return headers
 
-    def _post(self, payload: Dict[str, Any], include_session: bool, include_protocol: bool) -> Optional[requests.Response]:
+    def _post(
+        self,
+        payload: Dict[str, Any],
+        include_session: bool,
+        include_protocol: bool,
+        timeout_seconds: Optional[float] = None,
+    ) -> Optional[requests.Response]:
         headers = self._headers(include_session=include_session, include_protocol=include_protocol)
-        response = requests.post(self._server_url, headers=headers, json=payload, timeout=30)
+        timeout = timeout_seconds if timeout_seconds is not None else self._request_timeout_seconds
+        try:
+            response = requests.post(self._server_url, headers=headers, json=payload, timeout=timeout)
+        except requests.RequestException as exc:
+            logger.error(
+                "MCP HTTP request failed",
+                extra={"tool": "mcp_client", "url": self._server_url, "error": str(exc)},
+            )
+            return None
         if response.status_code == 202:
             return None
         return response
@@ -260,7 +286,12 @@ class StreamableHttpMcpClient:
             "method": "notifications/initialized",
             "params": {},
         }
-        self._post(notification, include_session=True, include_protocol=True)
+        self._post(
+            notification,
+            include_session=True,
+            include_protocol=True,
+            timeout_seconds=self._init_timeout_seconds,
+        )
 
 
 def _load_tool_server_map() -> Dict[str, str]:
@@ -270,27 +301,43 @@ def _load_tool_server_map() -> Dict[str, str]:
         "ingest_graph_entity": "normal",
         "ingest_graph_entities": "normal",
         "ingest_graph_relations": "normal",
-        "osint_sherlock_username": "kali",
+        "tavily_research": "normal",
+        "tavily_person_search": "normal",
+        "person_search": "normal",
+        "x_get_user_posts_api": "normal",
+        "linkedin_download_html_ocr": "normal",
+        "google_serp_person_search": "normal",
+        "arxiv_search_and_download": "normal",
+
+        # Kali OSINT core baseline (low-noise defaults for automation).
         "osint_maigret_username": "kali",
-        "osint_whatsmyname_username": "kali",
+        "osint_amass_domain": "kali",
+        "osint_whatweb_target": "kali",
+        "osint_exiftool_extract": "kali",
+
+        # Kali enrichment tools (use with strong post-filtering).
         "osint_holehe_email": "kali",
-        # Disabled by default (requires API key).
-        # HIBP key: https://haveibeenpwned.com/API/Key
-        # "osint_hibp_email": "kali",
         "osint_theharvester_email_domain": "kali",
         "osint_reconng_domain": "kali",
         "osint_spiderfoot_scan": "kali",
-        "osint_amass_domain": "kali",
         "osint_sublist3r_domain": "kali",
-        "osint_dnsdumpster_domain": "kali",
+
+        # Kali manual workflows.
         "osint_maltego_manual": "kali",
         "osint_foca_manual": "kali",
+
+        # Kali deprioritized/legacy (avoid in automated baseline).
+        "osint_sherlock_username": "kali",
+        "osint_whatsmyname_username": "kali",
+        "osint_phoneinfoga_number": "kali",
+        "osint_dnsdumpster_domain": "kali",
+
+        # Disabled by default (requires API key).
+        # HIBP key: https://haveibeenpwned.com/API/Key
+        # "osint_hibp_email": "kali",
         # Disabled by default (requires API key).
         # Shodan key: https://account.shodan.io/
         # "osint_shodan_host": "kali",
-        "osint_whatweb_target": "kali",
-        "osint_exiftool_extract": "kali",
-        "osint_phoneinfoga_number": "kali",
     }
     raw = os.getenv("MCP_TOOL_SERVER_MAP")
     if not raw:
@@ -333,7 +380,7 @@ class RoutedMcpClient:
         self._started_servers.clear()
 
     def call_tool(self, name: str, arguments: Dict[str, Any]) -> McpCallResult:
-        server_name = self._tool_server_map.get(name, "normal")
+        server_name = self._resolve_server_for_tool(name)
         client = self._clients.get(server_name)
         if client is None:
             return McpCallResult(
@@ -348,3 +395,12 @@ class RoutedMcpClient:
 
         logger.info("MCP tool routed", extra={"tool": name, "server": server_name})
         return client.call_tool(name, arguments)
+
+    def _resolve_server_for_tool(self, tool_name: str) -> str:
+        # Keep ingest/fetch on normal to centralize data-plane writes.
+        if tool_name == "fetch_url" or tool_name.startswith("ingest_"):
+            return "normal"
+        # Route all OSINT wrappers to kali by convention.
+        if tool_name.startswith("osint_"):
+            return "kali"
+        return self._tool_server_map.get(tool_name, "normal")

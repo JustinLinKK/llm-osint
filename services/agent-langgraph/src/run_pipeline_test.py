@@ -5,29 +5,37 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 
-import psycopg
-import requests
-from minio import Minio
+try:
+    import psycopg
+except ModuleNotFoundError:  # pragma: no cover - integration dependency
+    psycopg = None
+
+try:
+    import requests
+except ModuleNotFoundError:  # pragma: no cover - integration dependency
+    requests = None
+
+try:
+    from minio import Minio
+except ModuleNotFoundError:  # pragma: no cover - integration dependency
+    Minio = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from minio import Minio as MinioClient
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-
-from logger import get_logger
-from env import load_env
-from mcp_client import RoutedMcpClient
-from planner_graph import run_planner
-
-logger = get_logger(__name__)
-
 
 def _get_dsn() -> str:
     return os.getenv("DATABASE_URL", "postgresql://osint:osint@postgres:5432/osint")
 
 
 def _ensure_run(run_id: str, prompt: str) -> None:
+    if psycopg is None:
+        raise RuntimeError("Missing dependency: psycopg. Install services/agent-langgraph/requirements.txt.")
     dsn = _get_dsn()
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
@@ -42,6 +50,8 @@ def _ensure_run(run_id: str, prompt: str) -> None:
 
 
 def _get_document_object(document_id: str) -> Dict[str, Optional[str]]:
+    if psycopg is None:
+        raise RuntimeError("Missing dependency: psycopg. Install services/agent-langgraph/requirements.txt.")
     dsn = _get_dsn()
     with psycopg.connect(dsn) as conn:
         with conn.cursor() as cur:
@@ -66,6 +76,8 @@ def _get_document_object(document_id: str) -> Dict[str, Optional[str]]:
 
 
 def _fetch_text(url: str, max_chars: int) -> str:
+    if requests is None:
+        raise RuntimeError("Missing dependency: requests. Install services/agent-langgraph/requirements.txt.")
     response = requests.get(url, timeout=30)
     response.raise_for_status()
     text = response.text
@@ -74,7 +86,9 @@ def _fetch_text(url: str, max_chars: int) -> str:
     return text
 
 
-def _get_minio_client() -> Minio:
+def _get_minio_client() -> "MinioClient":
+    if Minio is None:
+        raise RuntimeError("Missing dependency: minio. Install services/agent-langgraph/requirements.txt.")
     endpoint = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
     access_key = os.getenv("MINIO_ACCESS_KEY", "minio")
     secret_key = os.getenv("MINIO_SECRET_KEY", "minio12345")
@@ -106,12 +120,18 @@ def _fetch_text_from_minio(bucket: str, object_key: str, max_chars: int) -> str:
 
 
 def main() -> None:
+    from env import load_env
+    from logger import get_logger
+    from mcp_client import RoutedMcpClient
+    from planner_graph import run_planner
+
+    logger = get_logger(__name__)
     load_env()
     parser = argparse.ArgumentParser(description="Run end-to-end pipeline test")
     parser.add_argument(
         "--url",
-        default="https://en.wikipedia.org/wiki/Joe_Biden",
-        help="Wikipedia URL to fetch",
+        default="http://example.com",
+        help="HTTP URL to fetch for smoke testing",
     )
     parser.add_argument("--max-chars", type=int, default=40000)
     args = parser.parse_args()

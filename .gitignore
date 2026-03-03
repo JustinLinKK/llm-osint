@@ -79,6 +79,7 @@ db.sqlite3-journal
 # ============================================================================
 logs/
 *.log
+*.pid
 
 # ============================================================================
 # OS
@@ -136,3 +137,12 @@ __pypackages__/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ============================================================================
+# Project Runtime Artifacts
+# ============================================================================
+.venv-agent/
+apps/mcp-server/tmp/
+apps/mcp-server/logs/
+services/agent-langgraph/logs/
+person_search_seen_urls.txt

@@ -32,6 +32,18 @@ class ArtifactRecord:
     summary_id: Optional[str]
 
 
+@dataclass
+class ArtifactConfidenceRecord:
+    artifact_id: str
+    tool_name: str
+    kind: str
+    summary_id: str
+    confidence: Optional[float]
+    summary: str
+    key_facts: List[Dict[str, Any]]
+    document_id: Optional[str]
+
+
 def insert_artifact(
     run_id: str,
     tool_name: str,
@@ -168,3 +180,49 @@ def insert_run_note(run_id: str, note: str, citations: List[Dict[str, Any]]) -> 
                 raise RuntimeError("Failed to insert run note")
             logger.info("Run note stored", extra={"run_id": run_id, "note_id": str(row[0])})
             return str(row[0])
+
+
+def list_artifacts_by_confidence(
+    run_id: str,
+    min_confidence: Optional[float] = None,
+) -> List[ArtifactConfidenceRecord]:
+    dsn = _get_dsn()
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    a.artifact_id,
+                    a.tool_name,
+                    a.kind,
+                    s.summary_id,
+                    s.confidence,
+                    s.summary,
+                    s.key_facts,
+                    a.document_id
+                FROM artifacts a
+                JOIN artifact_summaries s ON s.artifact_id = a.artifact_id
+                WHERE a.run_id = %s
+                  AND (%s IS NULL OR s.confidence >= %s)
+                ORDER BY s.confidence DESC NULLS LAST
+                """,
+                (run_id, min_confidence, min_confidence),
+            )
+            rows = cur.fetchall()
+
+    output: List[ArtifactConfidenceRecord] = []
+    for row in rows:
+        key_facts = row[6]
+        output.append(
+            ArtifactConfidenceRecord(
+                artifact_id=str(row[0]),
+                tool_name=str(row[1]),
+                kind=str(row[2]),
+                summary_id=str(row[3]),
+                confidence=float(row[4]) if row[4] is not None else None,
+                summary=str(row[5]),
+                key_facts=key_facts if isinstance(key_facts, list) else [],
+                document_id=str(row[7]) if row[7] is not None else None,
+            )
+        )
+    return output

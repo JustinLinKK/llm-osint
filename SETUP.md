@@ -1,11 +1,16 @@
 # LLM-OSINT Setup Guide
 
-Run the full local pipeline:
+Run the current local stack:
 - Infra: Postgres, MinIO, Neo4j, Qdrant, Redis, Temporal
 - API: Fastify backend
 - MCP servers: normal + kali-osint toolset
 - Agent: LangGraph planner/tool worker
-- Web UI: Tailwind + HeroUI frontend
+- Web UI: React + HeroUI frontend
+
+Current behavior:
+- API autostart runs the LangGraph planner by default
+- Stage 2 report generation is now part of the default run lifecycle
+- The web UI can load the generated report from the API when Stage 2 finishes
 
 ---
 
@@ -63,17 +68,58 @@ pip install -r services/agent-langgraph/requirements.txt
 
 ## 3) Start Infra + MCP/API Containers
 
-Bring up everything needed by agent + UI:
+Normal startup should not rebuild images. This matters for `worker-embedding` and `mcp-server-kali`, which are heavier and usually do not change often.
 
 ```bash
-docker compose -f infra/docker/docker-compose.yml up -d --build \
-  postgres redis minio qdrant neo4j temporal temporal-ui api mcp-server mcp-server-kali
+yarn infra:up
 ```
 
 Check status:
 
 ```bash
-docker compose -f infra/docker/docker-compose.yml ps
+yarn infra:ps
+```
+
+Use a rebuild only when Dockerfiles, Python dependencies, Node dependencies, or base images changed:
+
+```bash
+yarn infra:up:build
+```
+
+Targeted rebuilds for the heavier services:
+
+```bash
+yarn infra:rebuild:embedding
+yarn infra:rebuild:kali
+```
+
+Simple restarts when only env/runtime state changed:
+
+```bash
+yarn infra:restart:all-lite
+yarn infra:restart:api
+yarn infra:restart:embedding
+yarn infra:restart:kali
+```
+
+Use `yarn infra:restart:all-lite` when you want to restart the main infra stack after code changes without touching `mcp-server-kali` or `worker-embedding`.
+
+Code update workflow without touching the two large images:
+
+- For most TypeScript/Python code changes, run `yarn infra:up` and restart only the service you changed.
+- Do not rebuild `worker-embedding` or `mcp-server-kali` unless you changed their Dockerfiles, dependencies, or base image requirements.
+- Examples:
+
+```bash
+yarn infra:restart:all-lite
+yarn infra:restart:api
+docker compose -f infra/docker/docker-compose.yml restart mcp-server
+```
+
+- If you changed only frontend code, run:
+
+```bash
+yarn workspace @osint/web dev
 ```
 
 If using Dev Container, connect it to compose network once:
@@ -96,6 +142,13 @@ for f in infra/db/migrations/*.sql; do
 done
 ```
 
+If you only need the Stage 2 reporting tables:
+
+```bash
+docker compose --env-file infra/docker/.env -f infra/docker/docker-compose.yml exec -T postgres \
+  psql -U osint -d osint < infra/db/migrations/0007_stage2_reports.sql
+```
+
 ---
 
 ## 5) Start Web UI (Local Dev)
@@ -107,6 +160,23 @@ yarn workspace @osint/web dev
 Open: http://localhost:5173
 
 The web app proxies API requests to `http://localhost:3000`.
+
+Restart the web UI after frontend code changes:
+
+```bash
+yarn dev:web
+```
+
+If it is already running in a terminal, stop it with `Ctrl+C` and start it again.
+
+If you need both backend and frontend refreshed after code changes:
+
+```bash
+yarn restart:api-web
+```
+
+`yarn restart:api-web` restarts the Docker `api` service, then starts the web dev server in the current terminal.
+If a previous web dev server is still running, stop it with `Ctrl+C` first.
 
 ---
 
@@ -134,17 +204,68 @@ With `LANGGRAPH_AUTOSTART=true` (default), this now launches
 `services/agent-langgraph/src/run_planner.py` in the background and emits
 `RUN_STARTED`/`RUN_FINISHED` or `RUN_FAILED` events to `run_events`.
 
+In Docker Compose, the `api` image now includes the LangGraph Python runtime,
+so frontend `Start Run` works without running API locally.
+
 List runs (paged):
 
 ```bash
 curl "http://localhost:3000/runs?limit=20&offset=0"
 ```
 
+Verify the local embedder:
+
+```bash
+docker exec worker-embedding nvidia-smi
+docker exec worker-embedding /bin/sh -lc "curl -sS http://127.0.0.1:8000/v1/models"
+docker exec worker-embedding /bin/sh -lc "curl -sS http://127.0.0.1:8000/v1/embeddings -H 'Content-Type: application/json' -d '{\"model\":\"Qwen/Qwen3-Embedding-0.6B\",\"input\":[\"hello world\"]}' | head -c 400"
+docker logs --tail 50 worker-embedding
+```
+
+What to check:
+
+- `nvidia-smi` inside the container shows your GPU and driver.
+- `/v1/models` returns `Qwen/Qwen3-Embedding-0.6B`.
+- `/v1/embeddings` returns `200 OK` with an embedding array.
+- `worker-embedding` logs show `device_config=cuda` and `POST /v1/embeddings HTTP/1.1" 200 OK`.
+
+Verify backend containers can reach the embedder:
+
+```bash
+docker exec docker-mcp-server-1 /bin/sh -lc 'echo $EMBEDDING_API_URL && echo $EMBEDDING_MODEL && getent hosts worker-embedding'
+```
+
+End-to-end ingest + vector retrieval check:
+
+```bash
+RUN_ID=$(python3 - <<'PY'
+import uuid
+print(uuid.uuid4())
+PY
+)
+
+MCP_TEST_TOOL=ingest_text \
+RUN_ID=$RUN_ID \
+MCP_TEST_ARGS="{\"runId\":\"$RUN_ID\",\"text\":\"## Profile\nAda Lovelace wrote notes on the Analytical Engine.\n\n## Interests\nCharles Babbage collaborated with Ada Lovelace on early computing ideas.\",\"sourceUrl\":\"https://example.com/ada-lovelace\",\"title\":\"Ada Lovelace Test\"}" \
+yarn tsx apps/mcp-server/scripts/test-python-tools.ts
+
+MCP_TEST_TOOL=vector_search \
+RUN_ID=$RUN_ID \
+MCP_TEST_ARGS="{\"runId\":\"$RUN_ID\",\"query\":\"Who collaborated with Ada Lovelace on the Analytical Engine?\",\"k\":3}" \
+yarn tsx apps/mcp-server/scripts/test-python-tools.ts
+```
+
+Expected result:
+
+- `ingest_text` returns a `documentId`, `chunkCount`, and `vectorCount`.
+- `vector_search` returns a ranked result containing the ingested Ada/Charles snippet.
+- If you switched embedding models and hit a Qdrant vector dimension mismatch, set a new `QDRANT_COLLECTION` in `.env` and restart `mcp-server` plus `mcp-server-kali` so a fresh collection is created for the new embedding size.
+
 ---
 
 ## 7) Run Agent Pipeline Test
 
-With virtualenv active:
+With virtualenv active, run the integration script explicitly:
 
 ```bash
 . .venv-agent/bin/activate
@@ -172,7 +293,23 @@ export MCP_SERVER_KALI_URL=http://localhost:3002/mcp
 
 ---
 
-## 8) Access UIs
+## 8) Run Automated Tests
+
+Agent-langgraph unit/regression tests:
+
+```bash
+. .venv-agent/bin/activate
+cd services/agent-langgraph
+pytest -q
+```
+
+Notes:
+- `src/run_pipeline_test.py` is an integration runner script and is intentionally excluded from `pytest` collection.
+- Use section 7 to run that script directly when you want end-to-end validation.
+
+---
+
+## 9) Access UIs
 
 - Web UI: http://localhost:5173
 - MinIO Console: http://localhost:9001 (`minio` / `minio12345`)
@@ -182,7 +319,7 @@ export MCP_SERVER_KALI_URL=http://localhost:3002/mcp
 
 ---
 
-## 9) Common Operations
+## 10) Common Operations
 
 Tail logs:
 
@@ -206,7 +343,7 @@ docker compose -f infra/docker/docker-compose.yml down -v
 
 ---
 
-## 10) Troubleshooting
+## 11) Troubleshooting
 
 - `externally-managed-environment` during OSINT image build:
   - fixed by installing pip packages into `/opt/osint-venv` in `install-osint-tools.sh`.
@@ -215,7 +352,13 @@ docker compose -f infra/docker/docker-compose.yml down -v
   - run `docker network connect docker_default $(hostname)` once.
 
 - `ingest_text` fails with OpenRouter error:
-  - set `OPENROUTER_API_KEY` in `.env`.
+  - if `EMBEDDING_PROVIDER=openrouter`, set `OPENROUTER_API_KEY` in `.env`.
+  - if `EMBEDDING_PROVIDER=vllm` or `custom`, verify `EMBEDDING_API_URL`.
 
-- Some OSINT packages unavailable (`spiderfoot`, `recon-ng`, apt `amass`):
-  - currently non-fatal warnings in image build.
+- The `mcp-server-kali` image is a curated Debian-based OSINT image (not full Kali):
+  - tool installs are best-effort in `infra/docker/install-osint-tools.sh`; check build logs for warnings.
+  - if wrappers return passive fallback warnings, rebuild `mcp-server-kali`.
+
+- `worker-embedding` first boot is slow:
+  - the first pull of `vllm/vllm-openai:latest` is large.
+  - after that, prefer `yarn infra:restart:embedding` over full rebuilds.

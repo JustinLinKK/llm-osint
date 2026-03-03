@@ -20,6 +20,16 @@ export const cfg = {
     collection: process.env.QDRANT_COLLECTION ?? "osint_chunks",
   },
 
+  embeddings: {
+    provider: process.env.EMBEDDING_PROVIDER ?? "openrouter",
+    apiUrl: process.env.EMBEDDING_API_URL,
+    apiKey: process.env.EMBEDDING_API_KEY,
+    model:
+      process.env.EMBEDDING_MODEL ??
+      process.env.OPENROUTER_EMBED_MODEL ??
+      "openai/text-embedding-3-small",
+  },
+
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY,
     embedModel: process.env.OPENROUTER_EMBED_MODEL ?? "openai/text-embedding-3-small",
@@ -41,6 +51,12 @@ export const cfg = {
     accessKey: process.env.MINIO_ACCESS_KEY ?? "minio",
     secretKey: process.env.MINIO_SECRET_KEY ?? "minio12345",
     bucket: process.env.MINIO_BUCKET ?? "osint-raw"
+  },
+
+  fetchUrl: {
+    timeoutMs: Math.max(1000, Number(process.env.FETCH_URL_TIMEOUT_MS ?? "15000")),
+    maxAttempts: Math.max(1, Number(process.env.FETCH_URL_MAX_ATTEMPTS ?? "3")),
+    retryDelayMs: Math.max(100, Number(process.env.FETCH_URL_RETRY_DELAY_MS ?? "750")),
   },
 
   python: {

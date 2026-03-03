@@ -1,274 +1,152 @@
 # OSINT MCP Server
 
-Production-grade Model Context Protocol (MCP) server for OSINT tool execution.
+MCP server for OSINT collection, ingestion, and evidence retrieval.
 
-Built following the [official MCP tutorial](https://modelcontextprotocol.io/docs/develop/build-server).
+## Current Architecture
 
-## Architecture
+- Protocol: JSON-RPC 2.0
+- Transport: **Streamable HTTP**
+- Endpoint: `/mcp`
+- SDK: `@modelcontextprotocol/sdk`
 
-This is a **proper MCP server** following the [Model Context Protocol specification](https://modelcontextprotocol.io):
+The server is session-based:
 
-- **Protocol**: JSON-RPC 2.0
-- **Transport**: SSE (Server-Sent Events) for HTTP
-- **SDK**: `@modelcontextprotocol/sdk`
+1. client initializes with `POST /mcp`
+2. server returns an `mcp-session-id`
+3. subsequent tool calls reuse that session id
+4. client closes the session with `DELETE /mcp`
+
+Two runtime modes are used in this repo:
+
+- default server on port `3001`
+- curated OSINT/Kali preset server on port `3002`
 
 ## Structure
 
-```
+```text
 src/
-├── index.ts              # MCP server entrypoint
-├── config.ts             # Environment configuration
-├── tools/                # MCP tools (one per file)
-│   ├── fetch_url.ts
-│   ├── ingest_text.ts
-│   └── ingest_graph_entity.ts
-│   └── tools_python/      # Python tools used via MCP bridge
-└── clients/              # External service clients
-    ├── pg.ts             # Postgres connection
-    └── minio.ts          # MinIO client
+  index.ts                    # HTTP MCP entrypoint
+  config.ts                   # Env/config loading
+  tools/
+    fetch_url.ts
+    ingest_text.ts
+    ingest_graph_entity.ts
+    report_query_tools.ts
+    python_tools.ts
+    tools_python/             # Python wrappers and research integrations
+  clients/
+    pg.ts
+    minio.ts
 scripts/
-└── test-ingest-graph.ts   # MCP graph-ingest test script
-└── test-ingest-text.ts    # MCP vector ingest test script
-└── test-fetch-url.ts      # MCP fetch URL test script
-└── test-python-tools.ts    # MCP Python tool bridge test script
+  test-fetch-url.ts
+  test-ingest-text.ts
+  test-ingest-graph.ts
+  test-python-tools.ts
+  test-research-python-tools-http.sh
 ```
 
-## Endpoints
+## Implemented Tools
 
-### `GET /health`
-Health check endpoint.
+Core ingest tools:
 
-**Response:**
-```json
-{"ok": true}
-```
+- `fetch_url`
+- `ingest_text`
+- `ingest_graph_entity`
+- `ingest_graph_entities`
+- `ingest_graph_relations`
 
-### `GET /sse`
-MCP SSE endpoint - clients connect here.
+Retrieval/query tools:
 
-Follows the official MCP SSE transport pattern.
+- `vector_search`
+- `vector_get_document`
+- `graph_get_entity`
+- `graph_neighbors`
+- `graph_search_entities`
 
-## Tools
+Python-backed research tools:
 
-### `fetch_url`
-Fetches a URL via HTTP GET and stores raw response to MinIO + Postgres.
+- default runtime exposes research-integration tools such as `person_search`, `x_get_user_posts_api`, `linkedin_download_html_ocr`, `google_serp_person_search`, and `arxiv_search_and_download`
+- OSINT runtime exposes curated wrappers such as `osint_maigret_username`, `osint_amass_domain`, `osint_whatweb_target`, `osint_exiftool_extract`, and related preset tools
 
-**Input:**
-```json
-{
-  "runId": "uuid",
-  "url": "https://example.com"
-}
-```
+## Behavior
 
-**Output:**
-```json
-{
-  "documentId": "uuid",
-  "bucket": "osint-raw",
-  "objectKey": "runs/.../raw/html/...",
-  "etag": "...",
-  "sizeBytes": 1234,
-  "contentType": "text/html"
-}
-```
+`fetch_url`:
+- stores raw bytes in MinIO
+- writes `documents` + `document_objects`
+- logs `tool_calls`
+- emits `TOOL_CALL_STARTED` / `TOOL_CALL_FINISHED`
 
-**Side effects:**
-- Stores raw bytes to MinIO
-- Inserts document + document_object to Postgres
-- Emits `TOOL_CALL_STARTED` and `TOOL_CALL_FINISHED` events
-- Logs to `tool_calls` table
+`ingest_text`:
+- chunks text
+- generates embeddings through OpenRouter
+- upserts vectors into Qdrant
+- stores chunk rows in Postgres
 
-### `ingest_text`
-Ingests raw text into Postgres + Qdrant (chunk → embed → upsert).
+Graph ingest tools:
+- upsert entities/relations into Neo4j
+- keep evidence references on nodes/edges
+- normalize merge keys for URLs, emails, domains, names, and locations
 
-### `ingest_graph_entity`
-Ingests graph entities and relationships with evidence. Locations merge by lat/lon with a distance threshold.
+Query tools:
+- let the Stage 2 report graph retrieve evidence from Qdrant, Postgres, and Neo4j
 
-**Mitigations applied:**
-- **Location**: requires `lat/lon` (or address to geocode) and merges within a distance threshold.
-- **Email**: normalized to lowercase before merge (`address_normalized`).
-- **Domain**: normalized to lowercase and strips leading `www.`.
-- **Article URL**: normalized (lowercased host, hash removed, trailing slash trimmed).
-- **Person/Organization name**: normalized (`name_normalized`) used when no stable ID is provided.
-
-## Environment Variables
+## Environment
 
 ```bash
-MCP_PORT=3001                                      # Server port
+MCP_PORT=3001
 DATABASE_URL=postgresql://osint:osint@postgres:5432/osint
 MINIO_ENDPOINT=http://minio:9000
 MINIO_ACCESS_KEY=minio
 MINIO_SECRET_KEY=minio12345
 MINIO_BUCKET=osint-raw
-PYTHON_BIN=python3                                 # Optional override
-MCP_PYTHON_TOOLS='[]'                              # Optional JSON tool config
-MCP_TOOLSET=default                                # Optional preset (default | kali-osint)
-X_BEARER_TOKEN=                                    # Optional, X API
-BROWSERBASE_API_KEY=                               # Optional, Browserbase
-BROWSERBASE_PROJECT_ID=                            # Optional, Browserbase
-LINKEDIN_EMAIL=                                    # Optional, LinkedIn scraping
-LINKEDIN_PASSWORD=                                 # Optional, LinkedIn scraping
-HIBP_API_KEY=                                      # Optional, HaveIBeenPwned API
-SHODAN_API_KEY=                                    # Optional, Shodan API
-X_TEST_USERNAME=                                   # Optional, test helper
+QDRANT_URL=http://qdrant:6333
+QDRANT_COLLECTION=osint_chunks
+NEO4J_URI=bolt://neo4j:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=neo4jpassword
+PYTHON_BIN=python3
+MCP_PYTHON_TOOLS=[]
+MCP_TOOLSET=default
 ```
 
-See the example environment file in
-[apps/mcp-server/src/tools/tools_python/env.example](apps/mcp-server/src/tools/tools_python/env.example).
-
-## Python Tool Bridge (Option B)
-
-You can keep the Node MCP server and call Python tools as subprocesses.
-Define tools in `MCP_PYTHON_TOOLS` and provide a Python script path. Each script reads JSON
-from stdin and returns JSON on stdout.
-
-Example config:
-
-```bash
-MCP_PYTHON_TOOLS='[
-  {
-    "name": "x_get_user_posts",
-    "description": "Fetch X posts via API",
-    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_user_posts.py",
-    "timeoutMs": 30000
-  },
-  {
-    "name": "x_get_user_posts_browserbase",
-    "description": "Fetch X posts via Browserbase",
-    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_user_posts_browserbase.py",
-    "timeoutMs": 60000
-  },
-  {
-    "name": "linkedin_get_posts_browserbase",
-    "description": "Fetch LinkedIn posts via Browserbase",
-    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_linkedin_posts_browserbase.py",
-    "timeoutMs": 90000
-  }
-]'
-```
-
-Python tool protocol:
-
-- **stdin**: `{ "tool": "extract_entities", "input": { ... } }`
-- **stdout**: `{ "ok": true, "result": { ... } }` or `{ "ok": false, "error": "..." }`
-
-Minimal Python wrapper:
-
-```python
-import json
-import sys
-
-def main():
-    payload = json.load(sys.stdin)
-    tool = payload.get("tool")
-    input_data = payload.get("input", {})
-
-    # TODO: call your actual tool code here.
-    result = {"echo": input_data, "tool": tool}
-
-    json.dump({"ok": True, "result": result}, sys.stdout)
-
-if __name__ == "__main__":
-    main()
-```
-
-### Built-in Kali OSINT preset
-
-Set `MCP_TOOLSET=kali-osint` to auto-register a curated CLI wrapper set (no `MCP_PYTHON_TOOLS` JSON required):
-
-- `osint_sherlock_username`
-- `osint_maigret_username`
-- `osint_holehe_email`
-- `osint_hibp_email` (requires `HIBP_API_KEY`)
-- `osint_theharvester_email_domain`
-- `osint_reconng_domain`
-- `osint_spiderfoot_scan`
-- `osint_amass_domain`
-- `osint_sublist3r_domain`
-- `osint_dnsdumpster_domain`
-- `osint_shodan_host` (requires `SHODAN_API_KEY`)
-- `osint_whatweb_target`
-- `osint_exiftool_extract`
-- `osint_phoneinfoga_number`
-- `osint_whatsmyname_username`
-- `osint_maltego_manual` (manual handoff placeholder)
-- `osint_foca_manual` (manual handoff placeholder)
-
-The preset routes all tools through:
-`apps/mcp-server/src/tools/tools_python/osint_tool_runner.py`.
+See [env.example](/workspaces/llm-osint/apps/mcp-server/src/tools/tools_python/env.example) for optional provider credentials.
 
 ## Running
 
-### Development
-```bash
-yarn dev
-```
-
-### Production (Docker)
-```bash
-docker compose up mcp-server
-```
-
-### Dual server setup (normal + kali tools)
-```bash
-docker compose up mcp-server mcp-server-kali
-```
-
-## Test: Graph Ingest Tool
-
-Run the MCP graph-ingest test script (uses stdio transport and inserts a run if needed):
+Development:
 
 ```bash
-RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-graph.ts
+yarn workspace @osint/mcp-server dev
 ```
 
-## Test: Vector Ingest Tool
+Docker:
 
 ```bash
-RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-text.ts
+docker compose -f infra/docker/docker-compose.yml up -d mcp-server
+docker compose -f infra/docker/docker-compose.yml up -d mcp-server-kali
 ```
 
-## Test: Fetch URL Tool
+## Tests
 
 ```bash
 RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-fetch-url.ts
-```
-
-## Test: Python Tool Bridge
-
-Configure a tool in `MCP_PYTHON_TOOLS` and ensure required credentials exist in `.env`.
-For the default test, set `X_TEST_USERNAME` (and `X_BEARER_TOKEN` for the API tool).
-
-```bash
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-text.ts
+RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-ingest-graph.ts
 RUN_ID=<optional-uuid> yarn tsx apps/mcp-server/scripts/test-python-tools.ts
 ```
 
-## Client Usage (Python)
+`test-python-tools.ts` uses the HTTP MCP client transport and is the right shape for the current server.
 
-```python
-from mcp import ClientSession
-from mcp.client.sse import sse_client
+## Current Status
 
-async with sse_client("http://mcp-server:3001/sse") as (read, write):
-    async with ClientSession(read, write) as session:
-        # Initialize
-        await session.initialize()
-        
-        # List tools
-        tools = await session.list_tools()
-        
-        # Call tool
-        result = await session.call_tool("fetch_url", {
-            "runId": "...",
-            "url": "https://example.com"
-        })
-```
+Implemented and used by the repo today:
 
-## Design Principles
+- HTTP MCP transport
+- LangGraph HTTP client integration
+- ingest/vector/graph/query tools
+- Python bridge for research and curated OSINT tools
 
-1. **Evidence-first**: Raw bytes always stored in MinIO
-2. **Auditable**: Every tool call logged to `tool_calls` table
-3. **Observable**: Events emitted to `run_events` for UI streaming
-4. **Stateless tools**: Tools are pure functions
-5. **MCP compliant**: Follows official specification exactly
+Still pending:
+
+- generic provider-backed `web_search` tool abstraction
+- stronger per-tool budgets, allowlists, and rate-limiting

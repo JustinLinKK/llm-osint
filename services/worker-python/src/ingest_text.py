@@ -190,23 +190,32 @@ def insert_chunks(conn: psycopg.Connection, document_id: str, chunks: List[Chunk
 
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
-    api_key = os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY not set")
+    provider = os.getenv("EMBEDDING_PROVIDER", "openrouter").lower()
+    model = os.getenv("EMBEDDING_MODEL") or os.getenv(
+        "OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small"
+    )
+    embedding_api_url = os.getenv("EMBEDDING_API_URL")
 
-    model = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small")
-    payload = {
-        "model": model,
-        "input": texts,
-    }
+    headers = {"Content-Type": "application/json"}
+    if provider == "openrouter":
+        url = embedding_api_url or "https://openrouter.ai/api/v1/embeddings"
+        api_key = os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set EMBEDDING_API_KEY or OPENROUTER_API_KEY")
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif embedding_api_url:
+        url = embedding_api_url
+        api_key = os.getenv("EMBEDDING_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+    else:
+        raise RuntimeError("Set EMBEDDING_API_URL for non-openrouter embedding provider")
+
     response = requests.post(
-        "https://openrouter.ai/api/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=60,
+        url,
+        headers=headers,
+        json={"model": model, "input": texts},
+        timeout=120,
     )
     response.raise_for_status()
     data = response.json()
@@ -288,7 +297,9 @@ def ingest_text(
     dsn = os.getenv("DATABASE_URL", "postgresql://osint:osint@postgres:5432/osint")
     qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333")
     collection = os.getenv("QDRANT_COLLECTION", "osint_chunks")
-    embed_model = os.getenv("OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small")
+    embed_model = os.getenv("EMBEDDING_MODEL") or os.getenv(
+        "OPENROUTER_EMBED_MODEL", "openai/text-embedding-3-small"
+    )
 
     chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
 

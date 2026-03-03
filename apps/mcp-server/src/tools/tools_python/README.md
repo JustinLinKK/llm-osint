@@ -1,14 +1,13 @@
-# Social Media Posts Fetcher
+# Python OSINT Tools
 
-Fetch posts from social media profiles (X/Twitter, LinkedIn) using multiple approaches.
+Python helpers exposed through the MCP Python bridge.
 
 ## Supported Platforms
 
 | Platform | Script | Method |
 |----------|--------|--------|
 | X (Twitter) | `get_user_posts.py` | Official API v2 |
-| X (Twitter) | `get_user_posts_browserbase.py` | Browserbase scraping |
-| LinkedIn | `get_linkedin_posts_browserbase.py` | Browserbase scraping |
+| Unified MCP wrapper | `unified_research_mcp.py` | `person_search` + research integration tools |
 
 ## Prerequisites
 
@@ -58,19 +57,45 @@ Example:
 ```bash
 MCP_PYTHON_TOOLS='[
   {
-    "name": "x_get_user_posts",
-    "description": "Fetch X posts via API",
-    "scriptPath": "apps/mcp-server/src/tools/tools_python/get_user_posts.py",
-    "timeoutMs": 30000
+    "name": "person_search",
+    "description": "Search web pages about a person and extract page content",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/unified_research_mcp.py",
+    "timeoutMs": 120000
+  },
+  {
+    "name": "x_get_user_posts_api",
+    "description": "Fetch X posts via official API v2 (research integration)",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/unified_research_mcp.py",
+    "timeoutMs": 180000
+  },
+  {
+    "name": "linkedin_download_html_ocr",
+    "description": "Download LinkedIn profile/activity HTML via Browserbase (research integration)",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/unified_research_mcp.py",
+    "timeoutMs": 300000
+  },
+  {
+    "name": "google_serp_person_search",
+    "description": "Search person via Google SERP service and archive HTML results (research integration)",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/unified_research_mcp.py",
+    "timeoutMs": 180000
+  },
+  {
+    "name": "arxiv_search_and_download",
+    "description": "Search arXiv and download papers (research integration)",
+    "scriptPath": "apps/mcp-server/src/tools/tools_python/unified_research_mcp.py",
+    "timeoutMs": 300000
   }
 ]'
 ```
 
 MCP input payloads use JSON with the following fields:
 
-- `x_get_user_posts`: `{ "runId": "...", "username": "openai", "max_results": 10, "raw": false }`
-- `x_get_user_posts_browserbase`: `{ "runId": "...", "username": "openai", "max_posts": 10 }`
-- `linkedin_get_posts_browserbase`: `{ "runId": "...", "profile": "https://www.linkedin.com/in/username", "max_posts": 10, "reset_session": false }`
+- `person_search`: `{ "runId": "...", "name": "Barbara Liskov", "max_results": 5, "delay": 1.0, "request_timeout": 10.0, "download_dir": null, "seen_urls": null, "no_cache": false }`
+- `x_get_user_posts_api`: `{ "runId": "...", "username": "openai", "max_results": 10, "download_media": false }`
+- `linkedin_download_html_ocr`: `{ "runId": "...", "profile": "https://www.linkedin.com/in/username", "output_dir": "linkedin_html", "reset_session": false }`
+- `google_serp_person_search`: `{ "runId": "...", "target_name": "Sam Altman", "max_results": 10, "output_dir": "results/sam_search" }`
+- `arxiv_search_and_download`: `{ "runId": "...", "author": "Geoffrey Hinton", "max_results": 5, "output_dir": "results/arxiv_hinton" }`
 
 ## MCP Test Script
 

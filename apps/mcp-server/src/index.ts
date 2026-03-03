@@ -8,6 +8,7 @@ import {
   registerIngestGraphEntities,
   registerIngestGraphRelations,
 } from "./tools/ingest_graph_entity.js";
+import { registerReportQueryTools } from "./tools/report_query_tools.js";
 import { registerPythonTools } from "./tools/python_tools.js";
 import { logger } from "./utils/logger.js";
 import http from "node:http";
@@ -31,11 +32,17 @@ function createServer(): McpServer {
     }
   );
 
+  const toolset = (process.env.MCP_TOOLSET ?? "default").toLowerCase();
+  const isKaliOsintOnly = toolset === "kali-osint";
+
   registerFetchUrl(server);
-  registerIngestText(server);
-  registerIngestGraphEntity(server);
-  registerIngestGraphEntities(server);
-  registerIngestGraphRelations(server);
+  if (!isKaliOsintOnly) {
+    registerIngestText(server);
+    registerIngestGraphEntity(server);
+    registerIngestGraphEntities(server);
+    registerIngestGraphRelations(server);
+    registerReportQueryTools(server);
+  }
   registerPythonTools(server);
 
   return server;

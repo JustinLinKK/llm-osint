@@ -1,240 +1,100 @@
+# Current Checkpoint
 
-## ✅ Current Project Status
+Last reviewed against the current worktree on **February 27, 2026**.
 
-Successfully built a **production‑grade OSINT ingestion foundation**.
+## Repository Progress
 
-### Infrastructure (Docker Compose)
-Running services on a shared Docker network:
+The repository is beyond "infra setup only". It now has a working Stage 1 path:
 
-- **PostgreSQL 16** – authoritative metadata & provenance ledger  
-- **MinIO (Erasure Mode + Versioning)** – immutable evidence storage  
-- **Qdrant** – vector database (wired via MCP ingest_text)  
-- **Neo4j** – graph database (wired via MCP graph ingest tool)  
-- **Redis** – cache / coordination  
-- **Temporal + Temporal UI** – workflow orchestration  
-- **API (Node 20, Yarn 4, Fastify)** – containerized, production‑style
+- Docker Compose stack for Postgres, MinIO, Redis, Qdrant, Neo4j, Temporal, API, and MCP servers
+- Fastify API for creating runs, streaming run events, listing runs, listing stored files, reading graph snapshots, and fetching the latest report artifact
+- MCP server over **Streamable HTTP** with deterministic ingest/query tools and Python-backed research/OSINT tools
+- LangGraph planner and tool-worker graphs with receipts, run notes, vector ingest, and graph ingest
+- Web UI that can start runs, follow live events, and inspect file/graph evidence after a run finishes
 
-All services communicate via **container DNS** (no `localhost` misuse).
+## What Exists But Is Not Fully Wired
 
----
+- `services/agent-langgraph/src/report_graph.py` implements a Stage 2 report subgraph
+- `infra/db/migrations/0007_stage2_reports.sql` adds Stage 2 persistence tables
+- `services/agent-langgraph/src/run_planner.py` can invoke Stage 2 with `--run-stage2`
 
-### Data Model (Postgres – Live)
+Current limitation:
+- API autostart only launches Stage 1 today; Stage 2 is not part of the default run lifecycle yet
+- Temporal worker code is still a placeholder and does not orchestrate the real pipeline
 
-Verified tables:
-
-- `runs` – investigation sessions  
-- `documents` – logical artifacts  
-- `document_objects` – MinIO object pointers (bucket/key/version/etag)  
-- `chunks` – text chunks (for vector DB)  
-- `tool_calls` – agentic audit log  
-- `run_events` – observability events (SSE source)
-- `reports` – report pointers + status
-- `artifacts` – tool output storage pointers (bucket/key/version/etag)
-- `artifact_summaries` – compact summaries + key facts
-- `tool_call_receipts` – per-tool receipts (summary + ids + upsert stats)
-- `run_notes` – noteboard notes with citations
-
-This schema is:
-- Auditable  
-- Evidence‑anchored  
-- Production‑appropriate  
-
----
-
-### API Capabilities (Working)
-
-- `GET /health`
-- `POST /runs`
-- `POST /runs/:runId/ingest-text`
-- `GET /runs/:runId/events` (SSE)
-- `GET /runs/:runId` (status + latest report pointer)
-- `GET /runs/:runId/report` (render report + citations)
-
-End‑to‑end flow works:
-**API → MinIO (raw bytes) → Postgres (provenance metadata)**
-
----
-
-### MCP + LangGraph (Working)
-
-- MCP server `fetch_url` tool (HTTP GET → MinIO + Postgres + run_events)
-- MCP server `ingest_text` tool (chunk → embed via OpenRouter → Qdrant + Postgres)
-- MCP server `ingest_graph_entity` tool (Neo4j ingest with normalization + location merge by lat/lon threshold)
-- MCP server runs in Docker via Streamable HTTP transport on port 3001
-- LangGraph pipeline uses network MCP client (no local stdio server)
-- LangGraph Planner (Python) with tool planning + MCP execution
-- LangGraph tool-worker subgraph (per-tool micro-agent receipts + storage)
-- OpenRouter LLM integration for planning (fallback to heuristic URL extraction)
-
-Planner test: OpenRouter → `fetch_url` → document stored in MinIO and logged in Postgres.
-Receipt test: planner → tool worker → `tool_call_receipts` row + `run_notes` entry.
-Vector test: MCP `ingest_text` → chunks stored in Postgres + vectors upserted to Qdrant.
-Graph test: MCP `ingest_graph_entity` → nodes + evidence links in Neo4j.
-Network test: pipeline calls MCP over HTTP (containerized server) end-to-end.
-
----
-
-## 🧠 What Is Intentionally Not Done Yet
-
-- Automated processing pipeline (chunking/embedding worker orchestration)
-- Graph extraction pipeline (automated entity/claim extraction)
-- LLM summarization & reasoning
-- Temporal orchestration of the LangGraph planner
-
-The foundation is now stable enough to add these without refactors.
-
----
-
-# ⚡ Quick Start (After a Break)
-
-## 1. Open in Dev Container
-
-In VS Code:
-
-```
-Command Palette → Dev Containers: Open Folder in Container
-```
-
-Choose **“Clone repository in container volume”**.
-
----
-
-## 2. Start All Services
-
-From repo root **inside the devcontainer**:
-
-```bash
-docker compose -f infra/docker/docker-compose.yml up -d
-```
-
-Check status:
-
-```bash
-docker compose -f infra/docker/docker-compose.yml ps
-```
-
----
-
-## 2.1 Apply Database Migrations (Required)
-
-Run all SQL files in order from `infra/db/migrations`:
-
-```bash
-PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
-NET=$(docker inspect "$PG_CID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
-
-for f in infra/db/migrations/*.sql; do
-  docker run --rm -i --network "$NET" -e PGPASSWORD=osint postgres:16 \
-    psql -h postgres -U osint -d osint -v ON_ERROR_STOP=1 < "$f"
-done
-```
-
-Re-run this after adding new migrations.
-
-## 2.2 Verify Micro-agent Receipts
-
-Tool workers write receipts and noteboard notes to Postgres:
-
-```bash
-PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
-NET=$(docker inspect "$PG_CID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
-
-docker run --rm --network "$NET" -e PGPASSWORD=osint postgres:16 \
-  psql -h postgres -U osint -d osint \
-  -c "SELECT tool_name, ok, created_at FROM tool_call_receipts ORDER BY created_at DESC LIMIT 5;"
-```
-
-## 3. Verify Core Services
+## Component Snapshot
 
 ### API
-```bash
-curl http://localhost:3000/health
-# Expected: {"ok":true}
-```
+- Working:
+  - `POST /runs`
+  - `GET /runs`
+  - `GET /runs/:runId`
+  - `GET /runs/:runId/events`
+  - `GET /runs/:runId/files`
+  - `GET /runs/:runId/graph`
+  - `GET /runs/:runId/report`
+  - `PATCH /runs/:runId/title`
+- Behavior:
+  - creating a run writes `RUN_CREATED`
+  - API spawns the LangGraph planner in the background
+  - successful planner exit marks the run `done`
 
-### MinIO Console
-- URL: http://localhost:9001  
-- User: `minio`  
-- Password: `minio12345`  
-- Bucket: `osint-raw` (versioning enabled)
+### MCP Server
+- Transport: Streamable HTTP at `/mcp`
+- Core tools:
+  - `fetch_url`
+  - `ingest_text`
+  - `ingest_graph_entity`
+  - `ingest_graph_entities`
+  - `ingest_graph_relations`
+- Retrieval/query tools:
+  - `vector_search`
+  - `vector_get_document`
+  - `graph_get_entity`
+  - `graph_neighbors`
+  - `graph_search_entities`
+- Python bridge:
+  - research integration tools are available by default
+  - curated Kali/preset tools are exposed on the dedicated OSINT image
 
-### Temporal UI
-- http://localhost:8233
+### LangGraph
+- Stage 1:
+  - planner extracts URLs/domains/usernames and chooses tools
+  - tool worker normalizes tool output, optionally ingests vector/graph data, and persists receipts
+- Stage 2:
+  - outline generation
+  - vector retrieval + graph context
+  - claim extraction/verification
+  - section drafting
+  - refinement rounds
+  - persistence to `report_runs`, `section_drafts`, `claim_ledger`, `evidence_refs`
 
-### Neo4j Browser
-- http://localhost:7474  
-- User: `neo4j`  
-- Password: `neo4jpassword`
+### Web UI
+- Implemented:
+  - run list
+  - prompt composer
+  - live event timeline
+  - file evidence panel
+  - simple graph evidence visualization
+- Not implemented:
+  - file upload flow
+  - report reader with citations
 
----
+### Workers
+- `services/worker-python` contains chunk/embed logic
+- `services/worker-temporal` still emits placeholder events rather than running the real system
 
-## 4. Create a Run (Investigation Session)
+## Validation Run
 
-```bash
-curl -X POST http://localhost:3000/runs \
-  -H 'content-type: application/json' \
-  -d '{"prompt":"sanity test"}'
-```
+The following checks passed during this review:
 
-Response:
-```json
-{ "runId": "UUID" }
-```
+- `pytest -q` in `services/agent-langgraph` -> `1 passed`
+- `yarn workspace @osint/api build`
+- `yarn workspace @osint/mcp-server build`
+- `yarn workspace @osint/web build`
 
-Save the `runId`.
+Not covered by this checkpoint:
 
----
-
-## 5. Ingest Raw Text (End‑to‑End Proof)
-
-```bash
-curl -X POST http://localhost:3000/runs/<RUN_ID>/ingest-text \
-  -H 'content-type: application/json' \
-  -d '{
-    "text": "hello osint",
-    "sourceUrl": "https://example.com",
-    "title": "Example Document"
-  }'
-```
-
-This will:
-- Upload raw bytes to **MinIO**
-- Insert metadata into **Postgres**
-- Link evidence immutably
-
----
-
-## 6. Verify Data in Postgres (Optional)
-
-```bash
-PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
-NET=$(docker inspect "$PG_CID" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}')
-
-docker run --rm --network "$NET" -e PGPASSWORD=osint postgres:16 \
-  psql -h postgres -U osint -d osint \
-  -c "SELECT document_id, source_url, sha256 FROM documents;"
-```
-
----
-
-## 7. Stop Everything
-
-```bash
-docker compose -f infra/docker/docker-compose.yml down
-```
-
----
-
-# 🧭 Recommended Next Steps
-
-Correct technical progression:
-
-1. Reliable **MinIO `version_id` capture** (AWS S3 SDK v3)  
-2. **Temporal wiring for LangGraph planner**  
-3. **Processing pipeline for chunking + Qdrant embeddings**  
-4. **Automated Neo4j extraction pipeline (entities + claims)**  
-5. **LLM evidence‑backed summarization & reflection**
-
----
-
-**You now have a solid, production‑grade OSINT ingestion backbone.**
+- full end-to-end Docker integration run
+- actual external tool execution against live providers
+- Temporal workflow execution

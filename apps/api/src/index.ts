@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import neo4j from "neo4j-driver";
 import { cfg } from "./config.js";
 import { createRun, ingestRawBytes } from "./services/ingest.js";
 import { listRunEvents } from "./services/events.js";
@@ -7,6 +8,11 @@ import { minio } from "./clients/minio.js";
 import { neo4jDriver } from "./clients/neo4j.js";
 
 const app = Fastify({ logger: true });
+
+type StoredObjectRef = {
+  bucket: string;
+  objectKey: string;
+};
 
 function parsePositiveInt(raw: unknown, fallback: number, max: number): number {
   const value = Number(raw);
@@ -38,6 +44,119 @@ function normalizeNeo4jValue(value: unknown): unknown {
   return value;
 }
 
+function pickFirstString(
+  props: Record<string, unknown>,
+  keys: string[]
+): string | null {
+  for (const key of keys) {
+    const value = props[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+function truncateGraphText(value: string, maxLength: number): string {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatRelationType(type: string): string {
+  return type
+    .toLowerCase()
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function deriveGraphNodeDisplay(
+  labels: string[],
+  props: Record<string, unknown>,
+  fallbackId: string
+): string {
+  const preferred = pickFirstString(props, [
+    "display_name",
+    "displayName",
+    "name",
+    "title",
+    "username",
+    "handle",
+    "domain",
+    "address",
+    "email",
+    "uri",
+    "url",
+    "snippet_id",
+    "sourceTool"
+  ]);
+  if (preferred) return truncateGraphText(preferred, 96);
+
+  if (labels.includes("Snippet")) {
+    const text = pickFirstString(props, ["text", "toolSummary"]);
+    if (text) return `Snippet: ${truncateGraphText(text, 84)}`;
+  }
+
+  if (labels.includes("Article")) {
+    const articleRef = pickFirstString(props, ["uri", "url"]);
+    if (articleRef) return truncateGraphText(articleRef, 96);
+  }
+
+  const stableKey = pickFirstString(props, [
+    "person_id",
+    "org_id",
+    "location_id",
+    "address_normalized",
+    "name_normalized",
+    "uri_normalized",
+    "snippet_id"
+  ]);
+  const primaryLabel = labels[0] ?? "Entity";
+  if (stableKey) return `${primaryLabel}: ${truncateGraphText(stableKey, 72)}`;
+
+  const sourceTool = pickFirstString(props, ["sourceTool"]);
+  if (sourceTool) return `${primaryLabel}: ${truncateGraphText(sourceTool, 72)}`;
+
+  return primaryLabel;
+}
+
+function buildStage2Markdown(finalReport?: string | null, evidenceAppendix?: string | null): string | null {
+  const parts = [finalReport?.trim(), evidenceAppendix?.trim()].filter(
+    (value): value is string => Boolean(value)
+  );
+  return parts.length ? parts.join("\n\n") : null;
+}
+
+async function cleanupRunGraphEvidence(documentIds: string[]) {
+  if (!documentIds.length) return;
+  const session = neo4jDriver.session();
+  try {
+    await session.run(
+      `MATCH ()-[r]->()
+       WHERE r.evidence_document_id IN $documentIds
+       DELETE r`,
+      { documentIds }
+    );
+    await session.run(
+      `MATCH (n)
+       WHERE n.evidence_document_id IN $documentIds
+       DETACH DELETE n`,
+      { documentIds }
+    );
+  } finally {
+    await session.close();
+  }
+}
+
+async function cleanupStoredObjects(objects: StoredObjectRef[]) {
+  if (!objects.length) return;
+  await Promise.allSettled(
+    objects.map((item) =>
+      minio.removeObject(item.bucket, item.objectKey).catch(() => undefined)
+    )
+  );
+}
+
 app.get("/health", async () => ({ ok: true }));
 
 app.post("/runs", async (req, reply) => {
@@ -66,8 +185,17 @@ app.get("/runs", async (req) => {
 
   const { rows } = await pool.query(
     `SELECT r.run_id, r.title, r.created_at, r.status, r.prompt,
-            rep.report_id, rep.status AS report_status, rep.created_at AS report_created_at
+            COALESCE(rr.run_id::text, rep.report_id::text) AS report_id,
+            COALESCE(rr.status, rep.status) AS report_status,
+            COALESCE(rr.updated_at, rep.created_at) AS report_created_at
      FROM runs r
+     LEFT JOIN LATERAL (
+       SELECT run_id, status, updated_at
+       FROM report_runs
+       WHERE run_id = r.run_id
+       ORDER BY updated_at DESC
+       LIMIT 1
+     ) rr ON true
      LEFT JOIN LATERAL (
        SELECT report_id, status, created_at
        FROM reports
@@ -172,10 +300,19 @@ app.get("/runs/:runId", async (req, reply) => {
 
   const { rows } = await pool.query(
     `SELECT r.run_id, r.created_at, r.created_by, r.status, r.title, r.prompt, r.seeds, r.constraints, r.notes,
-            rep.report_id, rep.status AS report_status, rep.created_at AS report_created_at,
+            COALESCE(rr.run_id::text, rep.report_id::text) AS report_id,
+            COALESCE(rr.status, rep.status) AS report_status,
+            COALESCE(rr.updated_at, rep.created_at) AS report_created_at,
             rep.markdown_bucket, rep.markdown_object_key, rep.markdown_version_id,
             rep.json_bucket, rep.json_object_key, rep.json_version_id
      FROM runs r
+     LEFT JOIN LATERAL (
+       SELECT run_id, status, updated_at
+       FROM report_runs
+       WHERE run_id = r.run_id
+       ORDER BY updated_at DESC
+       LIMIT 1
+     ) rr ON true
      LEFT JOIN LATERAL (
        SELECT * FROM reports
        WHERE run_id = r.run_id
@@ -233,6 +370,65 @@ app.patch("/runs/:runId/title", async (req, reply) => {
   if (!rowCount) return reply.code(404).send({ error: "run not found" });
 
   return { ok: true, runId, title };
+});
+
+app.delete("/runs/:runId", async (req, reply) => {
+  const { runId } = req.params as { runId: string };
+  const client = await pool.connect();
+
+  let documentIds: string[] = [];
+  let objects: StoredObjectRef[] = [];
+
+  try {
+    await client.query("BEGIN");
+
+    const docsRes = await client.query<{ document_id: string }>(
+      `SELECT document_id::text
+       FROM documents
+       WHERE run_id = $1`,
+      [runId]
+    );
+    documentIds = docsRes.rows.map((row) => row.document_id);
+
+    const objectRes = await client.query<{ bucket: string | null; object_key: string | null }>(
+      `SELECT bucket, object_key
+       FROM document_objects o
+       JOIN documents d ON d.document_id = o.document_id
+       WHERE d.run_id = $1
+       UNION
+       SELECT bucket, object_key
+       FROM artifacts
+       WHERE run_id = $1
+       UNION
+       SELECT markdown_bucket AS bucket, markdown_object_key AS object_key
+       FROM reports
+       WHERE run_id = $1
+       UNION
+       SELECT json_bucket AS bucket, json_object_key AS object_key
+       FROM reports
+       WHERE run_id = $1`,
+      [runId]
+    );
+    objects = objectRes.rows
+      .filter((row) => row.bucket && row.object_key)
+      .map((row) => ({ bucket: row.bucket as string, objectKey: row.object_key as string }));
+
+    const deleteRes = await client.query(`DELETE FROM runs WHERE run_id = $1`, [runId]);
+    if (!deleteRes.rowCount) {
+      await client.query("ROLLBACK");
+      return reply.code(404).send({ error: "run not found" });
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  await Promise.allSettled([cleanupRunGraphEvidence(documentIds), cleanupStoredObjects(objects)]);
+  return { ok: true, runId };
 });
 
 app.get("/runs/:runId/files", async (req, reply) => {
@@ -320,6 +516,10 @@ app.get("/runs/:runId/graph", async (req, reply) => {
   const nodeOffset = parseNonNegativeInt(query.nodeOffset, 0);
   const edgeLimit = parsePositiveInt(query.edgeLimit, 120, 600);
   const edgeOffset = parseNonNegativeInt(query.edgeOffset, 0);
+  const nodeLimitInt = neo4j.int(nodeLimit);
+  const nodeOffsetInt = neo4j.int(nodeOffset);
+  const edgeLimitInt = neo4j.int(edgeLimit);
+  const edgeOffsetInt = neo4j.int(edgeOffset);
 
   const docRes = await pool.query(`SELECT document_id::text FROM documents WHERE run_id = $1`, [runId]);
   const documentIds: string[] = docRes.rows.map((row) => row.document_id);
@@ -351,25 +551,22 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       `MATCH (n)
        WHERE n.evidence_document_id IN $documentIds
        WITH DISTINCT n
-       ORDER BY coalesce(n.name, n.uri, n.address, n.email, elementId(n))
-       SKIP $nodeOffset
-       LIMIT $nodeLimit
-       RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
-      { documentIds, nodeLimit, nodeOffset }
+      ORDER BY coalesce(n.name, n.uri, n.address, n.email, elementId(n))
+      SKIP $nodeOffset
+      LIMIT $nodeLimit
+      RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
+      { documentIds, nodeLimit: nodeLimitInt, nodeOffset: nodeOffsetInt }
     );
 
     const nodes = nodeResult.records.map((record) => {
       const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
+      const labels = normalizeNeo4jValue(record.get("labels")) as string[];
+      const id = String(record.get("id"));
       return {
-        id: String(record.get("id")),
-        labels: normalizeNeo4jValue(record.get("labels")) as string[],
+        id,
+        labels,
         properties: props,
-        display:
-          (props.name as string | undefined) ??
-          (props.uri as string | undefined) ??
-          (props.address as string | undefined) ??
-          (props.email as string | undefined) ??
-          String(record.get("id"))
+        display: deriveGraphNodeDisplay(labels, props, id)
       };
     });
 
@@ -391,24 +588,28 @@ app.get("/runs/:runId/graph", async (req, reply) => {
           OR a.evidence_document_id IN $documentIds
           OR b.evidence_document_id IN $documentIds
        WITH DISTINCT a, r, b
-       ORDER BY type(r), elementId(r)
-       SKIP $edgeOffset
-       LIMIT $edgeLimit
-       RETURN elementId(r) AS id,
+      ORDER BY type(r), elementId(r)
+      SKIP $edgeOffset
+      LIMIT $edgeLimit
+      RETURN elementId(r) AS id,
               elementId(a) AS source,
               elementId(b) AS target,
               type(r) AS type,
               properties(r) AS props`,
-      { documentIds, edgeLimit, edgeOffset }
+      { documentIds, edgeLimit: edgeLimitInt, edgeOffset: edgeOffsetInt }
     );
 
-    const edges = edgeResult.records.map((record) => ({
-      id: String(record.get("id")),
-      source: String(record.get("source")),
-      target: String(record.get("target")),
-      type: String(record.get("type")),
-      properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
-    }));
+    const edges = edgeResult.records.map((record) => {
+      const type = String(record.get("type"));
+      return {
+        id: String(record.get("id")),
+        source: String(record.get("source")),
+        target: String(record.get("target")),
+        type,
+        display: formatRelationType(type),
+        properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
+      };
+    });
 
     return {
       runId,
@@ -426,6 +627,91 @@ app.get("/runs/:runId/graph", async (req, reply) => {
 
 app.get("/runs/:runId/report", async (req, reply) => {
   const { runId } = req.params as { runId: string };
+
+  const stage2Res = await pool.query(
+    `SELECT run_id, report_type, status, refine_round, quality_ok, final_report, evidence_appendix, created_at, updated_at
+     FROM report_runs
+     WHERE run_id = $1
+     ORDER BY updated_at DESC
+     LIMIT 1`,
+    [runId]
+  );
+
+  if (stage2Res.rows.length > 0) {
+    const report = stage2Res.rows[0];
+    const [sectionsRes, claimsRes, evidenceRes] = await Promise.all([
+      pool.query(
+        `SELECT section_id, section_order, title, content, citation_keys, created_at
+         FROM section_drafts
+         WHERE run_id = $1
+         ORDER BY section_order ASC, created_at ASC`,
+        [runId]
+      ),
+      pool.query(
+        `SELECT claim_id, section_id, claim_text, confidence, impact, evidence_keys, conflict_flags, created_at
+         FROM claim_ledger
+         WHERE run_id = $1
+         ORDER BY created_at ASC, section_id ASC, claim_id ASC`,
+        [runId]
+      ),
+      pool.query(
+        `SELECT citation_key, section_id, document_id, snippet, source_url, score, object_ref, created_at
+         FROM evidence_refs
+         WHERE run_id = $1
+         ORDER BY created_at ASC, section_id ASC, citation_key ASC`,
+        [runId]
+      )
+    ]);
+
+    return {
+      reportId: report.run_id,
+      runId: report.run_id,
+      status: report.status,
+      createdAt: report.updated_at ?? report.created_at,
+      markdown: buildStage2Markdown(report.final_report, report.evidence_appendix),
+      json: {
+        reportType: report.report_type,
+        qualityOk: report.quality_ok,
+        refineRound: report.refine_round,
+        finalReport: report.final_report,
+        evidenceAppendix: report.evidence_appendix,
+        sectionDrafts: sectionsRes.rows.map((row) => ({
+          sectionId: row.section_id,
+          sectionOrder: row.section_order,
+          title: row.title,
+          content: row.content,
+          citationKeys: row.citation_keys ?? [],
+          createdAt: row.created_at
+        })),
+        claimLedger: claimsRes.rows.map((row) => ({
+          claimId: row.claim_id,
+          sectionId: row.section_id,
+          text: row.claim_text,
+          confidence: row.confidence,
+          impact: row.impact,
+          evidenceKeys: row.evidence_keys ?? [],
+          conflictFlags: row.conflict_flags ?? [],
+          createdAt: row.created_at
+        })),
+        evidenceRefs: evidenceRes.rows.map((row) => ({
+          citationKey: row.citation_key,
+          sectionId: row.section_id,
+          documentId: row.document_id,
+          snippet: row.snippet,
+          sourceUrl: row.source_url,
+          score: row.score,
+          objectRef: row.object_ref ?? {},
+          createdAt: row.created_at
+        }))
+      },
+      citations: evidenceRes.rows.map((row) => ({
+        citationKey: row.citation_key,
+        sectionId: row.section_id,
+        sourceUrl: row.source_url,
+        documentId: row.document_id
+      }))
+    };
+  }
 
   const { rows } = await pool.query(
     `SELECT * FROM reports WHERE run_id = $1 ORDER BY created_at DESC LIMIT 1`,

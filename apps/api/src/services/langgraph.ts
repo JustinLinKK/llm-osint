@@ -70,6 +70,7 @@ export async function launchLangGraphRun(params: LaunchLangGraphParams): Promise
     params.runId,
     "--prompt",
     params.prompt,
+    "--run-stage2",
     "--max-iterations",
     String(cfg.langgraph.maxIterations)
   ];

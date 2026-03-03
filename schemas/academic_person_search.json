@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://llm-osint.local/schemas/academic_person_search.json",
+  "title": "AcademicPersonSearchInput",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "person_name"
+  ],
+  "properties": {
+    "person_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "affiliations": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "field_keywords": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "default": []
+    },
+    "known_ids": {
+      "type": "object",
+      "additionalProperties": {
+        "type": [
+          "string",
+          "number",
+          "boolean"
+        ]
+      },
+      "default": {}
+    },
+    "time_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start_year": {
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 2100
+        },
+        "end_year": {
+          "type": "integer",
+          "minimum": 1800,
+          "maximum": 2100
+        }
+      }
+    },
+    "max_results": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 50,
+      "default": 10
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "country": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        },
+        "venue_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "default": []
+        }
+      }
+    },
+    "orcid_id": {
+      "type": "string"
+    },
+    "author_id": {
+      "type": "string"
+    },
+    "dblp_pid": {
+      "type": "string"
+    },
+    "fetch_record": {
+      "type": "boolean",
+      "default": false
+    },
+    "fetch_author": {
+      "type": "boolean",
+      "default": false
+    },
+    "fetch_publications": {
+      "type": "boolean",
+      "default": false
+    }
+  }
+}

@@ -44,6 +44,33 @@ services:
     ports: ["6333:6333"]
     volumes: ["qdrant_data:/qdrant/storage"]
 
+  worker-embedding:
+    build:
+      context: ../../
+      dockerfile: services/worker-embedding/Dockerfile
+    container_name: worker-embedding
+    env_file:
+      - ../../.env
+    environment:
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
+      EMBEDDING_SERVED_MODEL_NAME: ${EMBEDDING_SERVED_MODEL_NAME}
+      EMBEDDING_HOST: 0.0.0.0
+      EMBEDDING_PORT: "8000"
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_TRUST_REMOTE_CODE: ${EMBEDDING_TRUST_REMOTE_CODE}
+      EMBEDDING_DTYPE: ${EMBEDDING_DTYPE}
+      EMBEDDING_TASK: ${EMBEDDING_TASK}
+      EMBEDDING_MAX_MODEL_LEN: ${EMBEDDING_MAX_MODEL_LEN}
+      EMBEDDING_TENSOR_PARALLEL_SIZE: ${EMBEDDING_TENSOR_PARALLEL_SIZE}
+      EMBEDDING_PIPELINE_PARALLEL_SIZE: ${EMBEDDING_PIPELINE_PARALLEL_SIZE}
+      EMBEDDING_GPU_MEMORY_UTILIZATION: ${EMBEDDING_GPU_MEMORY_UTILIZATION}
+      EMBEDDING_ENFORCE_SINGLE_MODEL: ${EMBEDDING_ENFORCE_SINGLE_MODEL}
+      EMBEDDING_VLLM_ARGS: ${EMBEDDING_VLLM_ARGS}
+    ports:
+      - "8008:8000"
+    shm_size: "4gb"
+    gpus: all
+
   neo4j:
     image: neo4j:5
     environment:
@@ -74,6 +101,8 @@ services:
     build:
       context: ../../
       dockerfile: apps/api/Dockerfile
+    env_file:
+      - ../../.env
     environment:
       API_PORT: "3000"
       DATABASE_URL: postgresql://osint:osint@postgres:5432/osint
@@ -81,6 +110,11 @@ services:
       MINIO_ACCESS_KEY: minio
       MINIO_SECRET_KEY: minio12345
       MINIO_BUCKET: osint-raw
+      LANGGRAPH_AUTOSTART: ${LANGGRAPH_AUTOSTART}
+      LANGGRAPH_PYTHON_BIN: /opt/agent-venv/bin/python
+      LANGGRAPH_SCRIPT_PATH: /app/services/agent-langgraph/src/run_planner.py
+      LANGGRAPH_WORKDIR: /app
+      LANGGRAPH_MAX_ITERATIONS: ${LANGGRAPH_MAX_ITERATIONS}
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,25 +137,24 @@ services:
       MINIO_SECRET_KEY: minio12345
       MINIO_BUCKET: osint-raw
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: osint_chunks
-      OPENROUTER_EMBED_MODEL: openai/text-embedding-3-small
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: neo4jpassword
-      PYTHON_BIN: ${PYTHON_BIN:-python3}
-      MCP_PYTHON_TOOLS: "${MCP_PYTHON_TOOLS:-[]}"
-      X_BEARER_TOKEN: ${X_BEARER_TOKEN:-}
-      BROWSERBASE_API_KEY: ${BROWSERBASE_API_KEY:-}
-      BROWSERBASE_PROJECT_ID: ${BROWSERBASE_PROJECT_ID:-}
-      LINKEDIN_EMAIL: ${LINKEDIN_EMAIL:-}
-      LINKEDIN_PASSWORD: ${LINKEDIN_PASSWORD:-}
-      HIBP_API_KEY: ${HIBP_API_KEY:-}
-      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      PYTHON_BIN: /opt/mcp-venv/bin/python
+      PATH: /opt/mcp-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      MCP_PYTHON_TOOLS: "${MCP_PYTHON_TOOLS}"
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
+      worker-embedding:
+        condition: service_started
     ports:
       - "3001:3001"
 
@@ -133,26 +166,30 @@ services:
       - ../../.env
     environment:
       MCP_PORT: "3002"
-      MCP_TOOLSET: "kali-osint"
       DATABASE_URL: postgresql://osint:osint@postgres:5432/osint
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: minio
       MINIO_SECRET_KEY: minio12345
       MINIO_BUCKET: osint-raw
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: osint_chunks
-      OPENROUTER_EMBED_MODEL: openai/text-embedding-3-small
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL}
       NEO4J_URI: bolt://neo4j:7687
       NEO4J_USER: neo4j
       NEO4J_PASSWORD: neo4jpassword
-      PYTHON_BIN: ${PYTHON_BIN:-python3}
-      HIBP_API_KEY: ${HIBP_API_KEY:-}
-      SHODAN_API_KEY: ${SHODAN_API_KEY:-}
+      MCP_TOOLSET: "kali-osint"
+      PYTHON_BIN: /opt/osint-venv/bin/python
+      PATH: /opt/osint-venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     depends_on:
       postgres:
         condition: service_healthy
       minio:
         condition: service_healthy
+      worker-embedding:
+        condition: service_started
     ports:
       - "3002:3002"
 
