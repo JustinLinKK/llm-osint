@@ -442,3 +442,85 @@ def test_dedupe_tool_plan_merges_personal_site_variants(monkeypatch) -> None:
     assert item.arguments["blog"] == "https://ada.dev/"
     assert item.arguments["domain"] == "www.ada.dev"
     assert item.arguments["email"] == "ada@ada.dev"
+
+
+def test_planner_runs_at_least_two_iterations_before_stage2(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    call_count = {"count": 0}
+
+    def fake_run_tool_worker(_mcp_client, run_id: str, tool_name: str, arguments: Dict[str, Any]) -> ToolWorkerResultStub:
+        call_count["count"] += 1
+        receipt = ReceiptStub(
+            run_id=run_id,
+            tool_name=tool_name,
+            ok=True,
+            summary=f"{tool_name} completed.",
+            arguments=arguments,
+            key_facts=[{"target": arguments.get("target_name") or arguments.get("person_name") or arguments.get("username")}],
+        )
+        return ToolWorkerResultStub(receipt=receipt, result={})
+
+    monkeypatch.setattr(planner_graph, "run_tool_worker", fake_run_tool_worker)
+    monkeypatch.setattr(planner_graph, "emit_run_event", lambda *args, **kwargs: None)
+
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    final_state = graph.compile().invoke(state)
+
+    assert final_state["iteration"] >= 2
+    assert final_state["next_stage"] == "stage2"
+    assert call_count["count"] >= 2
+
+
+def test_inject_noteboard_renders_structured_sections(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    prompt = planner_graph._inject_noteboard(
+        "Investigate Ada Lovelace",
+        [],
+        {
+            "evidence": ["Fetched profile page from example.edu."],
+            "frontier": ["Discovered in-scope lab staff page."],
+            "gaps": ["Current employer still unverified."],
+            "follow_ups": ["Queue institutional directory lookup."],
+            "depth_candidates": ["Depth candidate: organization Analytical Engine Lab."],
+        },
+        "Need to verify the employer before stage2.",
+        [{"tool_name": "institution_directory_search", "payload": {"name": "Ada Lovelace"}}],
+    )
+
+    assert "Evidence collected:" in prompt
+    assert "Open leads and frontier:" in prompt
+    assert "Known gaps or unresolved questions:" in prompt
+    assert "Depth candidates worth expanding:" in prompt
+    assert "Next iteration To Do:" in prompt

@@ -1,5 +1,6 @@
 import Fastify from "fastify";
 import neo4j from "neo4j-driver";
+import path from "node:path";
 import { cfg } from "./config.js";
 import { createRun, ingestRawBytes } from "./services/ingest.js";
 import { listRunEvents } from "./services/events.js";
@@ -76,6 +77,7 @@ function deriveGraphNodeDisplay(
   fallbackId: string
 ): string {
   const preferred = pickFirstString(props, [
+    "canonical_name",
     "display_name",
     "displayName",
     "name",
@@ -92,26 +94,22 @@ function deriveGraphNodeDisplay(
   ]);
   if (preferred) return truncateGraphText(preferred, 96);
 
-  if (labels.includes("Snippet")) {
+  if (props.type === "Snippet" || labels.includes("Snippet")) {
     const text = pickFirstString(props, ["text", "toolSummary"]);
     if (text) return `Snippet: ${truncateGraphText(text, 84)}`;
   }
 
-  if (labels.includes("Article")) {
+  if (props.type === "Article" || labels.includes("Article")) {
     const articleRef = pickFirstString(props, ["uri", "url"]);
     if (articleRef) return truncateGraphText(articleRef, 96);
   }
 
   const stableKey = pickFirstString(props, [
-    "person_id",
-    "org_id",
-    "location_id",
-    "address_normalized",
-    "name_normalized",
-    "uri_normalized",
+    "node_id",
+    "canonical_name_normalized",
     "snippet_id"
   ]);
-  const primaryLabel = labels[0] ?? "Entity";
+  const primaryLabel = pickFirstString(props, ["type", "osint_bucket"]) ?? labels[0] ?? "Entity";
   if (stableKey) return `${primaryLabel}: ${truncateGraphText(stableKey, 72)}`;
 
   const sourceTool = pickFirstString(props, ["sourceTool"]);
@@ -127,6 +125,19 @@ function buildStage2Markdown(finalReport?: string | null, evidenceAppendix?: str
   return parts.length ? parts.join("\n\n") : null;
 }
 
+function sanitizeFilename(value: string, fallback: string): string {
+  const normalized = value
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized || fallback;
+}
+
+function inferFilenameFromObjectKey(objectKey: string, fallbackBase: string): string {
+  const basename = path.posix.basename(objectKey);
+  return sanitizeFilename(basename || fallbackBase, fallbackBase);
+}
+
 async function cleanupRunGraphEvidence(documentIds: string[]) {
   if (!documentIds.length) return;
   const session = neo4jDriver.session();
@@ -134,13 +145,34 @@ async function cleanupRunGraphEvidence(documentIds: string[]) {
     await session.run(
       `MATCH ()-[r]->()
        WHERE r.evidence_document_id IN $documentIds
-       DELETE r`,
+          OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
+       WITH r,
+            [docId IN coalesce(r.evidence_document_ids, CASE WHEN r.evidence_document_id IS NULL THEN [] ELSE [r.evidence_document_id] END)
+             WHERE NOT docId IN $documentIds] AS remainingDocIds
+       FOREACH (_ IN CASE WHEN size(remainingDocIds) = 0 THEN [1] ELSE [] END | DELETE r)
+       FOREACH (_ IN CASE WHEN size(remainingDocIds) > 0 THEN [1] ELSE [] END |
+         SET r.evidence_document_ids = remainingDocIds,
+             r.evidence_document_id = head(remainingDocIds)
+       )`,
       { documentIds }
     );
     await session.run(
       `MATCH (n)
        WHERE n.evidence_document_id IN $documentIds
-       DETACH DELETE n`,
+          OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
+       WITH n,
+            [docId IN coalesce(n.evidence_document_ids, CASE WHEN n.evidence_document_id IS NULL THEN [] ELSE [n.evidence_document_id] END)
+             WHERE NOT docId IN $documentIds] AS remainingDocIds
+       OPTIONAL MATCH (n)-[r]-()
+       WITH n, remainingDocIds, count(r) AS remainingRelCount
+       FOREACH (_ IN CASE WHEN size(remainingDocIds) = 0 AND remainingRelCount = 0 THEN [1] ELSE [] END | DETACH DELETE n)
+       FOREACH (_ IN CASE WHEN size(remainingDocIds) > 0 THEN [1] ELSE [] END |
+         SET n.evidence_document_ids = remainingDocIds,
+             n.evidence_document_id = head(remainingDocIds)
+       )
+       FOREACH (_ IN CASE WHEN size(remainingDocIds) = 0 AND remainingRelCount > 0 THEN [1] ELSE [] END |
+         REMOVE n.evidence_document_ids, n.evidence_document_id
+       )`,
       { documentIds }
     );
   } finally {
@@ -503,6 +535,42 @@ app.get("/runs/:runId/files", async (req, reply) => {
   };
 });
 
+app.get("/runs/:runId/files/:documentId/download", async (req, reply) => {
+  const { runId, documentId } = req.params as { runId: string; documentId: string };
+
+  const { rows } = await pool.query(
+    `SELECT d.document_id,
+            d.title,
+            d.content_type,
+            d.source_url,
+            o.bucket,
+            o.object_key,
+            o.version_id,
+            o.content_type AS object_content_type
+     FROM documents d
+     JOIN document_objects o
+       ON o.document_id = d.document_id
+     WHERE d.run_id = $1
+       AND d.document_id = $2
+     ORDER BY CASE WHEN o.kind = 'raw' THEN 0 ELSE 1 END, o.created_at DESC
+     LIMIT 1`,
+    [runId, documentId]
+  );
+
+  if (!rows.length) return reply.code(404).send({ error: "file not found" });
+
+  const row = rows[0];
+  const stream = await minio.getObject(row.bucket, row.object_key, row.version_id ? { versionId: row.version_id } : {});
+  const fallbackBase = sanitizeFilename(`document-${documentId}`, `document-${documentId}`);
+  const filename =
+    sanitizeFilename(row.title ?? "", "") ||
+    inferFilenameFromObjectKey(row.object_key, fallbackBase);
+
+  reply.header("Content-Type", row.object_content_type || row.content_type || "application/octet-stream");
+  reply.header("Content-Disposition", `attachment; filename="${filename}"`);
+  return reply.send(stream);
+});
+
 app.get("/runs/:runId/graph", async (req, reply) => {
   const { runId } = req.params as { runId: string };
   const query = req.query as {
@@ -537,44 +605,14 @@ app.get("/runs/:runId/graph", async (req, reply) => {
 
   const session = neo4jDriver.session();
   try {
-    const nodeTotalResult = await session.run(
-      `MATCH (n)
-       WHERE n.evidence_document_id IN $documentIds
-       RETURN count(DISTINCT n) AS total`,
-      { documentIds }
-    );
-    const totalNodes = Number(
-      normalizeNeo4jValue(nodeTotalResult.records[0]?.get("total")) ?? 0
-    );
-
-    const nodeResult = await session.run(
-      `MATCH (n)
-       WHERE n.evidence_document_id IN $documentIds
-       WITH DISTINCT n
-      ORDER BY coalesce(n.name, n.uri, n.address, n.email, elementId(n))
-      SKIP $nodeOffset
-      LIMIT $nodeLimit
-      RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
-      { documentIds, nodeLimit: nodeLimitInt, nodeOffset: nodeOffsetInt }
-    );
-
-    const nodes = nodeResult.records.map((record) => {
-      const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
-      const labels = normalizeNeo4jValue(record.get("labels")) as string[];
-      const id = String(record.get("id"));
-      return {
-        id,
-        labels,
-        properties: props,
-        display: deriveGraphNodeDisplay(labels, props, id)
-      };
-    });
-
     const edgeTotalResult = await session.run(
       `MATCH (a)-[r]->(b)
        WHERE r.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
           OR a.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(a.evidence_document_ids, []) WHERE docId IN $documentIds)
           OR b.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
        RETURN count(DISTINCT r) AS total`,
       { documentIds }
     );
@@ -585,16 +623,19 @@ app.get("/runs/:runId/graph", async (req, reply) => {
     const edgeResult = await session.run(
       `MATCH (a)-[r]->(b)
        WHERE r.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
           OR a.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(a.evidence_document_ids, []) WHERE docId IN $documentIds)
           OR b.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
        WITH DISTINCT a, r, b
-      ORDER BY type(r), elementId(r)
+       ORDER BY coalesce(r.rel_type, type(r)), elementId(r)
       SKIP $edgeOffset
       LIMIT $edgeLimit
       RETURN elementId(r) AS id,
               elementId(a) AS source,
               elementId(b) AS target,
-              type(r) AS type,
+              coalesce(r.rel_type, type(r)) AS type,
               properties(r) AS props`,
       { documentIds, edgeLimit: edgeLimitInt, edgeOffset: edgeOffsetInt }
     );
@@ -611,9 +652,88 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       };
     });
 
+    const nodeTotalResult = await session.run(
+      `MATCH (n)
+       WHERE n.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
+          OR EXISTS {
+            MATCH (n)-[r]-(m)
+            WHERE r.evidence_document_id IN $documentIds
+               OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
+               OR m.evidence_document_id IN $documentIds
+               OR any(docId IN coalesce(m.evidence_document_ids, []) WHERE docId IN $documentIds)
+          }
+       RETURN count(DISTINCT n) AS total`,
+      { documentIds }
+    );
+    const totalNodes = Number(
+      normalizeNeo4jValue(nodeTotalResult.records[0]?.get("total")) ?? 0
+    );
+
+    const nodeResult = await session.run(
+      `MATCH (n)
+       WHERE n.evidence_document_id IN $documentIds
+          OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
+          OR EXISTS {
+            MATCH (n)-[r]-(m)
+            WHERE r.evidence_document_id IN $documentIds
+               OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
+               OR m.evidence_document_id IN $documentIds
+               OR any(docId IN coalesce(m.evidence_document_ids, []) WHERE docId IN $documentIds)
+          }
+       WITH DISTINCT n
+       ORDER BY coalesce(n.canonical_name, n.node_id, elementId(n))
+       SKIP $nodeOffset
+       LIMIT $nodeLimit
+       RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
+      { documentIds, nodeLimit: nodeLimitInt, nodeOffset: nodeOffsetInt }
+    );
+
+    const nodeRecords = nodeResult.records.map((record) => {
+      const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
+      const labels = normalizeNeo4jValue(record.get("labels")) as string[];
+      const id = String(record.get("id"));
+      return {
+        id,
+        labels,
+        properties: props,
+        display: deriveGraphNodeDisplay(labels, props, id)
+      };
+    });
+
+    const nodeIds = new Set(nodeRecords.map((node) => node.id));
+    const missingEndpointIds = Array.from(
+      new Set(
+        edges.flatMap((edge) => [edge.source, edge.target]).filter((nodeId) => nodeId && !nodeIds.has(nodeId))
+      )
+    );
+
+    if (missingEndpointIds.length > 0) {
+      const missingNodeResult = await session.run(
+        `MATCH (n)
+         WHERE elementId(n) IN $nodeIds
+         RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
+        { nodeIds: missingEndpointIds }
+      );
+
+      for (const record of missingNodeResult.records) {
+        const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
+        const labels = normalizeNeo4jValue(record.get("labels")) as string[];
+        const id = String(record.get("id"));
+        if (nodeIds.has(id)) continue;
+        nodeIds.add(id);
+        nodeRecords.push({
+          id,
+          labels,
+          properties: props,
+          display: deriveGraphNodeDisplay(labels, props, id)
+        });
+      }
+    }
+
     return {
       runId,
-      nodes,
+      nodes: nodeRecords,
       edges,
       page: {
         nodes: { limit: nodeLimit, offset: nodeOffset, total: totalNodes },

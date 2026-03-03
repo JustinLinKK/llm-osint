@@ -1,5 +1,14 @@
-from report_helpers import build_coverage_ledger, build_limits, coverage_is_complete, run_consistency_validator
+from report_helpers import (
+    assemble_final_report,
+    build_coverage_ledger,
+    build_limits,
+    build_report_memory,
+    coverage_is_complete,
+    pack_evidence,
+    run_consistency_validator,
+)
 from report_models import ClaimModel, EvidenceRefModel, SectionDraftModel
+from tool_worker_graph import ToolReceipt
 
 
 def test_coverage_ledger_marks_complete_when_baselines_exist() -> None:
@@ -92,3 +101,139 @@ def test_consistency_validator_detects_publication_conflict() -> None:
 
     assert any(issue.issue_id == "publication_conflict" for issue in issues)
     assert any("targeted follow-up" in item for item in limits)
+
+
+def test_coverage_ledger_does_not_mark_complete_from_keyword_only_evidence() -> None:
+    evidence = [
+        EvidenceRefModel(
+            citation_key="E1",
+            section_id="biography_history",
+            snippet="University of Somewhere and publication keywords appear in an unverified snippet.",
+        )
+    ]
+    drafts = [
+        SectionDraftModel(
+            section_id="biography_history",
+            title="Biography and history",
+            content="Unverified draft text mentions a university and publications.",
+        )
+    ]
+
+    coverage = build_coverage_ledger("person", [], evidence, drafts, [])
+
+    assert coverage.affiliations_resolved.resolved is False
+    assert coverage.education_resolved.resolved is False
+    assert coverage.publications_resolved.resolved is False
+    assert coverage.timeline_resolved.resolved is False
+
+
+def test_build_report_memory_recovers_profile_and_publication_inventory_from_receipts() -> None:
+    receipts = [
+        ToolReceipt(
+            run_id="run-1",
+            tool_name="github_identity_search",
+            arguments={},
+            argument_signature="sig-1",
+            ok=True,
+            summary="Resolved GitHub profile.",
+            key_facts=[
+                {"profileUrl": "https://github.com/FrederickPi"},
+                {"repositories": ["cs225-potd"]},
+                {"publications": [{"title": "Reasoning Like Program Executors", "year": 2024, "url": "https://arxiv.org/abs/2402.04333"}]},
+            ],
+            artifact_ids=[],
+            document_ids=[],
+        ),
+        ToolReceipt(
+            run_id="run-1",
+            tool_name="semantic_scholar_search",
+            arguments={},
+            argument_signature="sig-2",
+            ok=True,
+            summary="Resolved academic candidate.",
+            key_facts=[
+                {
+                    "candidates": [
+                        {
+                            "canonical_name": "Xinyu Pi",
+                            "evidence": [
+                                {
+                                    "title": "Bridging Human Interpretation and Machine Representation",
+                                    "url": "https://www.semanticscholar.org/paper/abc",
+                                    "year": 2025,
+                                    "venue": "Semantic Scholar",
+                                }
+                            ],
+                        }
+                    ]
+                }
+            ],
+            artifact_ids=[],
+            document_ids=[],
+        ),
+    ]
+
+    memory = build_report_memory(
+        question="profile Xinyu Pi",
+        report_type="person",
+        primary_entities=["Xinyu Frederick Pi"],
+        stage1_receipts=receipts,
+        claims=[],
+        evidence=[],
+        section_issues=[],
+        section_drafts=[],
+        latest_observation="",
+    )
+
+    assert any(item.url == "https://github.com/FrederickPi" for item in memory.profile_index)
+    titles = {item.title for item in memory.publication_inventory}
+    assert "Reasoning Like Program Executors" in titles
+    assert "Bridging Human Interpretation and Machine Representation" in titles
+
+
+def test_assemble_final_report_accepts_long_form_llm_output() -> None:
+    class _FakeLLM:
+        def complete_json(self, prompt: str, payload: dict, temperature: float, timeout: int) -> dict:
+            return {
+                "report_text": "# Xinyu Pi\n\n## Identity\nA long-form narrative report with citations [ID_1].\n\n## Research\nAdditional detail.\n"
+                * 8
+            }
+
+    state = {
+        "prompt": "profile Xinyu Pi",
+        "report_type": "person",
+        "primary_entities": ["Xinyu Pi"],
+        "section_drafts": [SectionDraftModel(section_id="identity_profile", title="Identity", content="Identity draft [ID_1]")],
+        "claim_ledger": [],
+        "evidence_refs": [],
+        "section_issues": [],
+        "stage1_receipts": [],
+        "report_memory": None,
+    }
+
+    report = assemble_final_report(state, _FakeLLM())
+
+    assert report.startswith("# Xinyu Pi")
+
+
+def test_pack_evidence_accepts_graph_backed_rows_and_rejects_unbacked_rows() -> None:
+    rows = [
+        {
+            "graph_entity_id": "ent_123",
+            "graph_ref": {"entityId": "ent_123", "labels": ["Entity"]},
+            "snippet": "Graph entity Ada Lovelace. type=Person. attributes=mathematician.",
+            "title": "Ada Lovelace",
+            "score": 0.9,
+            "db_source": "graph",
+        },
+        {
+            "snippet": "This row was never retrieved from a database and should be ignored.",
+            "score": 1.0,
+        },
+    ]
+
+    packed = pack_evidence("identity_profile", rows, k=5)
+
+    assert len(packed) == 1
+    assert packed[0].db_source == "graph"
+    assert packed[0].graph_ref["entityId"] == "ent_123"

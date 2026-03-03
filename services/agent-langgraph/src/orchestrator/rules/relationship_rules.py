@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Protocol, Tuple
 
 from orchestrator.rules.academic_rules import PRIORITY_MEDIUM, add_task_if_new, prune_dedupe_store
@@ -74,6 +75,8 @@ def derive_relationship_follow_up_tasks(
     tasks: List[RelationshipTask] = []
     notes: List[str] = []
     primary_name = primary_person_targets[:1][0] if primary_person_targets else ""
+    coauthor_names: set[str] = set()
+    institution_domains: set[str] = set()
 
     for receipt in [item for item in receipts if item.ok]:
         organizations = [item for item in _fact_list(receipt, "organizations") if isinstance(item, dict)]
@@ -95,6 +98,19 @@ def derive_relationship_follow_up_tasks(
 
         if receipt.tool_name in ACADEMIC_RELATIONSHIP_TOOLS and primary_name:
             publication_data = _publication_like_data(receipt)
+            for fact in receipt.key_facts:
+                if isinstance(fact, dict):
+                    values = fact.get("coauthors")
+                    if isinstance(values, list):
+                        for value in values:
+                            if isinstance(value, str) and value.strip():
+                                coauthor_names.add(value.strip())
+                    values = fact.get("affiliations")
+                    if isinstance(values, list):
+                        for value in values:
+                            if isinstance(value, str):
+                                for match in re.findall(r"\b[a-z0-9.-]+\.(?:edu|ac\.[a-z]{2,}|org|com)\b", value.lower()):
+                                    institution_domains.add(match)
             if publication_data:
                 add_task_if_new(
                     tasks,
@@ -105,6 +121,26 @@ def derive_relationship_follow_up_tasks(
                     priority=PRIORITY_MEDIUM,
                     reason="Academic/publication signal detected; derive coauthor overlap graph.",
                 )
+        if len(coauthor_names) >= 3 and primary_name:
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="coauthor_graph_search",
+                payload={"runId": run_id, "person_name": primary_name, "coauthors": sorted(coauthor_names)[:20]},
+                priority=PRIORITY_MEDIUM,
+                reason="At least three unique coauthors were observed across receipts; consolidate collaborator graph.",
+            )
+        for domain in sorted(institution_domains)[:3]:
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="institution_directory_search",
+                payload={"runId": run_id, "person_name": primary_name, "institution_domain": domain},
+                priority=PRIORITY_MEDIUM,
+                reason="Repeated institution-domain signal detected in relationship evidence; resolve staff/directory context.",
+            )
 
         if receipt.tool_name in BUSINESS_RELATIONSHIP_TOOLS:
             roles: List[Dict[str, Any]] = []

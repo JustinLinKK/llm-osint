@@ -23,7 +23,7 @@ export const cfg = {
     autostart: (process.env.LANGGRAPH_AUTOSTART ?? "true").toLowerCase() !== "false",
     pythonBin: process.env.LANGGRAPH_PYTHON_BIN ?? process.env.PYTHON_BIN ?? "python3",
     scriptPath: process.env.LANGGRAPH_SCRIPT_PATH ?? "",
-    maxIterations: Math.max(1, Number(process.env.LANGGRAPH_MAX_ITERATIONS ?? 3) || 3),
+    maxIterations: Math.max(1, Number(process.env.LANGGRAPH_MAX_ITERATIONS ?? 7) || 7),
     workdir: process.env.LANGGRAPH_WORKDIR ?? process.cwd()
   }
 };

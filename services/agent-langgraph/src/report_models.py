@@ -15,6 +15,18 @@ class SectionTaskModel(BaseModel):
     required: bool = True
     entity_ids: List[str] = Field(default_factory=list)
     query_hints: List[str] = Field(default_factory=list)
+    current_content: str = ""
+    revision_focus: str = ""
+    next_step_suggestion: str = ""
+
+
+class SectionReflectionModel(BaseModel):
+    section_id: str
+    status: Literal["ok", "needs_revision", "missing"] = "ok"
+    critique: str = ""
+    current_content: str = ""
+    next_step_suggestion: str = ""
+    query_hints: List[str] = Field(default_factory=list)
 
 
 class EvidenceRefModel(BaseModel):
@@ -29,7 +41,9 @@ class EvidenceRefModel(BaseModel):
     content_hash: str | None = None
     source_type: str = "web"
     score: float | None = None
+    db_source: str = "vector"
     object_ref: Dict[str, Any] = Field(default_factory=dict)
+    graph_ref: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ClaimModel(BaseModel):
@@ -73,11 +87,16 @@ class CoverageItemModel(BaseModel):
 
 class CoverageLedgerModel(BaseModel):
     identity_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
+    aliases_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     affiliations_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     education_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     publications_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     relationships_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
+    contacts_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     handles_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
+    code_presence_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
+    business_roles_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
+    archived_history_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     timeline_resolved: CoverageItemModel = Field(default_factory=CoverageItemModel)
     limits_explained: CoverageItemModel = Field(default_factory=CoverageItemModel)
 
@@ -230,6 +249,7 @@ class ReportState(TypedDict):
     claim_ledger: List[ClaimModel]
     evidence_refs: List[EvidenceRefModel]
     section_issues: List[str]
+    section_reflections: List[SectionReflectionModel]
     missing_section_ids: List[str]
     refine_round: int
     max_refine_rounds: int
@@ -284,6 +304,7 @@ def make_initial_report_state(
         "claim_ledger": [],
         "evidence_refs": [],
         "section_issues": [],
+        "section_reflections": [],
         "missing_section_ids": [],
         "refine_round": 0,
         "max_refine_rounds": max_refine_rounds,

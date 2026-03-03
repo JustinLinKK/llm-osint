@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 from typing import Any, Dict, List
 
 from langgraph.graph import END, StateGraph
@@ -8,11 +10,12 @@ from langgraph.graph import END, StateGraph
 from env import load_env
 from logger import get_logger
 from mcp_client import McpClientProtocol, RoutedMcpClient
-from openrouter_llm import OpenRouterLLM
+from openrouter_llm import OpenRouterLLM, invoke_complete_json
 from report_helpers import (
     assemble_evidence_appendix,
     assemble_final_report,
     build_coverage_ledger,
+    build_depth_quality_issues,
     build_report_memory,
     build_section_queries,
     contradiction_query_hints,
@@ -25,6 +28,7 @@ from report_helpers import (
     draft_section_content,
     fallback_claims,
     graph_context_signals,
+    graph_multi_entity_query,
     latest_draft_per_section,
     needs_conflict_resolution,
     needs_timeline_normalization,
@@ -40,12 +44,17 @@ from report_models import (
     ReportResult,
     ReportState,
     SectionDraftModel,
+    SectionReflectionModel,
     SectionTaskModel,
     make_initial_report_state,
 )
 from report_store import persist_report_snapshot
 from run_events import emit_run_event
-from system_prompts import REPORT_OUTLINE_SYSTEM_PROMPT, REPORT_SECTION_CLAIMS_SYSTEM_PROMPT
+from system_prompts import (
+    REPORT_OUTLINE_SYSTEM_PROMPT,
+    REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
+    REPORT_SECTION_REFLECTION_SYSTEM_PROMPT,
+)
 from tool_worker_graph import ToolReceipt
 
 logger = get_logger(__name__)
@@ -64,9 +73,11 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
     # Run-local caches prevent repeated DB round-trips across sections/refinement rounds.
     entity_signal_cache: Dict[str, tuple[List[str], List[str], List[str]]] = {}
     vector_query_cache: Dict[str, List[Dict[str, Any]]] = {}
+    cache_lock = Lock()
     max_outline_sections = max(1, int(os.getenv("STAGE2_MAX_OUTLINE_SECTIONS", "12")))
     max_graph_entities = max(1, int(os.getenv("STAGE2_MAX_GRAPH_CONTEXT_ENTITIES", "4")))
     max_vector_queries = max(1, int(os.getenv("STAGE2_MAX_VECTOR_QUERIES_PER_SECTION", "3")))
+    max_section_workers = max(1, int(os.getenv("STAGE2_MAX_SECTION_WORKERS", "4")))
     vector_k = max(1, int(os.getenv("STAGE2_VECTOR_K", "8")))
     persist_draft_snapshots = _env_flag("STAGE2_PERSIST_DRAFT_SNAPSHOTS", False)
 
@@ -93,6 +104,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             "claim_ledger": [],
             "evidence_refs": [],
             "section_issues": [],
+            "section_reflections": [],
             "missing_section_ids": [],
             "quality_ok": False,
             "done": False,
@@ -136,7 +148,15 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             },
         }
         try:
-            parsed = llm3.complete_json(REPORT_OUTLINE_SYSTEM_PROMPT, payload, temperature=0.2, timeout=45)
+            parsed = invoke_complete_json(
+                llm3,
+                REPORT_OUTLINE_SYSTEM_PROMPT,
+                payload,
+                temperature=0.2,
+                timeout=45,
+                run_id=state["run_id"],
+                operation="stage2.outline",
+            )
             outline_raw = parsed.get("outline")
             if isinstance(outline_raw, list):
                 outline = [SectionTaskModel.model_validate(item) for item in outline_raw]
@@ -149,19 +169,260 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         emit_stage(state, "build_outline_node", "completed", outline_count=len(fallback_outline), source="fallback")
         return {"outline": fallback_outline}
 
+    def _cached_graph_context_signals(entity_id: str) -> tuple[List[str], List[str], List[str]]:
+        with cache_lock:
+            cached = entity_signal_cache.get(entity_id)
+        if cached is not None:
+            return cached
+        resolved = graph_context_signals(mcp_client, [entity_id])
+        with cache_lock:
+            return entity_signal_cache.setdefault(entity_id, resolved)
+
+    def _cached_vector_rows(run_id: str, query: str) -> List[Dict[str, Any]]:
+        cache_key = f"{run_id}::{query.strip().lower()}"
+        with cache_lock:
+            cached = vector_query_cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+        resolved = vector_multi_query(mcp_client, run_id, [query], k=vector_k)
+        with cache_lock:
+            cached = vector_query_cache.setdefault(cache_key, resolved)
+        return list(cached)
+
+    def _extract_claims_for_task(
+        state: ReportState,
+        task: SectionTaskModel,
+        evidence: List[EvidenceRefModel],
+    ) -> List[ClaimModel]:
+        emit_stage(state, "extract_claims_node", "started", section_id=task.section_id)
+        if llm3 is None or not evidence:
+            claims = fallback_claims(task, evidence)
+            emit_stage(
+                state,
+                "extract_claims_node",
+                "completed",
+                section_id=task.section_id,
+                claim_count=len(claims),
+                reason=("llm_unavailable" if llm3 is None else "no_evidence"),
+            )
+            return claims
+
+        payload = {
+            "section": task.model_dump(),
+            "evidence": [item.model_dump() for item in evidence],
+            "output_schema": {
+                "claims": [
+                    {
+                        "claim_id": "string",
+                        "text": "string",
+                        "confidence": "number",
+                        "impact": "low|medium|high",
+                        "evidence_keys": ["string"],
+                        "conflict_flags": ["string"],
+                    }
+                ]
+            },
+        }
+        try:
+            parsed = invoke_complete_json(
+                llm3,
+                REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
+                payload,
+                temperature=0.1,
+                timeout=45,
+                run_id=state["run_id"],
+                operation="stage2.claim_extract",
+                metadata={"sectionId": task.section_id},
+            )
+            raw_claims = parsed.get("claims")
+            if isinstance(raw_claims, list):
+                claims = [ClaimModel.model_validate({**item, "section_id": task.section_id}) for item in raw_claims]
+                emit_stage(
+                    state,
+                    "extract_claims_node",
+                    "completed",
+                    section_id=task.section_id,
+                    claim_count=len(claims),
+                    source="llm",
+                )
+                return claims
+        except Exception:
+            logger.exception("Stage 2 claim extraction failed", extra={"section_id": task.section_id})
+
+        claims = fallback_claims(task, evidence)
+        emit_stage(state, "extract_claims_node", "completed", section_id=task.section_id, claim_count=len(claims), source="fallback")
+        return claims
+
+    def _verify_claims_for_task(
+        state: ReportState,
+        task: SectionTaskModel,
+        evidence: List[EvidenceRefModel],
+        claims: List[ClaimModel],
+    ) -> tuple[List[ClaimModel], List[str]]:
+        emit_stage(state, "verify_claims_node", "started", section_id=task.section_id)
+        valid_keys = {item.citation_key for item in evidence}
+        issues: List[str] = []
+        verified: List[ClaimModel] = []
+
+        for claim in claims:
+            matched = [key for key in claim.evidence_keys if key in valid_keys]
+            if not matched:
+                issues.append(f"{task.section_id}: dropped unsupported claim: {claim.claim_id}")
+                if claim.impact == "high":
+                    issues.append(f"{task.section_id}: high-impact claim without evidence: {claim.claim_id}")
+                continue
+            matched_evidence = [item for item in evidence if item.citation_key in matched]
+            primary_evidence = next(
+                (
+                    item
+                    for item in matched_evidence
+                    if item.source_url or item.document_id or item.object_ref or item.graph_ref
+                ),
+                None,
+            )
+            if primary_evidence is None:
+                issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
+                continue
+            normalized = claim.model_copy(
+                update={
+                    "evidence_keys": matched,
+                    "subject_entity_id": claim.subject_entity_id or (task.entity_ids[0] if task.entity_ids else None),
+                    "object": claim.object or claim.text,
+                    "source_url": primary_evidence.source_url,
+                    "source_type": primary_evidence.source_type,
+                    "retrieved_at": primary_evidence.retrieved_at,
+                    "quote_span": primary_evidence.snippet[:280],
+                }
+            )
+            verified.append(normalized)
+
+        emit_stage(
+            state,
+            "verify_claims_node",
+            "completed",
+            section_id=task.section_id,
+            claim_count=len(verified),
+            issue_count=len(issues),
+        )
+        return (verified, issues)
+
+    def _process_section_task(state: ReportState, task: SectionTaskModel) -> Dict[str, Any]:
+        emit_stage(state, "graph_context_node", "started", section_id=task.section_id)
+        entity_ids = dedupe_str_list(list(state.get("primary_entities", [])) + list(task.entity_ids))[:max_graph_entities]
+        aliases: List[str] = []
+        handles: List[str] = []
+        domains: List[str] = []
+        for entity_id in entity_ids:
+            item_aliases, item_handles, item_domains = _cached_graph_context_signals(entity_id)
+            aliases.extend(item_aliases)
+            handles.extend(item_handles)
+            domains.extend(item_domains)
+        hydrated_task = task.model_copy(update={"entity_ids": entity_ids, "query_hints": dedupe_str_list(list(task.query_hints) + aliases + handles + domains)})
+        emit_stage(
+            state,
+            "graph_context_node",
+            "completed",
+            section_id=task.section_id,
+            entity_count=len(entity_ids),
+            query_hint_count=len(hydrated_task.query_hints),
+        )
+
+        emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
+        queries = dedupe_str_list(build_section_queries(hydrated_task, llm3, run_id=state["run_id"]))[:max_vector_queries]
+        hits: List[Dict[str, Any]] = []
+        graph_hits = graph_multi_entity_query(mcp_client, hydrated_task.entity_ids)
+        for query in queries:
+            hits.extend(_cached_vector_rows(state["run_id"], query))
+        hits.extend(graph_hits)
+        hits = _dedupe_hit_rows(hits)
+        emit_stage(
+            state,
+            "vector_retrieve_node",
+            "completed",
+            section_id=task.section_id,
+            query_count=len(queries),
+            hit_count=len(hits),
+            graph_hit_count=len(graph_hits),
+        )
+
+        emit_stage(state, "evidence_pack_node", "started", section_id=task.section_id)
+        evidence = pack_evidence(hydrated_task.section_id, hits, k=vector_k)
+        emit_stage(state, "evidence_pack_node", "completed", section_id=task.section_id, evidence_count=len(evidence))
+
+        claims = _extract_claims_for_task(state, hydrated_task, evidence)
+        verified_claims, issues = _verify_claims_for_task(state, hydrated_task, evidence, claims)
+
+        emit_stage(state, "draft_section_node", "started", section_id=task.section_id)
+        section_draft = SectionDraftModel(
+            section_id=hydrated_task.section_id,
+            title=hydrated_task.title,
+            content=draft_section_content(state["run_id"], hydrated_task, verified_claims, evidence, llm3),
+            citation_keys=[item.citation_key for item in evidence],
+        )
+        emit_stage(
+            state,
+            "draft_section_node",
+            "completed",
+            section_id=task.section_id,
+            citation_count=len(section_draft.citation_keys),
+            next_section=None,
+        )
+        return {
+            "task": hydrated_task,
+            "section_draft": section_draft,
+            "claims": verified_claims,
+            "evidence": evidence,
+            "issues": issues,
+        }
+
     def section_router_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "section_router_node", "started")
         outline = list(state.get("outline", []))
         missing_ids = set(state.get("missing_section_ids", []))
-        section_tasks = [item for item in outline if item.section_id in missing_ids] if missing_ids else outline
+        draft_lookup = {draft.section_id: draft for draft in state.get("section_drafts", [])}
+        outline_lookup = {item.section_id: item for item in outline}
+        revision_targets = [item for item in state.get("section_reflections", []) if item.status != "ok"]
+
+        if revision_targets:
+            section_tasks: List[SectionTaskModel] = []
+            for reflection in revision_targets:
+                base_task = outline_lookup.get(reflection.section_id)
+                if base_task is None:
+                    draft = draft_lookup.get(reflection.section_id)
+                    if draft is None:
+                        continue
+                    base_task = SectionTaskModel(
+                        section_id=reflection.section_id,
+                        title=draft.title,
+                        objective=reflection.critique or f"Improve section {draft.title}",
+                        required=True,
+                    )
+                draft = draft_lookup.get(reflection.section_id)
+                current_content = reflection.current_content or (draft.content if draft is not None else "")
+                section_tasks.append(
+                    base_task.model_copy(
+                        update={
+                            "query_hints": dedupe_str_list(
+                                list(base_task.query_hints) + list(reflection.query_hints) + state.get("query_hints", [])
+                            ),
+                            "current_content": current_content,
+                            "revision_focus": reflection.critique,
+                            "next_step_suggestion": reflection.next_step_suggestion,
+                        }
+                    )
+                )
+        else:
+            section_tasks = [item for item in outline if item.section_id in missing_ids] if missing_ids else outline
 
         if state.get("refine_round", 0) > 0:
             section_tasks = [
-                task.model_copy(update={"query_hints": dedupe_str_list(list(task.query_hints) + state.get("query_hints", []))})
+                task.model_copy(
+                    update={"query_hints": dedupe_str_list(list(task.query_hints) + state.get("query_hints", []))}
+                )
                 for task in section_tasks
             ]
 
-        if needs_timeline_normalization(state.get("noteboard", [])):
+        if not revision_targets and needs_timeline_normalization(state.get("noteboard", [])):
             if not any(item.section_id == "timeline_normalization" for item in section_tasks):
                 section_tasks.append(
                     SectionTaskModel(
@@ -174,7 +435,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                     )
                 )
 
-        if needs_conflict_resolution(state.get("noteboard", []), state.get("claim_ledger", [])):
+        if not revision_targets and needs_conflict_resolution(state.get("noteboard", []), state.get("claim_ledger", [])):
             if not any(item.section_id == "conflict_resolution" for item in section_tasks):
                 section_tasks.append(
                     SectionTaskModel(
@@ -187,24 +448,108 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                     )
                 )
 
-        pending = list(section_tasks)
-        active_task = pending.pop(0) if pending else None
         output = {
             "section_tasks": section_tasks,
-            "pending_section_tasks": pending,
-            "active_task": active_task,
+            "pending_section_tasks": [],
+            "active_task": None,
         }
         emit_stage(
             state,
             "section_router_node",
             "completed",
-            active_section=(active_task.section_id if active_task else None),
-            pending_count=len(pending),
+            active_section=None,
+            pending_count=len(section_tasks),
         )
         return output
 
     def route_after_section_router(state: ReportState) -> str:
-        return "graph_context_node" if state.get("active_task") else "reduce_sections_node"
+        return "process_sections_node" if state.get("section_tasks") else "reduce_sections_node"
+
+    def process_sections_node(state: ReportState) -> Dict[str, Any]:
+        tasks = list(state.get("section_tasks", []))
+        if not tasks:
+            return {
+                "pending_section_tasks": [],
+                "active_task": None,
+                "section_hits": [],
+                "section_evidence_buffer": [],
+                "section_claims_buffer": [],
+                "section_issues_buffer": [],
+            }
+
+        emit_stage(
+            state,
+            "process_sections_node",
+            "started",
+            section_count=len(tasks),
+            worker_count=min(max_section_workers, len(tasks)),
+        )
+        results_by_section: Dict[str, Dict[str, Any]] = {}
+        worker_limit = min(max_section_workers, len(tasks))
+        if worker_limit == 1:
+            for task in tasks:
+                results_by_section[task.section_id] = _process_section_task(state, task)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_limit) as executor:
+                futures = {executor.submit(_process_section_task, state, task): task for task in tasks}
+                for future in as_completed(futures):
+                    task = futures[future]
+                    try:
+                        results_by_section[task.section_id] = future.result()
+                    except Exception:
+                        logger.exception("Stage 2 section worker failed", extra={"section_id": task.section_id})
+                        results_by_section[task.section_id] = {
+                            "task": task,
+                            "section_draft": None,
+                            "claims": [],
+                            "evidence": [],
+                            "issues": [f"{task.section_id}: section worker failed before draft generation."],
+                        }
+
+        ordered_results = [results_by_section[task.section_id] for task in tasks if task.section_id in results_by_section]
+        new_drafts = [item["section_draft"] for item in ordered_results if item.get("section_draft") is not None]
+        new_claims = [claim for item in ordered_results for claim in item.get("claims", [])]
+        new_evidence = [evidence_item for item in ordered_results for evidence_item in item.get("evidence", [])]
+        new_issues = [issue for item in ordered_results for issue in item.get("issues", [])]
+        latest_observation = ""
+        if new_evidence:
+            latest_observation = new_evidence[0].snippet
+        elif new_drafts:
+            latest_observation = new_drafts[0].content[:240]
+        output = {
+            "section_drafts": list(state.get("section_drafts", [])) + new_drafts,
+            "claim_ledger": list(state.get("claim_ledger", [])) + new_claims,
+            "evidence_refs": list(state.get("evidence_refs", [])) + new_evidence,
+            "section_issues": list(state.get("section_issues", [])) + new_issues,
+            "pending_section_tasks": [],
+            "active_task": None,
+            "section_hits": [],
+            "section_evidence_buffer": [],
+            "section_claims_buffer": [],
+            "section_issues_buffer": [],
+            "report_memory": build_report_memory(
+                question=state.get("prompt", ""),
+                report_type=state.get("report_type", "person"),
+                primary_entities=state.get("primary_entities", []),
+                noteboard=state.get("noteboard", []),
+                stage1_receipts=state.get("stage1_receipts", []),
+                claims=list(state.get("claim_ledger", [])) + new_claims,
+                evidence=list(state.get("evidence_refs", [])) + new_evidence,
+                section_issues=list(state.get("section_issues", [])) + new_issues,
+                section_drafts=list(state.get("section_drafts", [])) + new_drafts,
+                latest_observation=latest_observation,
+            ),
+        }
+        emit_stage(
+            state,
+            "process_sections_node",
+            "completed",
+            section_count=len(new_drafts),
+            claim_count=len(new_claims),
+            evidence_count=len(new_evidence),
+            issue_count=len(new_issues),
+        )
+        return output
 
     def graph_context_node(state: ReportState) -> Dict[str, Any]:
         task = state.get("active_task")
@@ -242,8 +587,9 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             return dict(state)
 
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
-        queries = dedupe_str_list(build_section_queries(task, llm3))[:max_vector_queries]
+        queries = dedupe_str_list(build_section_queries(task, llm3, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
+        graph_hits = graph_multi_entity_query(mcp_client, task.entity_ids)
         for query in queries:
             cache_key = f"{state['run_id']}::{query.strip().lower()}"
             cached_rows = vector_query_cache.get(cache_key)
@@ -251,6 +597,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                 cached_rows = vector_multi_query(mcp_client, state["run_id"], [query], k=vector_k)
                 vector_query_cache[cache_key] = cached_rows
             hits.extend(cached_rows)
+        hits.extend(graph_hits)
         hits = _dedupe_hit_rows(hits)
         emit_stage(
             state,
@@ -259,6 +606,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             section_id=task.section_id,
             query_count=len(queries),
             hit_count=len(hits),
+            graph_hit_count=len(graph_hits),
         )
         return {"section_hits": hits}
 
@@ -308,7 +656,16 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             },
         }
         try:
-            parsed = llm3.complete_json(REPORT_SECTION_CLAIMS_SYSTEM_PROMPT, payload, temperature=0.1, timeout=45)
+            parsed = invoke_complete_json(
+                llm3,
+                REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
+                payload,
+                temperature=0.1,
+                timeout=45,
+                run_id=state["run_id"],
+                operation="stage2.claim_refine",
+                metadata={"sectionId": task.section_id},
+            )
             raw_claims = parsed.get("claims")
             if isinstance(raw_claims, list):
                 claims = [ClaimModel.model_validate({**item, "section_id": task.section_id}) for item in raw_claims]
@@ -341,9 +698,16 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                     issues.append(f"{task.section_id}: high-impact claim without evidence: {claim.claim_id}")
                 continue
             matched_evidence = [item for item in evidence if item.citation_key in matched]
-            primary_evidence = next((item for item in matched_evidence if item.source_url), None)
+            primary_evidence = next(
+                (
+                    item
+                    for item in matched_evidence
+                    if item.source_url or item.document_id or item.object_ref or item.graph_ref
+                ),
+                None,
+            )
             if primary_evidence is None:
-                issues.append(f"{task.section_id}: dropped claim without URL-backed evidence: {claim.claim_id}")
+                issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
                 continue
             normalized = claim.model_copy(
                 update={
@@ -379,7 +743,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         section_draft = SectionDraftModel(
             section_id=task.section_id,
             title=task.title,
-            content=draft_section_content(task, claims, evidence, llm3),
+            content=draft_section_content(state["run_id"], task, claims, evidence, llm3),
             citation_keys=[item.citation_key for item in evidence],
         )
         pending = list(state.get("pending_section_tasks", []))
@@ -399,6 +763,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                 question=state.get("prompt", ""),
                 report_type=state.get("report_type", "person"),
                 primary_entities=state.get("primary_entities", []),
+                noteboard=state.get("noteboard", []),
                 stage1_receipts=state.get("stage1_receipts", []),
                 claims=list(state.get("claim_ledger", [])) + claims,
                 evidence=list(state.get("evidence_refs", [])) + evidence,
@@ -432,6 +797,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             question=state.get("prompt", ""),
             report_type=state.get("report_type", "person"),
             primary_entities=state.get("primary_entities", []),
+            noteboard=state.get("noteboard", []),
             stage1_receipts=state.get("stage1_receipts", []),
             claims=merged_claims,
             evidence=merged_evidence,
@@ -474,6 +840,114 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         )
         return next_state
 
+    def final_reflection_node(state: ReportState) -> Dict[str, Any]:
+        emit_stage(state, "final_reflection_node", "started")
+        outline = list(state.get("outline", []))
+        drafts = list(state.get("section_drafts", []))
+        report_memory = state.get("report_memory")
+        consistency_issues = list(state.get("consistency_issues", []))
+        draft_lookup = {item.section_id: item for item in drafts}
+        missing_required = [item.section_id for item in outline if item.required and not draft_lookup.get(item.section_id)]
+
+        reflections: List[SectionReflectionModel] = []
+        quality_ok_from_llm = False
+
+        if llm3 is not None:
+            payload = {
+                "report_type": state.get("report_type", "person"),
+                "outline": [item.model_dump() for item in outline],
+                "section_drafts": [item.model_dump() for item in drafts],
+                "section_issues": state.get("section_issues", []),
+                "report_memory": (report_memory.model_dump() if report_memory is not None else {}),
+                "consistency_issues": [item.model_dump() for item in consistency_issues],
+                "output_schema": {
+                    "quality_ok": "boolean",
+                    "sections": [
+                        {
+                            "section_id": "string",
+                            "status": "ok|needs_revision|missing",
+                            "critique": "string",
+                            "next_step_suggestion": "string",
+                            "query_hints": ["string"],
+                        }
+                    ],
+                },
+            }
+            try:
+                parsed = invoke_complete_json(
+                    llm3,
+                    REPORT_SECTION_REFLECTION_SYSTEM_PROMPT,
+                    payload,
+                    temperature=0.1,
+                    timeout=45,
+                    run_id=state["run_id"],
+                    operation="stage2.final_reflection",
+                )
+                quality_ok_from_llm = bool(parsed.get("quality_ok", False))
+                raw_sections = parsed.get("sections")
+                if isinstance(raw_sections, list):
+                    reflections = [SectionReflectionModel.model_validate(item) for item in raw_sections]
+            except Exception:
+                logger.exception("Stage 2 final reflection failed")
+
+        reflection_by_section = {item.section_id: item for item in reflections}
+        for section_id in missing_required:
+            draft = draft_lookup.get(section_id)
+            reflection_by_section[section_id] = SectionReflectionModel(
+                section_id=section_id,
+                status="missing",
+                critique="Required section is missing from the current report draft.",
+                current_content=(draft.content if draft else ""),
+                next_step_suggestion="Retrieve evidence aligned with the section objective and draft the missing section with concrete citations.",
+                query_hints=["overview", "timeline", "official profile"],
+            )
+
+        if not reflections:
+            for task in outline:
+                draft = draft_lookup.get(task.section_id)
+                if draft is None:
+                    continue
+                draft_text = draft.content.strip()
+                if len(draft_text) < 350 or not draft.citation_keys:
+                    reflection_by_section[task.section_id] = SectionReflectionModel(
+                        section_id=task.section_id,
+                        status="needs_revision",
+                        critique="Section is too thin or lacks enough explicit cited detail for the objective.",
+                        current_content=draft.content,
+                        next_step_suggestion="Expand this section with more evidence-backed specifics, chronology, and direct identifiers tied to the section objective.",
+                        query_hints=list(task.query_hints)[:3],
+                    )
+                else:
+                    reflection_by_section.setdefault(task.section_id, SectionReflectionModel(section_id=task.section_id, status="ok"))
+
+        for task in outline:
+            draft = draft_lookup.get(task.section_id)
+            reflection = reflection_by_section.get(task.section_id)
+            if reflection is None:
+                reflection_by_section[task.section_id] = SectionReflectionModel(
+                    section_id=task.section_id,
+                    status="ok" if draft and draft.content.strip() else "missing",
+                    current_content=(draft.content if draft else ""),
+                )
+            elif not reflection.current_content and draft is not None:
+                reflection_by_section[task.section_id] = reflection.model_copy(update={"current_content": draft.content})
+
+        normalized_reflections = [
+            reflection_by_section.get(task.section_id)
+            for task in outline
+            if reflection_by_section.get(task.section_id) is not None
+        ]
+        has_targets = any(item.status != "ok" for item in normalized_reflections if item is not None)
+        quality_ok = (quality_ok_from_llm if llm3 is not None else True) and not has_targets
+        emit_stage(
+            state,
+            "final_reflection_node",
+            "completed",
+            quality_ok=quality_ok,
+            targeted_count=len([item for item in normalized_reflections if item is not None and item.status != "ok"]),
+        )
+        return {"section_reflections": [item for item in normalized_reflections if item is not None], "quality_ok": quality_ok}
+
     def quality_gate_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "quality_gate_node", "started")
         outline = state.get("outline", [])
@@ -481,6 +955,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         claims = state.get("claim_ledger", [])
         evidence_refs = state.get("evidence_refs", [])
         section_issues = list(state.get("section_issues", []))
+        section_reflections = list(state.get("section_reflections", []))
         report_memory = state.get("report_memory")
         consistency_issues = list(state.get("consistency_issues", []))
 
@@ -489,6 +964,23 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         missing = sorted(required_ids - draft_ids)
         if missing:
             section_issues.append(f"Missing required sections: {', '.join(missing)}")
+
+        revision_targets = [item for item in section_reflections if item.status == "needs_revision"]
+        missing_targets = [item.section_id for item in section_reflections if item.status == "missing"]
+        for reflection in revision_targets:
+            critique = reflection.critique or "Section needs revision."
+            section_issues.append(f"{reflection.section_id}: reflection revision required: {critique}")
+        if missing_targets:
+            section_issues.append(f"Reflection flagged missing sections: {', '.join(sorted(set(missing_targets)))}")
+
+        section_issues.extend(
+            build_depth_quality_issues(
+                report_type=state.get("report_type", "person"),
+                primary_entities=state.get("primary_entities", []),
+                stage1_receipts=state.get("stage1_receipts", []),
+                section_drafts=drafts,
+            )
+        )
 
         for claim in claims:
             if claim.impact == "high" and not claim.evidence_keys:
@@ -512,15 +1004,16 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             for issue in consistency_issues:
                 section_issues.append(f"Consistency issue: {issue.description}")
 
-        quality_ok = not no_evidence_or_claims and (
+        quality_ok = not no_evidence_or_claims and bool(state.get("quality_ok", False)) and (
             not missing
+            and not revision_targets
             and not any("high-impact claim missing evidence" in item for item in section_issues)
             and not consistency_issues
             and coverage_is_complete(coverage, state.get("report_type", "person"))
         )
         output = {
             "quality_ok": quality_ok,
-            "missing_section_ids": missing,
+            "missing_section_ids": sorted(set(missing + missing_targets)),
             "section_issues": dedupe_str_list(section_issues),
             "report_memory": (report_memory.model_copy(update={"coverage": coverage, "limits": dedupe_str_list(section_issues), "consistency_issues": consistency_issues}) if report_memory is not None else report_memory),
         }
@@ -539,7 +1032,45 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             return "finalize_report_node"
         if state.get("refine_round", 0) >= state.get("max_refine_rounds", 2):
             return "finalize_report_node"
+        if any(item.status != "ok" for item in state.get("section_reflections", [])):
+            return "prepare_section_revisions_node"
         return "refine_retrieval_node"
+
+    def prepare_section_revisions_node(state: ReportState) -> Dict[str, Any]:
+        emit_stage(state, "prepare_section_revisions_node", "started")
+        targets = [item for item in state.get("section_reflections", []) if item.status != "ok"]
+        target_ids = {item.section_id for item in targets}
+        query_hints = list(state.get("query_hints", []))
+        for item in targets:
+            query_hints.extend(item.query_hints)
+        output = {
+            "query_hints": dedupe_str_list(query_hints),
+            "refine_round": state.get("refine_round", 0) + 1,
+            "section_drafts": [item for item in state.get("section_drafts", []) if item.section_id not in target_ids],
+            "claim_ledger": [item for item in state.get("claim_ledger", []) if item.section_id not in target_ids],
+            "evidence_refs": [item for item in state.get("evidence_refs", []) if item.section_id not in target_ids],
+            "section_issues": [
+                item
+                for item in state.get("section_issues", [])
+                if not any(item.startswith(f"{section_id}:") for section_id in target_ids)
+                and not item.startswith("Missing required sections:")
+                and not item.startswith("Reflection flagged missing sections:")
+            ],
+            "missing_section_ids": sorted(target_ids),
+            "section_hits": [],
+            "section_evidence_buffer": [],
+            "section_claims_buffer": [],
+            "section_issues_buffer": [],
+            "consistency_issues": [],
+        }
+        emit_stage(
+            state,
+            "prepare_section_revisions_node",
+            "completed",
+            refine_round=output["refine_round"],
+            target_count=len(target_ids),
+        )
+        return output
 
     def refine_retrieval_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "refine_retrieval_node", "started")
@@ -558,6 +1089,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             "claim_ledger": [],
             "evidence_refs": [],
             "section_issues": [],
+            "section_reflections": [],
             "section_hits": [],
             "section_evidence_buffer": [],
             "section_claims_buffer": [],
@@ -620,6 +1152,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
     graph.add_node("report_init_node", report_init_node)
     graph.add_node("build_outline_node", build_outline_node)
     graph.add_node("section_router_node", section_router_node)
+    graph.add_node("process_sections_node", process_sections_node)
     graph.add_node("graph_context_node", graph_context_node)
     graph.add_node("vector_retrieve_node", vector_retrieve_node)
     graph.add_node("evidence_pack_node", evidence_pack_node)
@@ -627,22 +1160,25 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
     graph.add_node("verify_claims_node", verify_claims_node)
     graph.add_node("draft_section_node", draft_section_node)
     graph.add_node("reduce_sections_node", reduce_sections_node)
+    graph.add_node("final_reflection_node", final_reflection_node)
     graph.add_node("quality_gate_node", quality_gate_node)
+    graph.add_node("prepare_section_revisions_node", prepare_section_revisions_node)
     graph.add_node("refine_retrieval_node", refine_retrieval_node)
     graph.add_node("finalize_report_node", finalize_report_node)
 
     graph.set_entry_point("report_init_node")
     graph.add_edge("report_init_node", "build_outline_node")
     graph.add_edge("build_outline_node", "section_router_node")
-    graph.add_conditional_edges("section_router_node", route_after_section_router, ["graph_context_node", "reduce_sections_node"])
-    graph.add_edge("graph_context_node", "vector_retrieve_node")
-    graph.add_edge("vector_retrieve_node", "evidence_pack_node")
-    graph.add_edge("evidence_pack_node", "extract_claims_node")
-    graph.add_edge("extract_claims_node", "verify_claims_node")
-    graph.add_edge("verify_claims_node", "draft_section_node")
-    graph.add_conditional_edges("draft_section_node", route_next_section_or_reduce, ["graph_context_node", "reduce_sections_node"])
-    graph.add_edge("reduce_sections_node", "quality_gate_node")
-    graph.add_conditional_edges("quality_gate_node", quality_route, ["refine_retrieval_node", "finalize_report_node"])
+    graph.add_conditional_edges("section_router_node", route_after_section_router, ["process_sections_node", "reduce_sections_node"])
+    graph.add_edge("process_sections_node", "reduce_sections_node")
+    graph.add_edge("reduce_sections_node", "final_reflection_node")
+    graph.add_edge("final_reflection_node", "quality_gate_node")
+    graph.add_conditional_edges(
+        "quality_gate_node",
+        quality_route,
+        ["prepare_section_revisions_node", "refine_retrieval_node", "finalize_report_node"],
+    )
+    graph.add_edge("prepare_section_revisions_node", "section_router_node")
     graph.add_edge("refine_retrieval_node", "section_router_node")
     graph.add_edge("finalize_report_node", END)
     return graph

@@ -134,6 +134,11 @@ def main() -> None:
         help="HTTP URL to fetch for smoke testing",
     )
     parser.add_argument("--max-chars", type=int, default=40000)
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=max(2, int(os.getenv("LANGGRAPH_MAX_ITERATIONS", "3"))),
+    )
     args = parser.parse_args()
 
     run_id = os.getenv("RUN_ID") or _new_run_id()
@@ -142,7 +147,12 @@ def main() -> None:
     logger.info("Pipeline test started", extra={"run_id": run_id, "url": args.url})
     _ensure_run(run_id, prompt)
 
-    planner_result = run_planner(run_id=run_id, prompt=prompt, inputs=[], max_iterations=1)
+    planner_result = run_planner(
+        run_id=run_id,
+        prompt=prompt,
+        inputs=[],
+        max_iterations=args.max_iterations,
+    )
     if not planner_result.documents_created:
         raise RuntimeError("Planner did not create any documents")
 

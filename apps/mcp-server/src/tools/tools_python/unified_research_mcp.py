@@ -234,6 +234,87 @@ def _normalize_url_list(input_data: dict[str, Any]) -> list[str]:
     return deduped
 
 
+def _normalize_tavily_include_raw_content(value: Any, default: str | bool = "text") -> str | bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return normalized
+    return bool(value)
+
+
+def _normalize_optional_str_list(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    return normalized or None
+
+
+def _build_tavily_search_payload(
+    *,
+    query: str,
+    max_results: int,
+    search_depth: str,
+    topic: str | None,
+    include_raw_content: str | bool,
+    include_answer: bool | str | None,
+    include_images: bool,
+    include_domains: list[str] | None = None,
+    exclude_domains: list[str] | None = None,
+    time_range: str | None = None,
+    days: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "query": query,
+        "search_depth": search_depth,
+        "max_results": max(1, min(max_results, 20)),
+        "include_raw_content": include_raw_content,
+        "include_images": include_images,
+    }
+    if topic:
+        payload["topic"] = topic
+    if include_answer is not None:
+        payload["include_answer"] = include_answer
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if exclude_domains:
+        payload["exclude_domains"] = exclude_domains
+    if time_range:
+        payload["time_range"] = time_range
+    if days is not None and days > 0:
+        payload["days"] = days
+    return payload
+
+
+def _extract_tavily_search_results(raw_response: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    raw_results = raw_response.get("results")
+    result_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+    extracted_results: list[dict[str, Any]] = []
+    for index, item in enumerate(result_rows[:20], start=1):
+        extracted_results.append(
+            {
+                "rank": index,
+                "title": _clean_text(item.get("title"), max_len=220),
+                "url": item.get("url"),
+                "content": _clean_text(item.get("content"), max_len=700),
+                "raw_content": _clean_text(item.get("raw_content"), max_len=2000),
+                "extracted_text": _clean_text(item.get("content") or item.get("raw_content"), max_len=700),
+                "score": item.get("score"),
+                "favicon": item.get("favicon"),
+                "images": item.get("images") if isinstance(item.get("images"), list) else [],
+            }
+        )
+    return result_rows, extracted_results
+
+
 def _tavily_api_key() -> str:
     api_key = str(
         os.getenv("TAVILY_SEARCH_API_KEY")
@@ -585,9 +666,14 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
     timeout_seconds = int(input_data.get("timeout_seconds", 120))
     search_depth = str(input_data.get("search_depth") or "advanced").strip() or "advanced"
     topic = str(input_data.get("topic") or "general").strip() or "general"
-    include_raw_content = bool(input_data.get("include_raw_content", False))
-    include_answer = bool(input_data.get("include_answer", False))
+    include_raw_content = _normalize_tavily_include_raw_content(input_data.get("include_raw_content"), default="text")
+    include_answer = input_data.get("include_answer", False)
     include_images = bool(input_data.get("include_images", False))
+    include_domains = _normalize_optional_str_list(input_data.get("include_domains"))
+    exclude_domains = _normalize_optional_str_list(input_data.get("exclude_domains"))
+    time_range = str(input_data.get("time_range") or "").strip() or None
+    days_value = input_data.get("days")
+    days = int(days_value) if days_value not in (None, "") else None
 
     out_input = input_data.get("output_dir")
     temp_output = False
@@ -598,39 +684,36 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
         temp_output = True
         output_dir = Path(tempfile.mkdtemp(prefix="tavily_web_search_"))
 
-    payload = {
-        "query": query,
-        "topic": topic,
-        "search_depth": search_depth,
-        "max_results": max(1, min(max_results, 20)),
-        "include_raw_content": include_raw_content,
-        "include_answer": include_answer,
-        "include_images": include_images,
-    }
+    payload = _build_tavily_search_payload(
+        query=query,
+        max_results=max_results,
+        search_depth=search_depth,
+        topic=topic,
+        include_raw_content=include_raw_content,
+        include_answer=include_answer,
+        include_images=include_images,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+        time_range=time_range,
+        days=days,
+    )
     raw_response = _tavily_json_request(api_url, payload, timeout_seconds=timeout_seconds)
     raw_path = _write_json_file(output_dir / "tavily_search_response.json", raw_response)
 
-    raw_results = raw_response.get("results")
-    result_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
-    extracted_results: list[dict[str, Any]] = []
-    for index, item in enumerate(result_rows[:20], start=1):
-        extracted_results.append(
-            {
-                "rank": index,
-                "title": _clean_text(item.get("title"), max_len=220),
-                "url": item.get("url"),
-                "extracted_text": _clean_text(item.get("content") or item.get("raw_content"), max_len=700),
-                "score": item.get("score"),
-            }
-        )
+    result_rows, extracted_results = _extract_tavily_search_results(raw_response)
 
     summary = {
         "query": query,
         "topic": topic,
+        "follow_up_questions": raw_response.get("follow_up_questions"),
+        "answer": raw_response.get("answer"),
+        "images": raw_response.get("images") if isinstance(raw_response.get("images"), list) else [],
         "results_found": len(result_rows),
         "search_depth": search_depth,
-        "answer": raw_response.get("answer") if include_answer else None,
-        "results": extracted_results,
+        "include_raw_content": include_raw_content,
+        "response_time": raw_response.get("response_time"),
+        "request_id": raw_response.get("request_id"),
+        "results": result_rows,
     }
     summary_path = _write_json_file(output_dir / "search_results.json", summary)
     index_path = _write_search_index(output_dir, f"Tavily search results for {query}", extracted_results)
@@ -638,6 +721,13 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
     result = {
         "query": query,
         "topic": topic,
+        "follow_up_questions": raw_response.get("follow_up_questions"),
+        "answer": raw_response.get("answer"),
+        "images": raw_response.get("images") if isinstance(raw_response.get("images"), list) else [],
+        "results": result_rows,
+        "response_time": raw_response.get("response_time"),
+        "request_id": raw_response.get("request_id"),
+        "results_found": len(result_rows),
         "output_dir": str(output_dir),
         "summary_path": str(summary_path),
         "api_response_path": str(raw_path),
@@ -645,7 +735,7 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
         "raw_files": [str(summary_path), str(raw_path), str(index_path)],
         "summary": summary,
         "extracted_results": extracted_results,
-        "answer": raw_response.get("answer"),
+        "payload": payload,
     }
     if temp_output:
         result["note"] = "Output was written to a temporary directory. Pass output_dir to persist files."
@@ -661,8 +751,15 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
     max_results = int(input_data.get("max_results", 10))
     timeout_seconds = int(input_data.get("timeout_seconds", 120))
     search_depth = str(input_data.get("search_depth") or "advanced").strip() or "advanced"
-    include_raw_content = bool(input_data.get("include_raw_content", False))
-    include_answer = bool(input_data.get("include_answer", False))
+    include_raw_content = _normalize_tavily_include_raw_content(input_data.get("include_raw_content"), default="text")
+    include_answer = input_data.get("include_answer", False)
+    include_images = bool(input_data.get("include_images", False))
+    include_domains = _normalize_optional_str_list(input_data.get("include_domains"))
+    exclude_domains = _normalize_optional_str_list(input_data.get("exclude_domains"))
+    topic = str(input_data.get("topic") or "general").strip() or "general"
+    time_range = str(input_data.get("time_range") or "").strip() or None
+    days_value = input_data.get("days")
+    days = int(days_value) if days_value not in (None, "") else None
 
     out_input = input_data.get("output_dir")
     temp_output = False
@@ -673,38 +770,38 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
         temp_output = True
         output_dir = Path(tempfile.mkdtemp(prefix="tavily_search_"))
 
-    payload = {
-        "query": target_name,
-        "search_depth": search_depth,
-        "max_results": max(1, min(max_results, 20)),
-        "include_raw_content": include_raw_content,
-        "include_answer": include_answer,
-        "include_images": False,
-    }
+    payload = _build_tavily_search_payload(
+        query=target_name,
+        max_results=max_results,
+        search_depth=search_depth,
+        topic=topic,
+        include_raw_content=include_raw_content,
+        include_answer=include_answer,
+        include_images=include_images,
+        include_domains=include_domains,
+        exclude_domains=exclude_domains,
+        time_range=time_range,
+        days=days,
+    )
     raw_response = _tavily_json_request(api_url, payload, timeout_seconds=timeout_seconds)
     raw_path = output_dir / "tavily_response.json"
     raw_path.write_text(json.dumps(raw_response, ensure_ascii=True, indent=2), encoding="utf-8")
 
-    raw_results = raw_response.get("results")
-    result_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
-    extracted_results: list[dict[str, Any]] = []
-    for index, item in enumerate(result_rows[:20], start=1):
-        extracted_results.append(
-            {
-                "rank": index,
-                "title": _clean_text(item.get("title"), max_len=220),
-                "url": item.get("url"),
-                "extracted_text": _clean_text(item.get("content") or item.get("raw_content"), max_len=700),
-                "score": item.get("score"),
-            }
-        )
+    result_rows, extracted_results = _extract_tavily_search_results(raw_response)
 
     summary = {
         "target_name": target_name,
+        "query": raw_response.get("query") or target_name,
+        "topic": topic,
+        "follow_up_questions": raw_response.get("follow_up_questions"),
+        "answer": raw_response.get("answer"),
+        "images": raw_response.get("images") if isinstance(raw_response.get("images"), list) else [],
         "results_found": len(result_rows),
         "search_depth": search_depth,
-        "answer": raw_response.get("answer") if include_answer else None,
-        "results": extracted_results,
+        "include_raw_content": include_raw_content,
+        "response_time": raw_response.get("response_time"),
+        "request_id": raw_response.get("request_id"),
+        "results": result_rows,
     }
     summary_path = output_dir / "search_results.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -712,6 +809,15 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         "target_name": target_name,
+        "query": raw_response.get("query") or target_name,
+        "topic": topic,
+        "follow_up_questions": raw_response.get("follow_up_questions"),
+        "answer": raw_response.get("answer"),
+        "images": raw_response.get("images") if isinstance(raw_response.get("images"), list) else [],
+        "results": result_rows,
+        "response_time": raw_response.get("response_time"),
+        "request_id": raw_response.get("request_id"),
+        "results_found": len(result_rows),
         "output_dir": str(output_dir),
         "summary_path": str(summary_path),
         "api_response_path": str(raw_path),
@@ -720,7 +826,7 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
         "raw_files": [str(summary_path), str(raw_path), str(index_path)],
         "summary": summary,
         "extracted_results": extracted_results,
-        "answer": raw_response.get("answer"),
+        "payload": payload,
     }
     if temp_output:
         result["note"] = "Output was written to a temporary directory. Pass output_dir to persist files."

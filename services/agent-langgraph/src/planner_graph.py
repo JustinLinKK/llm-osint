@@ -35,6 +35,18 @@ DEFAULT_MAX_WORKER = max(
     1,
     int(os.getenv("LANGGRAPH_MAX_WORKER", os.getenv("LANGGRAPH_MAX_WORKERS", "5"))),
 )
+STAGE1_MAX_RELATED_PERSON_EXPANSIONS = max(
+    1, int(os.getenv("STAGE1_MAX_RELATED_PERSON_EXPANSIONS", "3"))
+)
+STAGE1_MAX_RELATED_ORG_EXPANSIONS = max(
+    1, int(os.getenv("STAGE1_MAX_RELATED_ORG_EXPANSIONS", "2"))
+)
+STAGE1_RELATED_ENTITY_MIN_SCORE = max(
+    1, int(os.getenv("STAGE1_RELATED_ENTITY_MIN_SCORE", "2"))
+)
+STAGE1_MIN_ITERATIONS = max(
+    1, int(os.getenv("STAGE1_MIN_ITERATIONS", "2"))
+)
 
 URL_REGEX = re.compile(r"https?://[^\s\]]+")
 EMAIL_REGEX = re.compile(
@@ -139,13 +151,16 @@ class PlannerState(TypedDict):
     done: bool
     enough_info: bool
     noteboard: List[str]
+    noteboard_sections: Dict[str, List[str]]
     next_stage: str
     queued_tasks: List[Dict[str, Any]]
+    related_entity_candidates: List[Dict[str, Any]]
     academic_task_dedupe: Dict[str, int]
     technical_task_dedupe: Dict[str, int]
     business_task_dedupe: Dict[str, int]
     archive_identity_task_dedupe: Dict[str, int]
     relationship_task_dedupe: Dict[str, int]
+    depth_task_dedupe: Dict[str, int]
     coverage_ledger: Dict[str, bool]
 
 
@@ -159,6 +174,7 @@ class PlannerResult:
     iterations: int
     noteboard: List[str]
     next_stage: str
+    coverage_ledger: Dict[str, bool]
 
 
 def build_planner_graph(
@@ -188,11 +204,14 @@ def build_planner_graph(
             "iteration": 0,
             "done": False,
             "queued_tasks": [],
+            "related_entity_candidates": [],
+            "noteboard_sections": _empty_noteboard_sections(),
             "academic_task_dedupe": {},
             "technical_task_dedupe": {},
             "business_task_dedupe": {},
             "archive_identity_task_dedupe": {},
             "relationship_task_dedupe": {},
+            "depth_task_dedupe": {},
             "coverage_ledger": empty_coverage_ledger(),
         }
 
@@ -293,7 +312,7 @@ def build_planner_graph(
                 "name": "tavily_person_search",
                 "description": "Core: search person via Tavily and return high-signal public-web discovery results.",
                 "type": "web_search",
-                "confidence": 0.82,
+                "confidence": 0.9,
                 "category": ["search", "person", "tavily"],
                 "args": {"runId": "uuid", "target_name": "string", "max_results": "int"},
             },
@@ -680,13 +699,19 @@ def build_planner_graph(
         if llm is not None:
             try:
                 prompt = _inject_noteboard(
-                    state.get("prompt", ""), state.get("noteboard", []))
+                    state.get("prompt", ""),
+                    state.get("noteboard", []),
+                    state.get("noteboard_sections", {}),
+                    state.get("rationale", ""),
+                    state.get("queued_tasks", []),
+                )
                 result = llm.plan_tools(
                     prompt,
                     state.get("inputs", []),
                     tool_catalog,
                     prior_tool_calls=_planner_completed_tool_calls(state),
                     system_prompt=WORK_PLANNER_SYSTEM_PROMPT,
+                    run_id=state["run_id"],
                 )
                 rationale = result.get("rationale", "")
                 enough_info = bool(result.get("enough_info", False))
@@ -922,7 +947,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 8},
+                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
                             rationale=f"Expand related-person coverage using Tavily search for discovered person: {target_name}",
                         )
                     )
@@ -930,7 +955,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="google_serp_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 8},
+                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
                             rationale=f"Fallback related-person coverage via Google SERP for discovered person: {target_name}",
                         )
                     )
@@ -938,7 +963,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="person_search",
-                            arguments={"runId": state["run_id"], "name": target_name, "max_results": 8},
+                            arguments={"runId": state["run_id"], "name": target_name, "max_results": 10},
                             rationale=f"Collect biography, contact, and relationship clues for discovered related person: {target_name}",
                         )
                     )
@@ -1182,6 +1207,9 @@ def build_planner_graph(
         all_receipts = list(state.get("tool_receipts", []))
         documents_created = list(state.get("documents_created", []))
         noteboard = list(state.get("noteboard", []))
+        noteboard_sections = _normalize_noteboard_sections(
+            state.get("noteboard_sections", {})
+        )
         pending_urls = list(state.get("pending_urls", []))
         current_fetch_urls = list(state.get("current_fetch_urls", []))
         visited_urls = list(state.get("visited_urls", []))
@@ -1193,6 +1221,7 @@ def build_planner_graph(
         business_task_dedupe = dict(state.get("business_task_dedupe", {}))
         archive_identity_task_dedupe = dict(state.get("archive_identity_task_dedupe", {}))
         relationship_task_dedupe = dict(state.get("relationship_task_dedupe", {}))
+        depth_task_dedupe = dict(state.get("depth_task_dedupe", {}))
 
         for receipt in latest_receipts:
             all_receipts.append(receipt)
@@ -1201,7 +1230,7 @@ def build_planner_graph(
                     documents_created.append(document_id)
             note = _format_receipt_note(receipt)
             if note:
-                noteboard.append(note)
+                _append_noteboard_item(noteboard_sections, "evidence", note)
             if receipt.tool_name == "fetch_url":
                 source_url = _extract_fetch_receipt_url(receipt)
                 if source_url:
@@ -1219,7 +1248,9 @@ def build_planner_graph(
             + filtered_discovered_urls
         )
         if filtered_discovered_urls:
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "frontier",
                 f"Discovered {len(filtered_discovered_urls)} in-scope internal URL(s) for follow-up fetch."
             )
 
@@ -1243,10 +1274,12 @@ def build_planner_graph(
                     for task in entity_resolution_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(entity_resolution_follow_up_tasks)} deterministic identity-resolution follow-up task(s)."
             )
-        noteboard.extend(entity_resolution_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", entity_resolution_notes)
 
         follow_up_tasks, academic_task_dedupe, academic_notes = derive_academic_follow_up_tasks(
             run_id=state["run_id"],
@@ -1268,8 +1301,12 @@ def build_planner_graph(
                     for task in follow_up_tasks
                 ]
             )
-            noteboard.append(f"Queued {len(follow_up_tasks)} deterministic academic follow-up task(s).")
-        noteboard.extend(academic_notes)
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
+                f"Queued {len(follow_up_tasks)} deterministic academic follow-up task(s).",
+            )
+        _extend_noteboard_items(noteboard_sections, "gaps", academic_notes)
 
         technical_follow_up_tasks, technical_task_dedupe, technical_notes = derive_technical_follow_up_tasks(
             run_id=state["run_id"],
@@ -1291,10 +1328,12 @@ def build_planner_graph(
                     for task in technical_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(technical_follow_up_tasks)} deterministic technical follow-up task(s)."
             )
-        noteboard.extend(technical_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", technical_notes)
 
         business_follow_up_tasks, business_task_dedupe, business_notes = derive_business_follow_up_tasks(
             run_id=state["run_id"],
@@ -1316,10 +1355,12 @@ def build_planner_graph(
                     for task in business_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(business_follow_up_tasks)} deterministic business follow-up task(s)."
             )
-        noteboard.extend(business_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", business_notes)
 
         archive_identity_follow_up_tasks, archive_identity_task_dedupe, archive_identity_notes = derive_archive_identity_follow_up_tasks(
             run_id=state["run_id"],
@@ -1341,10 +1382,12 @@ def build_planner_graph(
                     for task in archive_identity_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(archive_identity_follow_up_tasks)} deterministic archive/identity follow-up task(s)."
             )
-        noteboard.extend(archive_identity_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", archive_identity_notes)
 
         relationship_follow_up_tasks, relationship_task_dedupe, relationship_notes = derive_relationship_follow_up_tasks(
             run_id=state["run_id"],
@@ -1366,10 +1409,12 @@ def build_planner_graph(
                     for task in relationship_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(relationship_follow_up_tasks)} deterministic relationship follow-up task(s)."
             )
-        noteboard.extend(relationship_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", relationship_notes)
 
         consistency_follow_up_tasks, academic_task_dedupe, consistency_notes = _derive_consistency_follow_up_tasks(
             run_id=state["run_id"],
@@ -1391,18 +1436,59 @@ def build_planner_graph(
                     for task in consistency_follow_up_tasks
                 ]
             )
-            noteboard.append(
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
                 f"Queued {len(consistency_follow_up_tasks)} contradiction-resolution follow-up task(s)."
             )
-        noteboard.extend(consistency_notes)
+        _extend_noteboard_items(noteboard_sections, "gaps", consistency_notes)
 
-        coverage_ledger = _derive_coverage_ledger({**state, "tool_receipts": all_receipts, "noteboard": noteboard})
+        related_entity_candidates = _rank_related_entity_candidates(
+            receipts=all_receipts,
+            primary_person_targets=primary_person_targets,
+        )
+        depth_follow_up_tasks, depth_task_dedupe, depth_notes = _derive_related_entity_expansion_follow_up_tasks(
+            run_id=state["run_id"],
+            receipts=all_receipts,
+            candidates=related_entity_candidates,
+            iteration=state.get("iteration", 0),
+            dedupe_store=depth_task_dedupe,
+        )
+        if depth_follow_up_tasks:
+            queued_tasks.extend(
+                [
+                    {
+                        "tool_name": task.tool_name,
+                        "payload": task.payload,
+                        "priority": task.priority,
+                        "reason": task.reason,
+                        "dedupe_key": task.dedupe_key,
+                    }
+                    for task in depth_follow_up_tasks
+                ]
+            )
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
+                f"Queued {len(depth_follow_up_tasks)} secondary-entity depth follow-up task(s)."
+            )
+        _extend_noteboard_items(noteboard_sections, "depth_candidates", depth_notes)
 
-        noteboard = _trim_noteboard(noteboard)
+        noteboard_sections = _trim_noteboard_sections(noteboard_sections)
+        noteboard = _flatten_noteboard_sections(noteboard_sections)
+        coverage_ledger = _derive_coverage_ledger(
+            {
+                **state,
+                "tool_receipts": all_receipts,
+                "noteboard": noteboard,
+                "noteboard_sections": noteboard_sections,
+            }
+        )
+
         emit_run_event(
             state["run_id"],
             "NOTEBOARD_UPDATED",
-            {"notes": noteboard},
+            {"notes": noteboard, "sections": noteboard_sections},
         )
         logger.info("Planner noteboard updated", extra={
                     "note_count": len(noteboard)})
@@ -1411,15 +1497,18 @@ def build_planner_graph(
             "tool_receipts": all_receipts,
             "documents_created": documents_created,
             "noteboard": noteboard,
+            "noteboard_sections": noteboard_sections,
             "pending_urls": pending_urls,
             "current_fetch_urls": [],
             "visited_urls": visited_urls,
             "queued_tasks": queued_tasks,
+            "related_entity_candidates": related_entity_candidates,
             "academic_task_dedupe": academic_task_dedupe,
             "technical_task_dedupe": technical_task_dedupe,
             "business_task_dedupe": business_task_dedupe,
             "archive_identity_task_dedupe": archive_identity_task_dedupe,
             "relationship_task_dedupe": relationship_task_dedupe,
+            "depth_task_dedupe": depth_task_dedupe,
             "coverage_ledger": coverage_ledger,
         }
 
@@ -1427,17 +1516,48 @@ def build_planner_graph(
         iteration = state.get("iteration", 0) + 1
         coverage_ledger = _derive_coverage_ledger(state)
         coverage_ok = coverage_led_stop_condition(coverage_ledger)
+        depth_ok = _planner_has_sufficient_related_entity_depth(state)
+        has_pending_follow_up = bool(state.get("queued_tasks", []))
+        noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
+        scorecard = _format_coverage_scorecard(coverage_ledger)
+        existing_gap_lines = [item for item in noteboard_sections.get("gaps", []) if not item.startswith("Coverage scorecard ")]
+        noteboard_sections["gaps"] = existing_gap_lines[-7:]
+        _append_noteboard_item(noteboard_sections, "gaps", scorecard)
+        min_iterations_reached = iteration >= min(
+            state.get("max_iterations", 1),
+            STAGE1_MIN_ITERATIONS,
+        )
         done = (
             iteration >= state.get("max_iterations", 1)
-            or not state.get("tool_plan")
-            or coverage_ok
+            or (
+                min_iterations_reached
+                and ((not state.get("tool_plan")) and not has_pending_follow_up)
+            )
+            or (
+                min_iterations_reached
+                and coverage_ok
+                and depth_ok
+                and not has_pending_follow_up
+            )
         )
+        if done:
+            unresolved = _coverage_gaps_from_ledger(coverage_ledger)
+            if unresolved:
+                _append_noteboard_item(
+                    noteboard_sections,
+                    "gaps",
+                    "Unresolved coverage: " + ", ".join(unresolved[:6]) + ".",
+                )
+        noteboard_sections = _trim_noteboard_sections(noteboard_sections)
+        noteboard = _flatten_noteboard_sections(noteboard_sections)
         next_stage = "stage2" if done else "stage1"
         return {
             **state,
             "iteration": iteration,
             "done": done,
             "next_stage": next_stage,
+            "noteboard": noteboard,
+            "noteboard_sections": noteboard_sections,
             "coverage_ledger": coverage_ledger,
         }
 
@@ -1505,13 +1625,16 @@ def run_planner(
             "done": False,
             "enough_info": False,
             "noteboard": [],
+            "noteboard_sections": _empty_noteboard_sections(),
             "next_stage": "stage1",
             "queued_tasks": [],
+            "related_entity_candidates": [],
             "academic_task_dedupe": {},
             "technical_task_dedupe": {},
             "business_task_dedupe": {},
             "archive_identity_task_dedupe": {},
             "relationship_task_dedupe": {},
+            "depth_task_dedupe": {},
             "coverage_ledger": empty_coverage_ledger(),
         }
 
@@ -1527,6 +1650,7 @@ def run_planner(
             iterations=final_state.get("iteration", 0),
             noteboard=final_state.get("noteboard", []),
             next_stage=final_state.get("next_stage", "stage1"),
+            coverage_ledger=final_state.get("coverage_ledger", empty_coverage_ledger()),
         )
     finally:
         mcp_client.close()
@@ -1681,7 +1805,13 @@ def _extract_primary_person_targets(state: PlannerState) -> List[str]:
 
 
 def _state_text_corpus(state: PlannerState) -> List[str]:
-    texts = [state.get("prompt", "")] + list(state.get("inputs", [])) + list(state.get("noteboard", []))
+    noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
+    texts = (
+        [state.get("prompt", "")]
+        + list(state.get("inputs", []))
+        + list(state.get("noteboard", []))
+        + _flatten_noteboard_sections(noteboard_sections)
+    )
     for receipt in state.get("tool_receipts", []):
         texts.append(receipt.summary)
         for fact in receipt.key_facts:
@@ -1722,6 +1852,229 @@ def _extract_related_person_targets_from_receipts(state: PlannerState) -> List[s
                         if isinstance(item, str):
                             candidates.extend(extract_person_targets(item))
     return _dedupe(candidates)
+
+
+def _extract_related_org_targets_from_receipts(receipts: List[ToolReceipt]) -> List[str]:
+    candidates: List[str] = []
+    interesting_keys = {
+        "organizations",
+        "organization",
+        "affiliations",
+        "institution",
+        "institutions",
+        "employers",
+        "companies",
+        "company",
+        "labs",
+        "lab",
+        "schools",
+        "school",
+        "departments",
+        "staff",
+    }
+    for receipt in receipts:
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            for key, value in fact.items():
+                if key not in interesting_keys:
+                    continue
+                candidates.extend(_extract_org_names_from_value(value))
+    return _dedupe(candidates)
+
+
+def _extract_org_names_from_value(value: Any) -> List[str]:
+    names: List[str] = []
+    if isinstance(value, str):
+        candidate = _normalize_related_org_name(value)
+        if candidate:
+            names.append(candidate)
+    elif isinstance(value, list):
+        for item in value:
+            names.extend(_extract_org_names_from_value(item))
+    elif isinstance(value, dict):
+        for key in ("name", "organization", "institution", "company", "lab", "school", "department", "employer"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                normalized = _normalize_related_org_name(candidate)
+                if normalized:
+                    names.append(normalized)
+        for key in ("title", "affiliation"):
+            candidate = value.get(key)
+            if isinstance(candidate, str):
+                normalized = _normalize_related_org_name(candidate)
+                if normalized:
+                    names.append(normalized)
+    return _dedupe(names)
+
+
+def _normalize_related_org_name(value: str) -> str | None:
+    candidate = " ".join(value.strip().split()).strip(" -,:;")
+    if len(candidate) < 3:
+        return None
+    lowered = candidate.casefold()
+    if lowered in PERSON_CANDIDATE_STOPWORDS:
+        return None
+    org_markers = (
+        "university",
+        "college",
+        "school",
+        "lab",
+        "laboratory",
+        "institute",
+        "department",
+        "center",
+        "centre",
+        "company",
+        "corp",
+        "corporation",
+        "inc",
+        "llc",
+        "ltd",
+        "group",
+        "team",
+        "studio",
+    )
+    if not any(marker in lowered for marker in org_markers) and len(candidate.split()) < 2:
+        return None
+    return candidate
+
+
+def _rank_related_entity_candidates(
+    *,
+    receipts: List[ToolReceipt],
+    primary_person_targets: List[str],
+) -> List[Dict[str, Any]]:
+    primary_people = {item.casefold() for item in primary_person_targets}
+    candidates: Dict[str, Dict[str, Any]] = {}
+
+    def ensure_candidate(name: str, entity_type: str) -> Dict[str, Any]:
+        key = f"{entity_type}:{name.casefold()}"
+        current = candidates.get(key)
+        if current is None:
+            current = {
+                "entity_name": name,
+                "entity_type": entity_type,
+                "relationship_types": [],
+                "supporting_tools": [],
+                "domains": [],
+                "urls": [],
+                "mention_count": 0,
+                "score": 0,
+            }
+            candidates[key] = current
+        return current
+
+    person_keys = {
+        "relatedPeople": "ASSOCIATE_OF",
+        "coauthors": "COAUTHORED_WITH",
+        "authors": "AUTHORED_WITH",
+        "advisor": "ADVISED_BY",
+        "advisors": "ADVISED_BY",
+        "collaborators": "COLLABORATED_WITH",
+        "colleagues": "COLLEAGUE_OF",
+        "mentors": "MENTORED_BY",
+        "labMembers": "MEMBER_OF_LAB_WITH",
+    }
+    org_keys = {
+        "organizations": "AFFILIATED_WITH",
+        "organization": "AFFILIATED_WITH",
+        "affiliations": "AFFILIATED_WITH",
+        "institution": "AFFILIATED_WITH",
+        "institutions": "AFFILIATED_WITH",
+        "employers": "WORKS_AT",
+        "companies": "WORKS_AT",
+        "company": "WORKS_AT",
+        "labs": "MEMBER_OF_LAB",
+        "lab": "MEMBER_OF_LAB",
+        "schools": "ATTENDED",
+        "school": "ATTENDED",
+        "departments": "MEMBER_OF_DEPARTMENT",
+    }
+
+    for receipt in receipts:
+        if not receipt.ok:
+            continue
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            for key, rel_type in person_keys.items():
+                if key not in fact:
+                    continue
+                for name in _extract_person_targets_from_mixed_value(fact.get(key)):
+                    if name.casefold() in primary_people:
+                        continue
+                    candidate = ensure_candidate(name, "person")
+                    candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
+                    candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
+                    candidate["mention_count"] += 1
+                    candidate["score"] += 2 if key in {"coauthors", "advisor", "advisors", "collaborators"} else 1
+            for key, rel_type in org_keys.items():
+                if key not in fact:
+                    continue
+                for name in _extract_org_names_from_value(fact.get(key)):
+                    candidate = ensure_candidate(name, "organization")
+                    candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
+                    candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
+                    candidate["mention_count"] += 1
+                    candidate["score"] += 2 if key in {"companies", "company", "labs", "lab", "institution", "institutions"} else 1
+            for url in _fact_urls(fact):
+                domain = _domain_from_url(url)
+                if not domain:
+                    continue
+                for candidate in candidates.values():
+                    if candidate["entity_name"].casefold() in url.casefold():
+                        candidate["urls"] = _dedupe(candidate["urls"] + [url])
+                        candidate["domains"] = _dedupe(candidate["domains"] + [domain])
+                        candidate["score"] += 1
+
+    ranked = [item for item in candidates.values() if int(item.get("score", 0)) >= STAGE1_RELATED_ENTITY_MIN_SCORE]
+    ranked.sort(key=lambda item: (int(item.get("score", 0)), int(item.get("mention_count", 0)), item.get("entity_name", "")), reverse=True)
+    org_count = 0
+    person_count = 0
+    limited: List[Dict[str, Any]] = []
+    for item in ranked:
+        if item["entity_type"] == "organization":
+            if org_count >= STAGE1_MAX_RELATED_ORG_EXPANSIONS:
+                continue
+            org_count += 1
+        elif item["entity_type"] == "person":
+            if person_count >= STAGE1_MAX_RELATED_PERSON_EXPANSIONS:
+                continue
+            person_count += 1
+        limited.append(item)
+    return limited
+
+
+def _extract_person_targets_from_mixed_value(value: Any) -> List[str]:
+    candidates: List[str] = []
+    if isinstance(value, str):
+        candidates.extend(extract_person_targets(value))
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_extract_person_targets_from_mixed_value(item))
+    elif isinstance(value, dict):
+        for key in ("name", "person", "author", "advisor", "colleague", "collaborator", "displayName"):
+            item = value.get(key)
+            if isinstance(item, str):
+                candidates.extend(extract_person_targets(item))
+    return _dedupe(candidates)
+
+
+def _fact_urls(fact: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    for value in fact.values():
+        if isinstance(value, str):
+            urls.extend(_extract_urls(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str):
+                    urls.extend(_extract_urls(item))
+                elif isinstance(item, dict):
+                    for nested in item.values():
+                        if isinstance(nested, str):
+                            urls.extend(_extract_urls(nested))
+    return _dedupe(urls)
 
 
 def _receipt_has_value(state: PlannerState, tool_name: str, expected: Dict[str, str]) -> bool:
@@ -1881,6 +2234,7 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
             ledger["identity"] = True
         if receipt.tool_name in academic_tools:
             ledger["academic"] = True
+            ledger["academic_profile"] = True
             ledger["history"] = True
         if receipt.tool_name in code_tools or receipt.tool_name in package_tools:
             ledger["code_presence"] = True
@@ -1898,6 +2252,10 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
         for fact in receipt.key_facts:
             if not isinstance(fact, dict):
                 continue
+            if any(key in fact for key in ("canonical_identity", "primary_identifiers", "profileUrls", "sourceUrls", "sourceUrl")):
+                ledger["identity"] = True
+            if any(key in fact for key in ("aliases", "alias_variants", "handles", "usernames", "matchedProfiles")):
+                ledger["aliases"] = True
             if any(key in fact for key in ("emails", "phones", "contactSignals", "profileUrls", "patterns")):
                 ledger["contacts"] = True
             if any(key in fact for key in ("relatedPeople", "coauthors", "organizations", "staff", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses")):
@@ -1910,18 +2268,57 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
             if "publications" in fact and isinstance(fact.get("publications"), list) and fact.get("publications"):
                 ledger["package_publications"] = True
                 ledger["code_presence"] = True
+                ledger["academic_profile"] = True
+                ledger["history"] = True
 
     if any(token in notes_blob for token in ("email", "phone", "contact", "linkedin.com/in/", "github.com/", "personal site")):
         ledger["contacts"] = ledger["contacts"] or ("email" in notes_blob or "phone" in notes_blob or "personal site" in notes_blob)
         ledger["identity"] = ledger["identity"] or ("github.com/" in notes_blob or "linkedin.com/in/" in notes_blob)
+    if any(token in notes_blob for token in ("alias", "also known as", "aka", "handle", "username")):
+        ledger["aliases"] = True
     if any(token in notes_blob for token in ("co-author", "coauthor", "advisor", "colleague", "collaborator", "organization affiliation")):
         ledger["relationships"] = True
     if any(token in notes_blob for token in ("publication", "research", "history", "worked at", "joined", "former", "education", "university")):
         ledger["history"] = True
+        if any(token in notes_blob for token in ("orcid", "semantic scholar", "dblp", "google scholar", "arxiv", "pubmed")):
+            ledger["academic_profile"] = True
     if any(token in notes_blob for token in ("github profile", "github username", "repository", "repositories", "code identity")):
         ledger["code_presence"] = True
         ledger["identity"] = True
+        ledger["aliases"] = True
     return ledger
+
+
+def _coverage_gaps_from_ledger(ledger: Dict[str, bool]) -> List[str]:
+    label_map = {
+        "identity": "identity anchors",
+        "aliases": "alias and handle resolution",
+        "history": "dated background/history",
+        "contacts": "public contact surface",
+        "relationships": "typed relationship coverage",
+        "code_presence": "code/repository footprint",
+        "academic_profile": "academic profile resolution",
+        "business_roles": "business-role coverage",
+        "archived_history": "archived history",
+    }
+    return [label for key, label in label_map.items() if not ledger.get(key, False)]
+
+
+def _format_coverage_scorecard(ledger: Dict[str, bool]) -> str:
+    ordered_keys = [
+        "identity",
+        "aliases",
+        "history",
+        "contacts",
+        "relationships",
+        "academic_profile",
+        "code_presence",
+        "business_roles",
+        "archived_history",
+    ]
+    parts = [f"{key}={'yes' if ledger.get(key, False) else 'no'}" for key in ordered_keys]
+    satisfied = sum(1 for key in ordered_keys if ledger.get(key, False))
+    return f"Coverage scorecard {satisfied}/{len(ordered_keys)}: " + "; ".join(parts)
 
 
 def _fact_list(receipt: ToolReceipt, *keys: str) -> List[Any]:
@@ -2145,6 +2542,175 @@ def _derive_entity_resolution_follow_up_tasks(
     return tasks, dedupe_store, notes
 
 
+def _derive_related_entity_expansion_follow_up_tasks(
+    *,
+    run_id: str,
+    receipts: List[ToolReceipt],
+    candidates: List[Dict[str, Any]],
+    iteration: int,
+    dedupe_store: Dict[str, int],
+):
+    dedupe_store = prune_dedupe_store(dedupe_store, iteration)
+    tasks = []
+    notes: List[str] = []
+    for candidate in candidates:
+        entity_name = str(candidate.get("entity_name") or "").strip()
+        entity_type = str(candidate.get("entity_type") or "").strip()
+        if not entity_name or not entity_type:
+            continue
+        if _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
+            continue
+        if entity_type == "person":
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="tavily_research",
+                payload={"runId": run_id, "input": entity_name, "timeout_seconds": 180},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: investigate secondary person {entity_name} beyond mention-level coverage.",
+            )
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="person_search",
+                payload={"runId": run_id, "name": entity_name, "max_results": 8},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: collect biography, affiliation, and contact context for secondary person {entity_name}.",
+            )
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="github_identity_search",
+                payload={"runId": run_id, "person_name": entity_name, "max_results": 5},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: resolve technical/public profile context for related person {entity_name}.",
+            )
+        elif entity_type == "organization":
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="tavily_research",
+                payload={"runId": run_id, "input": f"{entity_name} organization profile public activities", "timeout_seconds": 180},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: investigate what related organization {entity_name} does and its public footprint.",
+            )
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="open_corporates_search",
+                payload={"runId": run_id, "company_name": entity_name},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: resolve registry identity and officers for related organization {entity_name}.",
+            )
+            if candidate.get("domains"):
+                domain = str(candidate["domains"][0]).strip()
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="domain_whois_search",
+                    payload={"runId": run_id, "domain": domain, "max_results": 5},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: resolve ownership and infrastructure context for {entity_name} via {domain}.",
+                )
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="contact_page_extractor",
+                    payload={"runId": run_id, "site_url": f"https://{domain}"},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: extract public team/contact pages for related organization {entity_name}.",
+                )
+            elif candidate.get("urls"):
+                url = str(candidate["urls"][0]).strip()
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="contact_page_extractor",
+                    payload={"runId": run_id, "site_url": url},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: extract public profile/contact coverage for related organization {entity_name}.",
+                )
+        relationship_blob = ", ".join(candidate.get("relationship_types", []))
+        notes.append(
+            f"Depth candidate: {entity_type} {entity_name} (score={candidate.get('score', 0)}, relations={relationship_blob or 'unknown'})."
+        )
+    return tasks, dedupe_store, notes
+
+
+def _related_entity_has_depth_investigation(receipts: List[ToolReceipt], entity_name: str, entity_type: str) -> bool:
+    deep_person_tools = {
+        "tavily_research",
+        "tavily_person_search",
+        "person_search",
+        "github_identity_search",
+        "gitlab_identity_search",
+        "arxiv_search_and_download",
+        "orcid_search",
+        "semantic_scholar_search",
+        "dblp_author_search",
+    }
+    deep_org_tools = {
+        "tavily_research",
+        "open_corporates_search",
+        "company_officer_search",
+        "domain_whois_search",
+        "contact_page_extractor",
+        "org_staff_page_search",
+        "wayback_fetch_url",
+    }
+    target_tools = deep_person_tools if entity_type == "person" else deep_org_tools
+    expected = entity_name.casefold()
+    for receipt in receipts:
+        if not receipt.ok or receipt.tool_name not in target_tools:
+            continue
+        if _receipt_targets_name(receipt, expected):
+            return True
+    return False
+
+
+def _receipt_targets_name(receipt: ToolReceipt, expected_casefold: str) -> bool:
+    for value in receipt.arguments.values():
+        if isinstance(value, str) and value.strip() and expected_casefold in value.casefold():
+            return True
+    if expected_casefold in receipt.summary.casefold():
+        return True
+    for fact in receipt.key_facts:
+        if not isinstance(fact, dict):
+            continue
+        for value in fact.values():
+            if isinstance(value, str) and expected_casefold in value.casefold():
+                return True
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and expected_casefold in item.casefold():
+                        return True
+    return False
+
+
+def _planner_has_sufficient_related_entity_depth(state: PlannerState) -> bool:
+    candidates = list(state.get("related_entity_candidates", []))
+    if not candidates:
+        return True
+    receipts = [receipt for receipt in state.get("tool_receipts", []) if receipt.ok]
+    unresolved = 0
+    for candidate in candidates:
+        entity_name = str(candidate.get("entity_name") or "").strip()
+        entity_type = str(candidate.get("entity_type") or "").strip()
+        if not entity_name or not entity_type:
+            continue
+        if not _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
+            unresolved += 1
+    return unresolved == 0
+
+
 def _domain_from_url(url: str) -> str | None:
     match = re.match(r"^https?://([^/:?#]+)", url.strip(), re.IGNORECASE)
     if not match:
@@ -2329,7 +2895,23 @@ def _normalize_llm_tool_plan(
             )
         )
 
-    return normalized_plan
+    return _prefer_research_tool_sources(normalized_plan)
+
+
+def _tool_source_preference_rank(tool_name: str) -> int:
+    if tool_name in {"tavily_research", "tavily_person_search"}:
+        return 0
+    if tool_name.startswith("osint_"):
+        return 2
+    return 1
+
+
+def _prefer_research_tool_sources(plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
+    if len(plan) <= 1:
+        return plan
+    indexed_plan = list(enumerate(plan))
+    indexed_plan.sort(key=lambda item: (_tool_source_preference_rank(item[1].tool), item[0]))
+    return [item for _, item in indexed_plan]
 
 
 def _planner_completed_tool_calls(state: PlannerState, limit: int = 25) -> List[Dict[str, Any]]:
@@ -2564,17 +3146,169 @@ def _format_receipt_note(receipt: ToolReceipt) -> str | None:
     return receipt.summary
 
 
+def _empty_noteboard_sections() -> Dict[str, List[str]]:
+    return {
+        "evidence": [],
+        "frontier": [],
+        "gaps": [],
+        "follow_ups": [],
+        "depth_candidates": [],
+    }
+
+
+def _normalize_noteboard_sections(raw: Any) -> Dict[str, List[str]]:
+    sections = _empty_noteboard_sections()
+    if not isinstance(raw, dict):
+        return sections
+    for key in sections:
+        value = raw.get(key)
+        if isinstance(value, list):
+            sections[key] = [str(item).strip() for item in value if str(item).strip()]
+    return sections
+
+
+def _append_noteboard_item(sections: Dict[str, List[str]], section: str, item: str) -> None:
+    text = str(item or "").strip()
+    if not text:
+        return
+    bucket = sections.setdefault(section, [])
+    if text not in bucket:
+        bucket.append(text)
+
+
+def _extend_noteboard_items(sections: Dict[str, List[str]], section: str, items: List[str]) -> None:
+    for item in items:
+        _append_noteboard_item(sections, section, item)
+
+
+def _trim_noteboard_sections(
+    sections: Dict[str, List[str]],
+    *,
+    max_items_per_section: int = 8,
+) -> Dict[str, List[str]]:
+    trimmed = _empty_noteboard_sections()
+    for key, items in _normalize_noteboard_sections(sections).items():
+        trimmed[key] = items[-max_items_per_section:]
+    return trimmed
+
+
+def _flatten_noteboard_sections(sections: Dict[str, List[str]]) -> List[str]:
+    ordered_sections = [
+        ("evidence", "Evidence"),
+        ("frontier", "Frontier"),
+        ("gaps", "Gaps"),
+        ("follow_ups", "Follow-Ups"),
+        ("depth_candidates", "Depth Candidates"),
+    ]
+    flattened: List[str] = []
+    normalized = _normalize_noteboard_sections(sections)
+    for key, label in ordered_sections:
+        for item in normalized.get(key, []):
+            flattened.append(f"[{label}] {item}")
+    return flattened
+
+
 def _trim_noteboard(notes: List[str], max_items: int = 20) -> List[str]:
     if len(notes) <= max_items:
         return notes
     return notes[-max_items:]
 
 
-def _inject_noteboard(prompt: str, notes: List[str]) -> str:
-    if not notes:
+def _inject_noteboard(
+    prompt: str,
+    notes: List[str],
+    sections: Dict[str, List[str]] | None = None,
+    current_iteration_reasoning: str = "",
+    queued_tasks: List[Dict[str, Any]] | None = None,
+) -> str:
+    normalized_sections = _normalize_noteboard_sections(sections or {})
+    if not notes and not any(normalized_sections.values()) and not current_iteration_reasoning.strip() and not queued_tasks:
         return prompt
-    summary = "\n".join(f"- {note}" for note in notes)
-    return f"{prompt}\n\nNoteboard (key findings so far):\n{summary}"
+
+    evidence_lines = normalized_sections.get("evidence", [])
+    frontier_lines = normalized_sections.get("frontier", [])
+    gap_lines = normalized_sections.get("gaps", [])
+    follow_up_lines = normalized_sections.get("follow_ups", [])
+    depth_lines = normalized_sections.get("depth_candidates", [])
+
+    if not any(normalized_sections.values()):
+        fallback_sections = _derive_legacy_noteboard_sections(notes)
+        evidence_lines = fallback_sections["evidence"]
+        frontier_lines = fallback_sections["frontier"]
+        gap_lines = fallback_sections["gaps"]
+        follow_up_lines = fallback_sections["follow_ups"]
+        depth_lines = fallback_sections["depth_candidates"]
+
+    todo_lines: List[str] = []
+    for task in (queued_tasks or [])[:8]:
+        if not isinstance(task, dict):
+            continue
+        tool_name = str(task.get("tool_name") or task.get("tool") or "").strip()
+        reason = str(task.get("reason") or "").strip()
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        pivot = ""
+        for key in ("target_name", "person_name", "name", "url", "domain", "username", "profile"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                pivot = value
+                break
+        parts = [part for part in [tool_name, pivot] if part]
+        line = " -> ".join(parts) if parts else "queued follow-up"
+        if reason:
+            line = f"{line}: {reason}"
+        todo_lines.append(line)
+    todo_lines = _dedupe(follow_up_lines + todo_lines)[:8]
+
+    noteboard_lines = [
+        "Noteboard",
+        "",
+        "Evidence collected:",
+        *([f"- {item}" for item in evidence_lines] or ["- none yet"]),
+        "",
+        "Open leads and frontier:",
+        *([f"- {item}" for item in frontier_lines] or ["- none yet"]),
+        "",
+        "Known gaps or unresolved questions:",
+        *([f"- {item}" for item in gap_lines] or ["- none yet"]),
+        "",
+        "Depth candidates worth expanding:",
+        *([f"- {item}" for item in depth_lines] or ["- none yet"]),
+        "",
+        "Current iteration reasoning:",
+        current_iteration_reasoning.strip() or "No prior iteration reasoning recorded yet.",
+        "",
+        "Next iteration To Do:",
+        *([f"- {item}" for item in todo_lines] or ["- none queued yet"]),
+    ]
+    return f"{prompt}\n\n" + "\n".join(noteboard_lines)
+
+
+def _derive_legacy_noteboard_sections(notes: List[str]) -> Dict[str, List[str]]:
+    sections = _empty_noteboard_sections()
+    for note in notes:
+        text = str(note or "").strip()
+        if not text:
+            continue
+        lower = text.casefold()
+        if lower.startswith("[evidence] "):
+            _append_noteboard_item(sections, "evidence", text[11:])
+        elif lower.startswith("[frontier] "):
+            _append_noteboard_item(sections, "frontier", text[11:])
+        elif lower.startswith("[gaps] "):
+            _append_noteboard_item(sections, "gaps", text[7:])
+        elif lower.startswith("[follow-ups] "):
+            _append_noteboard_item(sections, "follow_ups", text[13:])
+        elif lower.startswith("[depth candidates] "):
+            _append_noteboard_item(sections, "depth_candidates", text[19:])
+        elif "queued" in lower:
+            _append_noteboard_item(sections, "follow_ups", text)
+        elif "depth candidate" in lower:
+            _append_noteboard_item(sections, "depth_candidates", text)
+        elif "discovered" in lower or "frontier" in lower:
+            _append_noteboard_item(sections, "frontier", text)
+        else:
+            _append_noteboard_item(sections, "evidence", text)
+    return _trim_noteboard_sections(sections)
 
 
 def _derive_run_title(prompt: str, inputs: List[str], llm: OpenRouterLLM | None) -> str:

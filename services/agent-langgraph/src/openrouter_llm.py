@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
 from env import load_env
+from run_events import emit_run_event
 
 
 class OpenRouterLLM:
@@ -27,6 +28,7 @@ class OpenRouterLLM:
         tool_catalog: List[Dict[str, Any]],
         prior_tool_calls: List[Dict[str, Any]] | None = None,
         system_prompt: str | None = None,
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         system = system_prompt or (
             "You are a planning agent. Return JSON only. "
@@ -46,7 +48,14 @@ class OpenRouterLLM:
             },
         }
 
-        data = self.complete_json(system, user, temperature=0.2, timeout=30)
+        data = self.complete_json(
+            system,
+            user,
+            temperature=0.2,
+            timeout=30,
+            run_id=run_id,
+            operation="planner.plan_tools",
+        )
 
         plan = data.get("plan") if isinstance(data.get("plan"), list) else []
         reasoning = data.get("reasoning")
@@ -64,6 +73,7 @@ class OpenRouterLLM:
         system_prompt: str,
         tool_name: str,
         arguments: Dict[str, Any],
+        run_id: str | None = None,
     ) -> Dict[str, Any]:
         user = {
             "tool": tool_name,
@@ -72,7 +82,14 @@ class OpenRouterLLM:
             "instructions": "Return JSON only. Keep runId unchanged.",
         }
 
-        parsed = self.complete_json(system_prompt, user, temperature=0.1, timeout=30)
+        parsed = self.complete_json(
+            system_prompt,
+            user,
+            temperature=0.1,
+            timeout=30,
+            run_id=run_id,
+            operation=f"tool.refine_arguments.{tool_name}",
+        )
 
         refined = parsed.get("arguments") if isinstance(parsed, dict) else None
         if isinstance(refined, dict):
@@ -85,7 +102,21 @@ class OpenRouterLLM:
         user_payload: Dict[str, Any],
         temperature: float = 0.1,
         timeout: int = 30,
+        run_id: Optional[str] = None,
+        operation: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        if run_id:
+            emit_run_event(
+                run_id,
+                "LLM_CALL_STARTED",
+                {
+                    "operation": operation or "complete_json",
+                    "model": self._model,
+                    "timeoutSeconds": timeout,
+                    **(metadata or {}),
+                },
+            )
         payload = {
             "model": self._model,
             "messages": [
@@ -95,27 +126,53 @@ class OpenRouterLLM:
             "temperature": temperature,
         }
 
-        response = requests.post(
-            f"{self._base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            data=json.dumps(payload),
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "{}")
-        )
         try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+            response = requests.post(
+                f"{self._base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(payload),
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "{}")
+            )
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError:
+                parsed = {}
+
+            if run_id:
+                emit_run_event(
+                    run_id,
+                    "LLM_CALL_COMPLETED",
+                    {
+                        "operation": operation or "complete_json",
+                        "model": self._model,
+                        "ok": True,
+                        **(metadata or {}),
+                    },
+                )
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception as exc:
+            if run_id:
+                emit_run_event(
+                    run_id,
+                    "LLM_CALL_FAILED",
+                    {
+                        "operation": operation or "complete_json",
+                        "model": self._model,
+                        "error": str(exc),
+                        **(metadata or {}),
+                    },
+                )
+            raise
 
     def generate_run_title(self, prompt: str, inputs: List[str]) -> str | None:
         system = (
@@ -137,3 +194,33 @@ class OpenRouterLLM:
         if not normalized:
             return None
         return normalized[:160]
+
+
+def invoke_complete_json(
+    llm: Any,
+    system_prompt: str,
+    user_payload: Dict[str, Any],
+    *,
+    temperature: float,
+    timeout: int,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    try:
+        result = llm.complete_json(
+            system_prompt,
+            user_payload,
+            temperature=temperature,
+            timeout=timeout,
+            **kwargs,
+        )
+    except TypeError as exc:
+        if kwargs and "unexpected keyword argument" in str(exc):
+            result = llm.complete_json(
+                system_prompt,
+                user_payload,
+                temperature=temperature,
+                timeout=timeout,
+            )
+        else:
+            raise
+    return result if isinstance(result, dict) else {}

@@ -8,6 +8,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from dotenv import load_dotenv
 from logger import get_logger
+from run_monitor import notify_progress
 
 logger = get_logger(__name__)
 
@@ -28,4 +29,6 @@ def emit_run_event(run_id: str, event_type: str, payload: Dict[str, Any]) -> Non
                 "INSERT INTO run_events(run_id, type, ts, payload) VALUES (%s, %s, now(), %s::jsonb)",
                 (run_id, event_type, Jsonb(payload)),
             )
+    if event_type not in {"RUN_HEARTBEAT", "RUN_STALLED"}:
+        notify_progress(event_type)
     logger.info("Run event emitted", extra={"run_id": run_id, "type": event_type})

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Button,
   Card,
@@ -9,6 +9,9 @@ import {
   Spinner,
   Textarea
 } from "@heroui/react";
+import type { Core, ElementDefinition, EventObject } from "cytoscape";
+import CytoscapeComponent from "react-cytoscapejs";
+import { jsPDF } from "jspdf";
 
 type ViewMode = "chat" | "report" | "evidence";
 type EvidenceView = "files" | "graph";
@@ -55,6 +58,21 @@ type GraphNode = {
   display: string;
   properties?: Record<string, unknown>;
 };
+
+const GRAPH_PALETTE = [
+  "#1f77b4",
+  "#ff7f0e",
+  "#2ca02c",
+  "#d62728",
+  "#9467bd",
+  "#8c564b",
+  "#e377c2",
+  "#7f7f7f",
+  "#bcbd22",
+  "#17becf",
+  "#4c78a8",
+  "#f58518"
+] as const;
 
 type GraphEdge = {
   id: string;
@@ -215,13 +233,155 @@ function buildReportFallback(report: ReportPayload | null): string {
     .join("\n\n---\n\n");
 }
 
-function truncateGraphLabel(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+function slugifyFilename(value: string, fallback: string): string {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return normalized || fallback;
+}
+
+function triggerBlobDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+}
+
+function graphNodeType(node: GraphNode): string {
+  const rawType = node.properties?.type;
+  if (typeof rawType === "string" && rawType.trim()) return rawType.trim();
+  return node.labels[0] || "Entity";
+}
+
+function stableGraphColor(label: string): string {
+  const key = label.trim().toLowerCase();
+  if (!key) return "#9ca3af";
+  let hash = 0;
+  for (let index = 0; index < key.length; index += 1) {
+    hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
+  }
+  return GRAPH_PALETTE[hash % GRAPH_PALETTE.length] ?? "#9ca3af";
+}
+
+function graphRelType(edge: GraphEdge): string {
+  return edge.type?.trim() || edge.display?.trim() || "(unknown)";
+}
+
+function uniqueSorted(values: Iterable<string>): string[] {
+  return Array.from(new Set(Array.from(values).map((value) => value.trim()).filter(Boolean))).sort((a, b) =>
+    a.localeCompare(b)
+  );
+}
+
+function buildAdjacency(edges: GraphEdge[]): Map<string, Set<string>> {
+  const adjacency = new Map<string, Set<string>>();
+  for (const edge of edges) {
+    if (!edge.source || !edge.target) continue;
+    const sourceLinks = adjacency.get(edge.source) ?? new Set<string>();
+    sourceLinks.add(edge.target);
+    adjacency.set(edge.source, sourceLinks);
+    const targetLinks = adjacency.get(edge.target) ?? new Set<string>();
+    targetLinks.add(edge.source);
+    adjacency.set(edge.target, targetLinks);
+  }
+  return adjacency;
+}
+
+function computeDegrees(edges: GraphEdge[]): Map<string, number> {
+  const degrees = new Map<string, number>();
+  for (const edge of edges) {
+    if (edge.source) degrees.set(edge.source, (degrees.get(edge.source) ?? 0) + 1);
+    if (edge.target) degrees.set(edge.target, (degrees.get(edge.target) ?? 0) + 1);
+  }
+  return degrees;
+}
+
+function bfsNeighborhood(adjacency: Map<string, Set<string>>, root: string, depth: number): Set<string> {
+  if (!root || depth < 0) return new Set<string>();
+  const visited = new Set<string>([root]);
+  const queue: Array<{ nodeId: string; depth: number }> = [{ nodeId: root, depth: 0 }];
+  while (queue.length) {
+    const current = queue.shift();
+    if (!current || current.depth >= depth) continue;
+    for (const next of adjacency.get(current.nodeId) ?? []) {
+      if (visited.has(next)) continue;
+      visited.add(next);
+      queue.push({ nodeId: next, depth: current.depth + 1 });
+    }
+  }
+  return visited;
+}
+
+function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<Record<string, unknown>> {
+  const boundedDegree = Math.max(maxDegree, 1);
+  const stylesheet: Array<Record<string, unknown>> = [
+    {
+      selector: "node",
+      style: {
+        label: "data(label)",
+        "font-size": 10,
+        "text-wrap": "wrap",
+        "text-max-width": 140,
+        "background-color": "data(color)",
+        color: "#111827",
+        "border-width": 1.2,
+        "border-color": "#1f2937",
+        width: `mapData(degree, 0, ${boundedDegree}, 14, 54)`,
+        height: `mapData(degree, 0, ${boundedDegree}, 14, 54)`
+      }
+    },
+    {
+      selector: "edge",
+      style: {
+        "curve-style": "bezier",
+        "line-color": "#9ca3af",
+        "target-arrow-color": "#9ca3af",
+        "target-arrow-shape": "triangle",
+        "arrow-scale": 0.8,
+        width: 1.4
+      }
+    }
+  ];
+
+  if (showEdgeLabels) {
+    stylesheet.push({
+      selector: "edge",
+      style: {
+        label: "data(label)",
+        "font-size": 8,
+        "text-wrap": "wrap",
+        "text-max-width": 130,
+        "text-background-opacity": 0.8,
+        "text-background-color": "#ffffff",
+        "text-background-padding": 2
+      }
+    });
+  }
+
+  return stylesheet;
+}
+
+function formatSelectionPayload(payload: Record<string, unknown>): string {
+  return JSON.stringify(payload, null, 2);
+}
+
+function buildReportMarkdown(report: ReportPayload | null, fallbackContent: string): string {
+  const markdown = report?.markdown?.trim();
+  if (markdown) return markdown;
+  const finalReport = report?.json?.finalReport?.trim();
+  const appendix = report?.json?.evidenceAppendix?.trim();
+  const parts = [finalReport, appendix].filter((value): value is string => Boolean(value));
+  if (parts.length) return parts.join("\n\n");
+  return fallbackContent.trim();
 }
 
 export default function App() {
+  const cytoscapeRef = useRef<Core | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>(() => loadRuns());
   const [selectedRunId, setSelectedRunId] = useState<string | null>(runs[0]?.runId ?? null);
   const [events, setEvents] = useState<RunEvent[]>([]);
@@ -236,42 +396,222 @@ export default function App() {
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isLoadingGraph, setIsLoadingGraph] = useState(false);
   const [isLoadingReport, setIsLoadingReport] = useState(false);
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
+  const [isDownloadingGraph, setIsDownloadingGraph] = useState(false);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [graphSearchText, setGraphSearchText] = useState("");
+  const [selectedGraphNodeTypes, setSelectedGraphNodeTypes] = useState<string[]>([]);
+  const [selectedGraphRelTypes, setSelectedGraphRelTypes] = useState<string[]>([]);
+  const [graphMinDegree, setGraphMinDegree] = useState(0);
+  const [graphNodeLimit, setGraphNodeLimit] = useState(25);
+  const [graphEgoNode, setGraphEgoNode] = useState("");
+  const [graphEgoDepth, setGraphEgoDepth] = useState(1);
+  const [graphLayoutName, setGraphLayoutName] = useState("cose");
+  const [showGraphEdgeLabels, setShowGraphEdgeLabels] = useState(false);
+  const [graphSelectionText, setGraphSelectionText] = useState("Click a node or edge to inspect details.");
 
   const graphNodeMap = useMemo(
     () => new Map(graphNodes.map((node) => [node.id, node])),
     [graphNodes]
   );
 
-  const graphLayout = useMemo(() => {
-    const columnCount = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(Math.max(graphNodes.length, 1)))));
-    const rowCount = Math.max(1, Math.ceil(graphNodes.length / columnCount));
-    const xSpacing = 190;
-    const ySpacing = 150;
-    const startX = 110;
-    const startY = 85;
-
-    return {
-      width: Math.max(820, startX * 2 + (columnCount - 1) * xSpacing),
-      height: Math.max(320, startY * 2 + (rowCount - 1) * ySpacing),
-      positions: graphNodes.map((node, index) => ({
-        id: node.id,
-        x: startX + (index % columnCount) * xSpacing,
-        y: startY + Math.floor(index / columnCount) * ySpacing
-      }))
-    };
-  }, [graphNodes]);
-
-  const graphPositionMap = useMemo(
-    () => new Map(graphLayout.positions.map((position) => [position.id, position])),
-    [graphLayout]
+  const sanitizedGraphEdges = useMemo(
+    () => graphEdges.filter((edge) => graphNodeMap.has(edge.source) && graphNodeMap.has(edge.target)),
+    [graphEdges, graphNodeMap]
   );
+  const graphAdjacency = useMemo(() => buildAdjacency(sanitizedGraphEdges), [sanitizedGraphEdges]);
+  const graphDegreeByNode = useMemo(() => computeDegrees(sanitizedGraphEdges), [sanitizedGraphEdges]);
+  const graphMaxDegree = useMemo(
+    () => Math.max(0, ...Array.from(graphDegreeByNode.values())),
+    [graphDegreeByNode]
+  );
+  const graphNodeTypeValues = useMemo(
+    () => uniqueSorted(graphNodes.map((node) => graphNodeType(node))),
+    [graphNodes]
+  );
+  const graphRelTypeValues = useMemo(
+    () => uniqueSorted(sanitizedGraphEdges.map((edge) => graphRelType(edge))),
+    [sanitizedGraphEdges]
+  );
+  const graphNodeOptions = useMemo(
+    () =>
+      Array.from(graphNodeMap.values())
+        .sort((left, right) => left.display.localeCompare(right.display))
+        .map((node) => ({ id: node.id, label: `${node.display} (${node.id})` })),
+    [graphNodeMap]
+  );
+  const graphLimitMin = graphNodes.length >= 10 ? 10 : 1;
+  const graphLimitMax = Math.max(graphLimitMin, graphNodes.length || 1);
 
   useEffect(() => {
     localStorage.setItem(RUNS_STORAGE_KEY, JSON.stringify(runs));
   }, [runs]);
+
+  useEffect(() => {
+    setGraphSearchText("");
+    setSelectedGraphNodeTypes([]);
+    setSelectedGraphRelTypes([]);
+    setGraphMinDegree(0);
+    setGraphNodeLimit(25);
+    setGraphEgoNode("");
+    setGraphEgoDepth(1);
+    setGraphLayoutName("cose");
+    setShowGraphEdgeLabels(false);
+    setGraphSelectionText("Click a node or edge to inspect details.");
+  }, [selectedRunId]);
+
+  useEffect(() => {
+    setGraphNodeLimit((current) => {
+      const nextDefault = Math.min(250, graphLimitMax);
+      if (current < graphLimitMin) return nextDefault;
+      if (current > graphLimitMax) return graphLimitMax;
+      return current;
+    });
+  }, [graphLimitMax, graphLimitMin]);
+
+  const filteredGraph = useMemo(() => {
+    const query = graphSearchText.trim().toLowerCase();
+    let candidateNodes = new Set(Array.from(graphNodeMap.keys()));
+
+    if (selectedGraphNodeTypes.length) {
+      const allowedTypes = new Set(selectedGraphNodeTypes);
+      candidateNodes = new Set(
+        Array.from(candidateNodes).filter((nodeId) => {
+          const node = graphNodeMap.get(nodeId);
+          return node ? allowedTypes.has(graphNodeType(node)) : false;
+        })
+      );
+    }
+
+    if (graphMinDegree > 0) {
+      candidateNodes = new Set(
+        Array.from(candidateNodes).filter((nodeId) => (graphDegreeByNode.get(nodeId) ?? 0) >= graphMinDegree)
+      );
+    }
+
+    if (query) {
+      candidateNodes = new Set(
+        Array.from(candidateNodes).filter((nodeId) => {
+          const node = graphNodeMap.get(nodeId);
+          if (!node) return false;
+          const altNames = Array.isArray(node.properties?.alt_names) ? node.properties?.alt_names : [];
+          const attributes = Array.isArray(node.properties?.attributes) ? node.properties?.attributes : [];
+          const haystack = [
+            node.display,
+            ...altNames.map((value) => String(value)),
+            ...attributes.map((value) => String(value)),
+            graphNodeType(node)
+          ]
+            .join(" | ")
+            .toLowerCase();
+          return haystack.includes(query);
+        })
+      );
+    }
+
+    if (graphEgoNode) {
+      const egoSet = bfsNeighborhood(graphAdjacency, graphEgoNode, graphEgoDepth);
+      candidateNodes = new Set(Array.from(candidateNodes).filter((nodeId) => egoSet.has(nodeId)));
+    }
+
+    const rankedNodes = Array.from(candidateNodes).sort((left, right) => {
+      const degreeDelta = (graphDegreeByNode.get(right) ?? 0) - (graphDegreeByNode.get(left) ?? 0);
+      if (degreeDelta !== 0) return degreeDelta;
+      const leftNode = graphNodeMap.get(left);
+      const rightNode = graphNodeMap.get(right);
+      return (leftNode?.display ?? left).localeCompare(rightNode?.display ?? right);
+    });
+    const limitedNodes = new Set(rankedNodes.slice(0, Math.max(1, graphNodeLimit)));
+    const allowedRelTypes = new Set(selectedGraphRelTypes);
+
+    const filteredEdges = sanitizedGraphEdges.filter((edge) => {
+      if (!limitedNodes.has(edge.source) || !limitedNodes.has(edge.target)) return false;
+      if (allowedRelTypes.size && !allowedRelTypes.has(graphRelType(edge))) return false;
+      return true;
+    });
+
+    const connectedNodes = new Set<string>();
+    for (const edge of filteredEdges) {
+      connectedNodes.add(edge.source);
+      connectedNodes.add(edge.target);
+    }
+    const finalNodeIds = new Set([...limitedNodes, ...connectedNodes]);
+
+    const elements: ElementDefinition[] = Array.from(finalNodeIds)
+      .sort((left, right) => (graphNodeMap.get(left)?.display ?? left).localeCompare(graphNodeMap.get(right)?.display ?? right))
+      .map((nodeId) => {
+        const node = graphNodeMap.get(nodeId);
+        const nodeType = node ? graphNodeType(node) : "Entity";
+        return {
+          data: {
+            id: nodeId,
+            label: node?.display ?? nodeId,
+            type: nodeType,
+            degree: graphDegreeByNode.get(nodeId) ?? 0,
+            color: stableGraphColor(nodeType)
+          }
+        };
+      });
+
+    for (const edge of filteredEdges) {
+      elements.push({
+        data: {
+          id: edge.id || `${edge.source}-${edge.target}-${graphRelType(edge)}`,
+          source: edge.source,
+          target: edge.target,
+          label: edge.display ?? graphRelType(edge),
+          rel_type: graphRelType(edge)
+        }
+      });
+    }
+
+    const layout: Record<string, unknown> = { name: graphLayoutName || "cose", animate: false };
+    if (graphLayoutName === "breadthfirst" && graphEgoNode && finalNodeIds.has(graphEgoNode)) {
+      layout.roots = `#${graphEgoNode}`;
+    }
+
+    let warning = "";
+    if (!finalNodeIds.size) warning = "No nodes match current filters.";
+    else if (candidateNodes.size > graphNodeLimit) warning = `Filtered node set truncated by node limit: ${graphNodeLimit}.`;
+
+    return {
+      elements,
+      layout,
+      stylesheet: makeGraphStylesheet(showGraphEdgeLabels, graphMaxDegree),
+      stats: `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`,
+      warning
+    };
+  }, [
+    graphAdjacency,
+    graphDegreeByNode,
+    graphEgoDepth,
+    graphEgoNode,
+    graphLayoutName,
+    graphMaxDegree,
+    graphMinDegree,
+    graphNodeLimit,
+    graphNodeMap,
+    graphNodes.length,
+    graphSearchText,
+    sanitizedGraphEdges,
+    selectedGraphNodeTypes,
+    selectedGraphRelTypes,
+    showGraphEdgeLabels
+  ]);
+
+  useEffect(() => {
+    if (mode !== "evidence" || evidenceView !== "graph" || !cytoscapeRef.current) return;
+    const frame = window.requestAnimationFrame(() => {
+      cytoscapeRef.current?.resize();
+      if (filteredGraph.elements.length > 0) {
+        cytoscapeRef.current?.fit(undefined, 28);
+      }
+      cytoscapeRef.current?.center();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [evidenceView, filteredGraph.elements, filteredGraph.layout, mode]);
 
   useEffect(() => {
     let disposed = false;
@@ -562,13 +902,85 @@ export default function App() {
     buildReportFallback(report) ||
     report?.json?.evidenceAppendix?.trim() ||
     "";
+  const reportMarkdown = buildReportMarkdown(report, reportContent);
   const reportAvailable = Boolean(report?.status || selectedRun?.reportStatus || runIsFinished);
+  const reportFilenameBase = slugifyFilename(
+    selectedRun?.title || selectedRun?.prompt || selectedRun?.runId || "report",
+    selectedRun ? `report-${shortRunId(selectedRun.runId)}` : "report"
+  );
+
+  const downloadReportMarkdown = () => {
+    if (!reportMarkdown.trim()) return;
+    triggerBlobDownload(new Blob([reportMarkdown], { type: "text/markdown;charset=utf-8" }), `${reportFilenameBase}.md`);
+  };
+
+  const downloadReportPdf = async () => {
+    if (!reportMarkdown.trim()) return;
+    setIsDownloadingPdf(true);
+    try {
+      const doc = new jsPDF({
+        orientation: "portrait",
+        unit: "pt",
+        format: "a4"
+      });
+      const margin = 48;
+      const lineHeight = 18;
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const printableWidth = pageWidth - margin * 2;
+      const lines = doc.splitTextToSize(reportMarkdown, printableWidth) as string[];
+      let cursorY = margin;
+
+      doc.setFillColor(248, 250, 252);
+      doc.rect(0, 0, pageWidth, pageHeight, "F");
+      doc.setTextColor(15, 23, 42);
+      doc.setFont("courier", "normal");
+      doc.setFontSize(11);
+
+      for (const line of lines) {
+        if (cursorY > pageHeight - margin) {
+          doc.addPage();
+          doc.setFillColor(248, 250, 252);
+          doc.rect(0, 0, pageWidth, pageHeight, "F");
+          doc.setTextColor(15, 23, 42);
+          doc.setFont("courier", "normal");
+          doc.setFontSize(11);
+          cursorY = margin;
+        }
+        doc.text(line || " ", margin, cursorY);
+        cursorY += lineHeight;
+      }
+
+      doc.save(`${reportFilenameBase}.pdf`);
+    } finally {
+      setIsDownloadingPdf(false);
+    }
+  };
+
+  const downloadGraphPng = async () => {
+    if (!cytoscapeRef.current || !selectedRun) return;
+    setIsDownloadingGraph(true);
+    try {
+      const dataUrl = cytoscapeRef.current.png({
+        full: true,
+        bg: "#ffffff",
+        scale: 3
+      });
+      const response = await fetch(dataUrl);
+      const pngBlob = await response.blob();
+      triggerBlobDownload(pngBlob, `${reportFilenameBase}-graph.png`);
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to export graph PNG");
+    } finally {
+      setIsDownloadingGraph(false);
+    }
+  };
 
   return (
     <main className="grid-bg h-screen overflow-hidden bg-background text-foreground">
       <div className="h-full bg-gradient-to-br from-slate-950 via-slate-900 to-cyan-950/40">
-        <div className="mx-auto flex h-full w-full max-w-[1400px] gap-4 p-4">
-          <aside className="hidden h-full min-h-0 w-80 flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950/70 p-4 shadow-2xl backdrop-blur lg:flex">
+        <div className="mx-auto flex h-full w-full max-w-[2600px] gap-5 px-5 py-4">
+          <aside className="hidden h-full min-h-0 w-[360px] flex-col overflow-hidden rounded-2xl border border-white/10 bg-slate-950/70 p-4 shadow-2xl backdrop-blur lg:flex">
             <div className="mb-4">
               <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80">Pipeline Runs</p>
               <h1 className="mt-1 text-2xl font-semibold text-cyan-50">Control Room</h1>
@@ -626,7 +1038,7 @@ export default function App() {
             </ScrollShadow>
           </aside>
 
-          <section className="flex h-full min-h-0 flex-1 flex-col rounded-2xl border border-white/10 bg-slate-950/60 p-4 shadow-2xl backdrop-blur">
+          <section className="flex h-full min-h-0 flex-1 flex-col rounded-2xl border border-white/10 bg-slate-950/60 p-5 shadow-2xl backdrop-blur">
             <div className="mb-4 flex items-center justify-between gap-3">
               <div>
                 <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80">Current Session</p>
@@ -737,25 +1149,48 @@ export default function App() {
                         ) : (
                           <>
                             <Card className="border border-white/10 bg-slate-900/50" shadow="none">
-                              <CardBody className="flex flex-wrap gap-2 text-sm">
-                                <Chip size="sm" color={statusColor(report?.status ?? "draft")} variant="flat">
-                                  {report?.status ?? "draft"}
-                                </Chip>
-                                {report?.json?.reportType ? (
-                                  <Chip size="sm" variant="flat" color="secondary">
-                                    {report.json.reportType}
+                              <CardBody className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                                <div className="flex flex-wrap gap-2">
+                                  <Chip size="sm" color={statusColor(report?.status ?? "draft")} variant="flat">
+                                    {report?.status ?? "draft"}
                                   </Chip>
-                                ) : null}
-                                {typeof report?.json?.qualityOk === "boolean" ? (
-                                  <Chip size="sm" variant="flat" color={report.json.qualityOk ? "success" : "warning"}>
-                                    {report.json.qualityOk ? "quality ok" : "needs review"}
-                                  </Chip>
-                                ) : null}
-                                {typeof report?.json?.refineRound === "number" ? (
-                                  <Chip size="sm" variant="flat" color="default">
-                                    refine {report.json.refineRound}
-                                  </Chip>
-                                ) : null}
+                                  {report?.json?.reportType ? (
+                                    <Chip size="sm" variant="flat" color="secondary">
+                                      {report.json.reportType}
+                                    </Chip>
+                                  ) : null}
+                                  {typeof report?.json?.qualityOk === "boolean" ? (
+                                    <Chip size="sm" variant="flat" color={report.json.qualityOk ? "success" : "warning"}>
+                                      {report.json.qualityOk ? "quality ok" : "needs review"}
+                                    </Chip>
+                                  ) : null}
+                                  {typeof report?.json?.refineRound === "number" ? (
+                                    <Chip size="sm" variant="flat" color="default">
+                                      refine {report.json.refineRound}
+                                    </Chip>
+                                  ) : null}
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                  <Button
+                                    size="sm"
+                                    variant="bordered"
+                                    className="border-cyan-300/30 text-cyan-100"
+                                    onPress={downloadReportMarkdown}
+                                    isDisabled={!reportMarkdown.trim()}
+                                  >
+                                    Download Markdown
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="bordered"
+                                    className="border-cyan-300/30 text-cyan-100"
+                                    onPress={downloadReportPdf}
+                                    isLoading={isDownloadingPdf}
+                                    isDisabled={!reportMarkdown.trim()}
+                                  >
+                                    Download PDF
+                                  </Button>
+                                </div>
                               </CardBody>
                             </Card>
 
@@ -861,19 +1296,35 @@ export default function App() {
                                 className="border border-white/10 bg-slate-900/50"
                                 shadow="none"
                               >
-                                <CardBody className="text-sm">
-                                  <p className="font-medium text-cyan-100">{file.title || `Document ${shortRunId(file.documentId)}`}</p>
-                                  <p className="mt-1 font-mono text-xs text-default-500">
-                                    {file.object ? `${file.object.bucket}/${file.object.objectKey}` : "No object pointer"}
-                                  </p>
-                                  <p className="mt-2 text-default-600">Source: {file.sourceUrl ?? "-"}</p>
-                                  <div className="mt-2 flex gap-2">
+                                <CardBody className="grid gap-3 text-sm md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
+                                  <div className="min-w-0">
+                                    <div>
+                                      <p className="font-medium text-cyan-100">{file.title || `Document ${shortRunId(file.documentId)}`}</p>
+                                      <p className="mt-1 break-all font-mono text-xs text-default-500">
+                                        {file.object ? `${file.object.bucket}/${file.object.objectKey}` : "No object pointer"}
+                                      </p>
+                                    </div>
+                                    <p className="mt-2 break-all text-default-600">Source: {file.sourceUrl ?? "-"}</p>
+                                  <div className="mt-2 flex flex-wrap gap-2">
                                     <Chip size="sm" variant="dot" color="default">
                                       {file.sourceType}
                                     </Chip>
                                     <Chip size="sm" variant="flat" color="default">
                                       {file.object?.contentType ?? file.contentType ?? "unknown"}
                                     </Chip>
+                                  </div>
+                                  </div>
+                                  <div className="flex justify-start md:justify-end">
+                                    <Button
+                                      size="sm"
+                                      variant="bordered"
+                                      className="border-cyan-300/30 text-cyan-100"
+                                      as="a"
+                                      href={`${API_BASE}/runs/${selectedRunId}/files/${file.documentId}/download`}
+                                      isDisabled={!file.object}
+                                    >
+                                      Download Original
+                                    </Button>
                                   </div>
                                 </CardBody>
                               </Card>
@@ -887,133 +1338,236 @@ export default function App() {
                         {graphNodes.length === 0 ? (
                           <p className="text-sm text-default-500">No graph nodes with this run's evidence pointers yet.</p>
                         ) : (
-                          <ScrollShadow className="themed-scroll h-full pr-2">
-                            <div className="space-y-4">
-                              <Card className="border border-white/10 bg-slate-900/50" shadow="none">
-                                <CardBody className="flex flex-wrap gap-2 text-sm">
-                                  <Chip size="sm" variant="flat" color="secondary">
-                                    {graphNodes.length} node{graphNodes.length === 1 ? "" : "s"}
-                                  </Chip>
-                                  <Chip size="sm" variant="flat" color="default">
-                                    {graphEdges.length} edge{graphEdges.length === 1 ? "" : "s"}
-                                  </Chip>
-                                </CardBody>
-                              </Card>
+                          <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[340px_minmax(0,1.2fr)_320px] 2xl:grid-cols-[360px_minmax(0,1.45fr)_340px]">
+                            <Card className="min-h-0 border border-white/10 bg-slate-900/50" shadow="none">
+                              <CardBody className="space-y-4 overflow-y-auto text-sm">
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Search</p>
+                                  <input
+                                    type="text"
+                                    value={graphSearchText}
+                                    onChange={(event) => setGraphSearchText(event.target.value)}
+                                    placeholder="e.g. handle, domain, company"
+                                    className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50 outline-none placeholder:text-cyan-100/35"
+                                  />
+                                </div>
 
-                              {graphNodes.length > 1 ? (
-                                <Card className="border border-white/10 bg-slate-900/50" shadow="none">
-                                  <CardBody>
-                                    <svg
-                                      viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
-                                      className="h-[360px] w-full"
-                                    >
-                                      {graphEdges.map((edge, index) => {
-                                        const sourcePosition = graphPositionMap.get(edge.source);
-                                        const targetPosition = graphPositionMap.get(edge.target);
-                                        if (!sourcePosition || !targetPosition) return null;
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Node Types</p>
+                                  <select
+                                    multiple
+                                    value={selectedGraphNodeTypes}
+                                    onChange={(event) =>
+                                      setSelectedGraphNodeTypes(Array.from(event.target.selectedOptions, (option) => option.value))
+                                    }
+                                    className="h-32 w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50"
+                                  >
+                                    {graphNodeTypeValues.map((type) => (
+                                      <option key={type} value={type}>
+                                        {type}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
 
-                                        const x1 = sourcePosition.x;
-                                        const y1 = sourcePosition.y;
-                                        const x2 = targetPosition.x;
-                                        const y2 = targetPosition.y;
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Relation Types</p>
+                                  <select
+                                    multiple
+                                    value={selectedGraphRelTypes}
+                                    onChange={(event) =>
+                                      setSelectedGraphRelTypes(Array.from(event.target.selectedOptions, (option) => option.value))
+                                    }
+                                    className="h-32 w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50"
+                                  >
+                                    {graphRelTypeValues.map((type) => (
+                                      <option key={type} value={type}>
+                                        {type}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
 
-                                        return (
-                                          <g key={edge.id ?? `${edge.source}-${edge.target}-${index}`}>
-                                            <line
-                                              x1={x1}
-                                              y1={y1}
-                                              x2={x2}
-                                              y2={y2}
-                                              stroke="rgba(34,211,238,0.45)"
-                                              strokeWidth="2"
-                                            />
-                                            <text
-                                              x={(x1 + x2) / 2}
-                                              y={(y1 + y2) / 2 - 8}
-                                              fill="#94a3b8"
-                                              fontSize="10"
-                                              textAnchor="middle"
-                                            >
-                                              {truncateGraphLabel(edge.display ?? edge.type, 22)}
-                                            </text>
-                                          </g>
+                                <div>
+                                  <div className="mb-2 flex items-center justify-between">
+                                    <p className="font-semibold text-cyan-100">Minimum Degree</p>
+                                    <span className="text-xs text-cyan-100/70">{graphMinDegree}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={Math.max(graphMaxDegree, 1)}
+                                    step={1}
+                                    value={graphMinDegree}
+                                    onChange={(event) => setGraphMinDegree(Number(event.target.value))}
+                                    className="w-full"
+                                  />
+                                </div>
+
+                                <div>
+                                  <div className="mb-2 flex items-center justify-between">
+                                    <p className="font-semibold text-cyan-100">Node Limit</p>
+                                    <span className="text-xs text-cyan-100/70">{graphNodeLimit}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={graphLimitMin}
+                                    max={graphLimitMax}
+                                    step={graphLimitMax - graphLimitMin >= 10 ? 10 : 1}
+                                    value={Math.min(graphNodeLimit, graphLimitMax)}
+                                    onChange={(event) => setGraphNodeLimit(Number(event.target.value))}
+                                    className="w-full"
+                                  />
+                                </div>
+
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Ego Node</p>
+                                  <select
+                                    value={graphEgoNode}
+                                    onChange={(event) => setGraphEgoNode(event.target.value)}
+                                    className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50"
+                                  >
+                                    <option value="">Optional focus node...</option>
+                                    {graphNodeOptions.map((option) => (
+                                      <option key={option.id} value={option.id}>
+                                        {option.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+
+                                <div>
+                                  <div className="mb-2 flex items-center justify-between">
+                                    <p className="font-semibold text-cyan-100">Ego Depth</p>
+                                    <span className="text-xs text-cyan-100/70">{graphEgoDepth}</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={3}
+                                    step={1}
+                                    value={graphEgoDepth}
+                                    onChange={(event) => setGraphEgoDepth(Number(event.target.value))}
+                                    className="w-full"
+                                  />
+                                </div>
+
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Layout</p>
+                                  <select
+                                    value={graphLayoutName}
+                                    onChange={(event) => setGraphLayoutName(event.target.value)}
+                                    className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50"
+                                  >
+                                    <option value="cose">COSE (force-directed)</option>
+                                    <option value="concentric">Concentric</option>
+                                    <option value="breadthfirst">Breadthfirst</option>
+                                    <option value="circle">Circle</option>
+                                    <option value="grid">Grid</option>
+                                  </select>
+                                </div>
+
+                                <label className="flex items-center gap-2 text-cyan-100">
+                                  <input
+                                    type="checkbox"
+                                    checked={showGraphEdgeLabels}
+                                    onChange={(event) => setShowGraphEdgeLabels(event.target.checked)}
+                                  />
+                                  Show edge labels
+                                </label>
+                              </CardBody>
+                            </Card>
+
+                            <Card className="min-h-0 border border-white/10 bg-slate-900/50" shadow="none">
+                              <CardBody className="flex h-full min-h-0 flex-col gap-3">
+                                <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
+                                  <div>
+                                    <p className="font-semibold text-cyan-100">{filteredGraph.stats}</p>
+                                    {filteredGraph.warning ? (
+                                      <p className="text-xs text-amber-300">{filteredGraph.warning}</p>
+                                    ) : null}
+                                  </div>
+                                  <Button
+                                    size="sm"
+                                    variant="bordered"
+                                    className="border-cyan-300/30 text-cyan-100"
+                                    onPress={downloadGraphPng}
+                                    isLoading={isDownloadingGraph}
+                                    isDisabled={filteredGraph.elements.length === 0}
+                                  >
+                                    Download PNG
+                                  </Button>
+                                </div>
+                                <div className="h-[70vh] min-h-[560px] overflow-hidden rounded-xl border border-white/10 bg-white">
+                                  <CytoscapeComponent
+                                    elements={filteredGraph.elements}
+                                    layout={filteredGraph.layout}
+                                    stylesheet={filteredGraph.stylesheet}
+                                    style={{ width: "100%", height: "100%" }}
+                                    cy={(cy: Core) => {
+                                      cytoscapeRef.current = cy;
+                                      cy.off("tap");
+                                      cy.on("tap", "node", (event: EventObject) => {
+                                        const nodeId = event.target.id();
+                                        const node = graphNodeMap.get(nodeId);
+                                        setGraphSelectionText(
+                                          formatSelectionPayload({
+                                            element: "node",
+                                            id: nodeId,
+                                            display: node?.display ?? nodeId,
+                                            type: node ? graphNodeType(node) : null,
+                                            labels: node?.labels ?? [],
+                                            properties: node?.properties ?? {}
+                                          })
                                         );
-                                      })}
-
-                                      {graphNodes.map((node) => {
-                                        const position = graphPositionMap.get(node.id);
-                                        if (!position) return null;
-                                        const x = position.x;
-                                        const y = position.y;
-                                        return (
-                                          <g key={node.id}>
-                                            <circle
-                                              cx={x}
-                                              cy={y}
-                                              r="34"
-                                              fill="rgba(6,182,212,0.3)"
-                                              stroke="rgba(34,211,238,0.9)"
-                                            />
-                                            <text
-                                              x={x}
-                                              y={y + 4}
-                                              fill="#e2e8f0"
-                                              fontSize="11"
-                                              textAnchor="middle"
-                                            >
-                                              {truncateGraphLabel(node.display, 18)}
-                                            </text>
-                                          </g>
+                                      });
+                                      cy.on("tap", "edge", (event: EventObject) => {
+                                        const edgeId = event.target.id();
+                                        const edge = sanitizedGraphEdges.find((item) => item.id === edgeId);
+                                        setGraphSelectionText(
+                                          formatSelectionPayload({
+                                            element: "edge",
+                                            id: edgeId,
+                                            source: edge?.source ?? event.target.source().id(),
+                                            target: edge?.target ?? event.target.target().id(),
+                                            relType: edge ? graphRelType(edge) : event.target.data("rel_type"),
+                                            label: edge?.display ?? event.target.data("label"),
+                                            properties: edge?.properties ?? {}
+                                          })
                                         );
-                                      })}
-                                    </svg>
-                                  </CardBody>
-                                </Card>
-                              ) : null}
+                                      });
+                                    }}
+                                  />
+                                </div>
+                              </CardBody>
+                            </Card>
 
-                              {graphEdges.length ? (
-                                <Card className="border border-white/10 bg-slate-900/50" shadow="none">
-                                  <CardBody className="space-y-3 text-sm">
-                                    {graphEdges.map((edge) => {
-                                      const sourceNode = graphNodeMap.get(edge.source);
-                                      const targetNode = graphNodeMap.get(edge.target);
-                                      return (
-                                        <div
-                                          key={edge.id}
-                                          className="rounded-xl border border-white/10 bg-slate-950/40 px-3 py-2"
-                                        >
-                                          <p className="text-cyan-100">
-                                            {sourceNode?.display ?? edge.source}
-                                          </p>
-                                          <p className="my-1 text-xs uppercase tracking-[0.18em] text-default-400">
-                                            {edge.display ?? edge.type}
-                                          </p>
-                                          <p className="text-cyan-100">
-                                            {targetNode?.display ?? edge.target}
-                                          </p>
-                                        </div>
-                                      );
-                                    })}
-                                  </CardBody>
-                                </Card>
-                              ) : null}
+                            <Card className="min-h-0 border border-white/10 bg-slate-900/50" shadow="none">
+                              <CardBody className="space-y-3 overflow-y-auto text-sm">
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Selection</p>
+                                  <pre className="rounded-lg border border-white/10 bg-slate-950/70 p-3 text-xs leading-6 text-cyan-50">
+                                    {graphSelectionText}
+                                  </pre>
+                                </div>
 
-                              {graphNodes.map((node) => (
-                                <Card key={node.id} className="border border-white/10 bg-slate-900/50" shadow="none">
-                                  <CardBody className="text-sm">
-                                    <p className="font-medium text-cyan-100">{node.display}</p>
-                                    <div className="mt-2 flex flex-wrap gap-2">
-                                      {node.labels.map((label) => (
-                                        <Chip key={`${node.id}-${label}`} size="sm" variant="flat" color="secondary">
-                                          {label}
-                                        </Chip>
-                                      ))}
-                                    </div>
-                                  </CardBody>
-                                </Card>
-                              ))}
-                            </div>
-                          </ScrollShadow>
+                                <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Type Palette</p>
+                                  <div className="space-y-2">
+                                    {graphNodeTypeValues.map((type) => (
+                                      <div key={type} className="flex items-center gap-3 rounded-lg border border-white/10 bg-slate-950/50 px-3 py-2">
+                                        <span
+                                          className="inline-block h-3 w-3 rounded-full"
+                                          style={{ backgroundColor: stableGraphColor(type) }}
+                                        />
+                                        <span className="text-cyan-50">{type}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              </CardBody>
+                            </Card>
+                          </div>
                         )}
                       </>
                     )}

@@ -231,7 +231,7 @@ function registerGraphGetEntity(server: McpServer) {
       try {
         const result = await session.run(
           `MATCH (n)
-           WHERE coalesce(n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
+           WHERE coalesce(n.node_id, n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
            RETURN labels(n) as labels, properties(n) as props
            LIMIT 1`,
           { entityId }
@@ -275,10 +275,9 @@ function registerGraphNeighbors(server: McpServer) {
         const hops = depth ?? 1;
         const result = await session.run(
           `MATCH (n)
-           WHERE coalesce(n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
+           WHERE coalesce(n.node_id, n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
            MATCH p=(n)-[r*1..${hops}]-(m)
-           WITH m, relationships(p) as rels
-           WITH m, [rel IN rels | type(rel)] as relTypesFound
+           WITH m, [rel IN relationships(p) | coalesce(rel.rel_type, type(rel))] as relTypesFound
            WHERE $relTypes IS NULL OR any(t IN relTypesFound WHERE t IN $relTypes)
            RETURN DISTINCT labels(m) as labels, properties(m) as props, relTypesFound
            LIMIT 200`,
@@ -322,16 +321,19 @@ function registerGraphSearchEntities(server: McpServer) {
         const maxRows = limit ?? 20;
         const result = await session.run(
           `MATCH (n)
-           WHERE any(v IN [
-             coalesce(n.person_id, ''),
-             coalesce(n.org_id, ''),
-             coalesce(n.location_id, ''),
-             coalesce(n.address, ''),
-             coalesce(n.uri, ''),
-             coalesce(n.name, ''),
-             coalesce(n.domain, ''),
-             coalesce(n.email, '')
-           ] WHERE toLower(toString(v)) CONTAINS toLower($query))
+           WHERE toLower(coalesce(n.node_id, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.person_id, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.org_id, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.location_id, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.address, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.uri, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.name, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.domain, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.email, '')) CONTAINS toLower($query)
+              OR toLower(coalesce(n.canonical_name, '')) CONTAINS toLower($query)
+              OR any(v IN coalesce(n.alt_names, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
+              OR any(v IN coalesce(n.attributes, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
+              OR any(v IN coalesce(n.filter_terms, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
            RETURN labels(n) as labels, properties(n) as props
            LIMIT $limit`,
           { query, limit: neo4j.int(maxRows) }
@@ -339,18 +341,18 @@ function registerGraphSearchEntities(server: McpServer) {
 
         const entities = result.records.map((rec) => {
           const props = (rec.get("props") ?? {}) as Record<string, unknown>;
-          const entityId =
-            (props.person_id as string | undefined) ||
-            (props.org_id as string | undefined) ||
-            (props.location_id as string | undefined) ||
-            (props.address as string | undefined) ||
-            (props.uri as string | undefined) ||
-            (props.domain as string | undefined) ||
-            (props.email as string | undefined) ||
-            (props.name as string | undefined) ||
-            "";
           return {
-            entityId,
+            entityId:
+              (props.node_id as string | undefined) ??
+              (props.person_id as string | undefined) ??
+              (props.org_id as string | undefined) ??
+              (props.location_id as string | undefined) ??
+              (props.address as string | undefined) ??
+              (props.uri as string | undefined) ??
+              (props.domain as string | undefined) ??
+              (props.email as string | undefined) ??
+              (props.name as string | undefined) ??
+              "",
             labels: rec.get("labels"),
             properties: props,
           };

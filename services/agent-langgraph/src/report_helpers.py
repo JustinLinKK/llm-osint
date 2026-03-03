@@ -39,6 +39,8 @@ if TYPE_CHECKING:
     from openrouter_llm import OpenRouterLLM
     from tool_worker_graph import ToolReceipt
 
+from openrouter_llm import invoke_complete_json
+
 logger = get_logger(__name__)
 
 
@@ -113,12 +115,36 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
                 query_hints=["news", "press release", "launch", "timeline", "history"],
             ),
             SectionTaskModel(
+                section_id="org_timeline",
+                title="Timeline",
+                objective="Render a dated chronology of corporate milestones, leadership changes, filings, launches, and archived changes.",
+                required=True,
+                entity_ids=core_ids,
+                query_hints=["timeline", "year", "filing date", "history", "milestone"],
+            ),
+            SectionTaskModel(
+                section_id="org_source_documents",
+                title="Source documents",
+                objective="Highlight official documents, filings, archived pages, PDFs, and primary-source pages that anchor the organization profile.",
+                required=False,
+                entity_ids=core_ids,
+                query_hints=["pdf", "filing", "official document", "archive", "about page"],
+            ),
+            SectionTaskModel(
                 section_id="org_risks_uncertainty",
                 title="Risks and uncertainties",
                 objective="Conflicts, unresolved claims, legal/regulatory signals, and confidence caveats.",
                 required=True,
                 entity_ids=core_ids,
                 query_hints=["lawsuit", "violation", "complaint", "controversy", "risk"],
+            ),
+            SectionTaskModel(
+                section_id="methodological_limits",
+                title="Methodological limits",
+                objective="State unresolved coverage gaps, blocked pivots, ambiguous identities, and why some deterministic follow-ups could not be completed.",
+                required=True,
+                entity_ids=core_ids,
+                query_hints=["limitations", "uncertainty", "not found", "ambiguous", "archive"],
             ),
         ]
     return [
@@ -137,6 +163,14 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
             required=True,
             entity_ids=core_ids,
             query_hints=["education", "academic history", "employment history", "publication", "research", "timeline"],
+        ),
+        SectionTaskModel(
+            section_id="timeline_normalization",
+            title="Timeline",
+            objective="Render a chronological sequence of dated milestones across identity, education, employment, publications, archives, and business roles.",
+            required=True,
+            entity_ids=core_ids,
+            query_hints=["timeline", "year", "date", "joined", "graduated", "published"],
         ),
         SectionTaskModel(
             section_id="academic_research",
@@ -171,6 +205,22 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
             query_hints=["co-author", "advisor", "colleague", "works at", "lab", "department", "network"],
         ),
         SectionTaskModel(
+            section_id="collaboration_clusters",
+            title="Collaboration clusters",
+            objective="Describe collaborator groupings, repeated coauthor clusters, labs, departments, and how those clusters relate to the primary target.",
+            required=False,
+            entity_ids=core_ids,
+            query_hints=["coauthor cluster", "collaboration group", "lab", "advisor", "coauthor graph"],
+        ),
+        SectionTaskModel(
+            section_id="source_documents",
+            title="Source documents",
+            objective="Highlight official documents, theses, archived pages, PDFs, and primary-source records that anchor the profile.",
+            required=False,
+            entity_ids=core_ids,
+            query_hints=["pdf", "thesis", "dissertation", "cv", "official page", "archive"],
+        ),
+        SectionTaskModel(
             section_id="social_accounts_and_interests",
             title="Social accounts and interests",
             objective="Social media accounts, recurring topics, hobbies, interests, affiliations, and public behavior patterns from posts/content.",
@@ -185,6 +235,14 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
             required=True,
             entity_ids=core_ids,
             query_hints=["crime", "arrest", "court", "lawsuit", "controversy", "conflict", "risk", "uncertain"],
+        ),
+        SectionTaskModel(
+            section_id="methodological_limits",
+            title="Methodological limits",
+            objective="State unresolved coverage gaps, ambiguous pivots, negative searches, and why specific follow-up chains were not completed.",
+            required=True,
+            entity_ids=core_ids,
+            query_hints=["limitations", "uncertainty", "not found", "ambiguous", "blocked"],
         ),
     ]
 
@@ -263,8 +321,10 @@ def graph_context_signals(mcp_client: McpClientProtocol, entity_ids: List[str]) 
     return (dedupe_str_list(aliases), dedupe_str_list(handles), dedupe_str_list(domains))
 
 
-def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None) -> List[str]:
-    base_queries = dedupe_str_list([task.title, task.objective] + task.query_hints + task.entity_ids)
+def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None, run_id: str | None = None) -> List[str]:
+    base_queries = dedupe_str_list(
+        [task.title, task.objective, task.revision_focus, task.next_step_suggestion] + task.query_hints + task.entity_ids
+    )
     if llm3 is None:
         return base_queries[:3]
 
@@ -274,11 +334,15 @@ def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None) ->
         "output_schema": {"queries": ["string"]},
     }
     try:
-        parsed = llm3.complete_json(
+        parsed = invoke_complete_json(
+            llm3,
             "Generate compact OSINT retrieval query variants. Return JSON only.",
             payload,
             temperature=0.1,
             timeout=30,
+            run_id=run_id,
+            operation="stage2.query_variants",
+            metadata={"sectionId": task.section_id},
         )
         queries = parsed.get("queries")
         if isinstance(queries, list):
@@ -305,7 +369,7 @@ def vector_multi_query(
         rows = pick_list(result.content, ["results", "hits", "items"])
         for row in rows:
             if isinstance(row, dict):
-                hits.append(row)
+                hits.append({**row, "db_source": "vector"})
     deduped: Dict[str, Dict[str, Any]] = {}
     for row in hits:
         doc_id = str(row.get("document_id") or row.get("documentId") or "")
@@ -316,28 +380,83 @@ def vector_multi_query(
     return list(deduped.values())
 
 
+def graph_multi_entity_query(
+    mcp_client: McpClientProtocol,
+    entity_ids: List[str],
+    neighbor_depth: int = 1,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for entity_id in dedupe_str_list(entity_ids)[:4]:
+        entity_result = mcp_client.call_tool("graph_get_entity", {"entityId": entity_id})
+        if entity_result.ok and isinstance(entity_result.content, dict):
+            props = pick_dict(entity_result.content, ["properties", "props"])
+            labels = pick_list(entity_result.content, ["labels"])
+            row = _graph_row_from_entity_payload(entity_id, props, labels, score=1.0)
+            if row:
+                rows.append(row)
+
+        neighbor_result = mcp_client.call_tool(
+            "graph_neighbors",
+            {"entityId": entity_id, "depth": neighbor_depth},
+        )
+        if not neighbor_result.ok or not isinstance(neighbor_result.content, dict):
+            continue
+        neighbors = pick_list(neighbor_result.content, ["neighbors", "entities", "items"])
+        for neighbor in neighbors:
+            if not isinstance(neighbor, dict):
+                continue
+            props = pick_dict(neighbor, ["properties", "props"])
+            labels = pick_list(neighbor, ["labels"])
+            rel_types = pick_list(neighbor, ["relTypes", "rel_types"])
+            row = _graph_row_from_entity_payload(
+                pick_str(props, ["node_id", "person_id", "org_id", "location_id", "address", "uri", "name"]) or entity_id,
+                props,
+                labels,
+                score=0.7,
+                rel_types=[str(item) for item in rel_types if isinstance(item, str)],
+            )
+            if row:
+                rows.append(row)
+
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = f"{row.get('graph_entity_id') or row.get('document_id') or ''}|{str(row.get('snippet') or '')[:120]}"
+        if key not in deduped:
+            deduped[key] = row
+    return list(deduped.values())
+
+
 def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[EvidenceRefModel]:
     sorted_rows = sorted(
-        rows,
+        [row for row in rows if _row_has_database_evidence(row)],
         key=lambda item: float(item.get("score", 0.0) or 0.0),
         reverse=True,
     )[:k]
     packed: List[EvidenceRefModel] = []
     for idx, row in enumerate(sorted_rows, start=1):
+        source_url = pick_str(row, ["sourceUrl", "source_url", "url"])
+        metadata = pick_dict(row, ["metadata", "payload"])
+        if not source_url and metadata:
+            source_url = pick_str(metadata, ["sourceUrl", "source_url", "url"])
+        snippet = str(row.get("snippet") or row.get("text") or "").strip()[:500]
+        if not source_url:
+            source_url = _first_url_in_text(snippet)
         packed.append(
             EvidenceRefModel(
                 citation_key=f"{section_id.upper()}_{idx}",
                 section_id=section_id,
                 document_id=str(row.get("document_id") or row.get("documentId") or "") or None,
-                snippet=str(row.get("snippet") or row.get("text") or "").strip()[:500],
-                source_url=pick_str(row, ["sourceUrl", "source_url", "url"]),
+                snippet=snippet,
+                source_url=source_url,
                 title=pick_str(row, ["title", "document_title", "page_title"]),
-                domain=_domain_from_url(pick_str(row, ["sourceUrl", "source_url", "url"])),
-                retrieved_at=pick_str(row, ["retrievedAt", "retrieved_at", "created_at"]),
+                domain=_domain_from_url(source_url),
+                retrieved_at=pick_str(row, ["retrievedAt", "retrieved_at", "created_at"]) or pick_str(metadata, ["retrievedAt", "retrieved_at", "created_at"]),
                 content_hash=pick_str(row, ["contentHash", "content_hash", "sha256"]),
                 source_type=_infer_source_type(row),
                 score=float(row.get("score", 0.0) or 0.0),
-                object_ref=pick_dict(row, ["objectRef", "object_ref"]),
+                db_source=pick_str(row, ["db_source"]) or ("graph" if row.get("graph_entity_id") or row.get("graph_ref") else "vector"),
+                object_ref=pick_dict(row, ["objectRef", "object_ref"]) or pick_dict(metadata, ["objectRef", "object_ref"]),
+                graph_ref=pick_dict(row, ["graph_ref"]),
             )
         )
     return packed
@@ -364,6 +483,7 @@ def fallback_claims(task: SectionTaskModel, evidence: List[EvidenceRefModel]) ->
 
 
 def draft_section_content(
+    run_id: str,
     task: SectionTaskModel,
     claims: List[ClaimModel],
     evidence: List[EvidenceRefModel],
@@ -371,6 +491,10 @@ def draft_section_content(
 ) -> str:
     if llm3 is None:
         lines = [f"Section: {task.title}", f"Objective: {task.objective}"]
+        if task.revision_focus:
+            lines.append(f"Revision focus: {task.revision_focus}")
+        if task.next_step_suggestion:
+            lines.append(f"Next step: {task.next_step_suggestion}")
         for claim in claims[:8]:
             refs = ", ".join(claim.evidence_keys) if claim.evidence_keys else "NO_REF"
             lines.append(f"- {claim.text} [{refs}]")
@@ -386,13 +510,22 @@ def draft_section_content(
         "output_schema": {"section_text": "string"},
     }
     try:
-        parsed = llm3.complete_json(REPORT_SECTION_DRAFT_SYSTEM_PROMPT, payload, temperature=0.2, timeout=45)
+        parsed = invoke_complete_json(
+            llm3,
+            REPORT_SECTION_DRAFT_SYSTEM_PROMPT,
+            payload,
+            temperature=0.2,
+            timeout=45,
+            run_id=run_id,
+            operation="stage2.section_draft",
+            metadata={"sectionId": task.section_id},
+        )
         section_text = parsed.get("section_text")
         if isinstance(section_text, str) and section_text.strip():
             return section_text.strip()
     except Exception:
         logger.exception("Stage 2 section drafting failed")
-    return draft_section_content(task, claims, evidence, llm3=None)
+    return draft_section_content(run_id, task, claims, evidence, llm3=None)
 
 
 def latest_draft_per_section(drafts: List[SectionDraftModel], ordered_ids: List[str]) -> List[SectionDraftModel]:
@@ -420,7 +553,10 @@ def dedupe_claims(claims: List[ClaimModel]) -> List[ClaimModel]:
 def dedupe_evidence(items: List[EvidenceRefModel]) -> List[EvidenceRefModel]:
     seen: Dict[str, EvidenceRefModel] = {}
     for item in items:
-        key = f"{item.content_hash or item.document_id}|{item.snippet[:100]}|{item.section_id}"
+        graph_key = ""
+        if isinstance(item.graph_ref, dict):
+            graph_key = str(item.graph_ref.get("entityId") or item.graph_ref.get("edgeId") or "")
+        key = f"{item.db_source}|{item.content_hash or item.document_id or graph_key}|{item.snippet[:100]}|{item.section_id}"
         seen[key] = item
     return list(seen.values())
 
@@ -435,6 +571,7 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
             question=state.get("prompt", ""),
             report_type=state.get("report_type", "person"),
             primary_entities=state.get("primary_entities", []),
+            noteboard=state.get("noteboard", []),
             stage1_receipts=state.get("stage1_receipts", []),
             claims=state.get("claim_ledger", []),
             evidence=state.get("evidence_refs", []),
@@ -455,21 +592,20 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
         "output_schema": {"report_text": "string"},
     }
     try:
-        parsed = llm3.complete_json(
+        parsed = invoke_complete_json(
+            llm3,
             FINAL_REPORT_ASSEMBLY_SYSTEM_PROMPT,
             payload,
             temperature=0.2,
             timeout=45,
+            run_id=state.get("run_id"),
+            operation="stage2.final_report",
         )
         report_text = parsed.get("report_text")
-        if (
-            isinstance(report_text, str)
-            and report_text.strip()
-            and "Findings" in report_text
-            and "Evidence Index" in report_text
-            and "Limits" in report_text
-        ):
-            return report_text.strip()
+        if isinstance(report_text, str) and report_text.strip():
+            assembled = report_text.strip()
+            if len(assembled) >= 200 or len(drafts) <= 2:
+                return assembled
     except Exception:
         logger.exception("Final report assembly failed")
     return ordered
@@ -482,7 +618,7 @@ def assemble_evidence_appendix(items: List[EvidenceRefModel]) -> str:
         src = item.source_url or "-"
         retrieved = item.retrieved_at or "unknown-date"
         lines.append(
-            f"{index}. [{item.citation_key}] {domain} | {retrieved} | {src} | {item.snippet[:160]}"
+            f"{index}. [{item.citation_key}] {item.db_source}:{domain} | {retrieved} | {src} | {item.snippet[:160]}"
         )
     return "\n".join(lines)
 
@@ -492,6 +628,7 @@ def build_report_memory(
     question: str,
     report_type: str,
     primary_entities: List[str],
+    noteboard: List[str],
     stage1_receipts: List[ToolReceipt],
     claims: List[ClaimModel],
     evidence: List[EvidenceRefModel],
@@ -502,6 +639,7 @@ def build_report_memory(
     structured = _derive_structured_outputs(
         report_type=report_type,
         primary_entities=primary_entities,
+        noteboard=noteboard,
         stage1_receipts=stage1_receipts,
         claims=claims,
         evidence=evidence,
@@ -515,7 +653,7 @@ def build_report_memory(
     return ReportMemoryModel(
         question=question,
         entities=entities,
-        claims=dedupe_claims([claim for claim in claims if claim.evidence_keys and claim.source_url]),
+        claims=dedupe_claims([claim for claim in claims if claim.evidence_keys]),
         evidence=dedupe_evidence(evidence),
         coverage=coverage,
         consistency_issues=consistency_issues,
@@ -549,16 +687,13 @@ def build_coverage_ledger(
 ) -> CoverageLedgerModel:
     structured = structured or {}
     section_map = {draft.section_id: draft for draft in section_drafts}
-    claim_sections = {claim.section_id for claim in claims if claim.evidence_keys}
-    evidence_urls = [item.source_url or "" for item in evidence]
-    evidence_blob = " ".join(
-        [
-            *[claim.text for claim in claims],
-            *[draft.content for draft in section_drafts],
-            *[item.snippet for item in evidence],
-            *evidence_urls,
-        ]
-    ).lower()
+    verified_claims = [claim for claim in claims if claim.evidence_keys]
+    claim_sections = {claim.section_id for claim in verified_claims}
+    claim_blob = " ".join(claim.text for claim in verified_claims).lower()
+    stable_evidence = [item for item in evidence if item.source_url or item.document_id or item.object_ref]
+    evidence_urls = [item.source_url or "" for item in stable_evidence]
+    evidence_snippet_blob = " ".join(item.snippet for item in stable_evidence).lower()
+    evidence_url_blob = " ".join(evidence_urls).lower()
     canonical_identity: CanonicalIdentityModel = structured.get("canonical_identity", CanonicalIdentityModel())
     timeline: List[TimelineEventModel] = structured.get("timeline", [])
     publication_inventory: List[PublicationInventoryItemModel] = structured.get("publication_inventory", [])
@@ -572,24 +707,103 @@ def build_coverage_ledger(
         return CoverageItemModel(resolved=resolved, confidence=confidence if resolved else min(confidence, 0.49), notes=[note])
 
     has_identity = bool(canonical_identity.canonical_name) or "identity_profile" in claim_sections or "org_identity" in claim_sections
-    has_affiliation = any(profile.affiliation for profile in profile_index) or any(dive.affiliations for dive in doc_deep_dives) or bool(re.search(r"\b(university|lab|department|company|inc|llc|organization|institute|works at|joined)\b", evidence_blob))
-    has_education = any(re.search(r"\b(university|college|school|b\.?s\.?|m\.?s\.?|ph\.?d|degree|graduated)\b", event.event.lower()) for event in timeline) or bool(re.search(r"\b(university|college|school|b\.?s\.?|m\.?s\.?|ph\.?d|degree|graduated)\b", evidence_blob))
-    has_publications = bool(publication_inventory or thesis_inventory) or "academic_research" in claim_sections or bool(re.search(r"\b(publication|paper|preprint|arxiv|dblp|pubmed|semantic scholar|orcid|coauthor)\b", evidence_blob))
-    has_relationships = bool(collaboration_graph_edges) or "relationships_and_associates" in claim_sections or "org_people_and_relations" in claim_sections or bool(re.search(r"\b(coauthor|advisor|colleague|collaborator|lab|team|partner)\b", evidence_blob))
-    has_handles = bool(profile_index) or any(domain in evidence_blob for domain in ("github.com", "gitlab.com", "linkedin.com", "x.com", "twitter.com")) or "social_accounts_and_interests" in claim_sections or "org_presence_and_assets" in claim_sections
-    has_timeline = len(timeline) >= (2 if report_type == "person" else 1) or bool(re.search(r"\b(19|20)\d{2}\b", evidence_blob)) or "biography_history" in claim_sections or "org_activity_and_history" in claim_sections or "timeline_normalization" in section_map
+    has_affiliation = (
+        any(profile.affiliation for profile in profile_index)
+        or any(dive.affiliations for dive in doc_deep_dives)
+        or bool(re.search(r"\b(university|lab|department|company|inc|llc|organization|institute|works at|joined)\b", claim_blob))
+        or bool(re.search(r"\b(university|lab|department|company|inc|llc|organization|institute|works at|joined)\b", evidence_snippet_blob))
+    )
+    has_education = (
+        any(re.search(r"\b(university|college|school|b\.?s\.?|m\.?s\.?|ph\.?d|degree|graduated)\b", event.event.lower()) for event in timeline)
+        or bool(re.search(r"\b(university|college|school|b\.?s\.?|m\.?s\.?|ph\.?d|degree|graduated)\b", claim_blob))
+        or bool(re.search(r"\b(university|college|school|b\.?s\.?|m\.?s\.?|ph\.?d|degree|graduated)\b", evidence_snippet_blob))
+    )
+    has_publications = bool(publication_inventory or thesis_inventory) or "academic_research" in claim_sections
+    has_relationships = bool(collaboration_graph_edges) or "relationships_and_associates" in claim_sections or "org_people_and_relations" in claim_sections
+    has_contacts = (
+        bool(re.search(r"\b(email|phone|contact page|contact us)\b", claim_blob))
+        or bool(re.search(r"\b(email|phone|contact page|contact us)\b", evidence_snippet_blob))
+        or bool(re.search(r"\bmailto:|@[\w.-]+\.[a-z]{2,}\b", evidence_url_blob))
+        or "public_contact_methods" in claim_sections
+    )
+    has_handles = (
+        bool(profile_index)
+        or any(domain in evidence_url_blob for domain in ("github.com", "gitlab.com", "linkedin.com", "x.com", "twitter.com"))
+        or "social_accounts_and_interests" in claim_sections
+        or "org_presence_and_assets" in claim_sections
+    )
+    has_aliases = bool(canonical_identity.aliases) or bool(re.search(r"\b(alias|aka|username|handle)\b", claim_blob))
+    has_code_presence = (
+        bool(profile_index)
+        or bool(re.search(r"\b(github|gitlab|repository|repositories|package|npm|pypi|crates|hugging face)\b", claim_blob))
+        or bool(re.search(r"\b(github|gitlab|repository|repositories|package|npm|pypi|crates|hugging face)\b", evidence_snippet_blob))
+        or "code_software_footprint" in claim_sections
+    )
+    has_business_roles = (
+        bool(re.search(r"\b(founder|director|officer|board|sec filing|incorporated|company number|jurisdiction)\b", claim_blob))
+        or bool(re.search(r"\b(founder|director|officer|board|sec filing|incorporated|company number|jurisdiction)\b", evidence_snippet_blob))
+        or "org_identity" in claim_sections
+        or "org_people_and_relations" in claim_sections
+    )
+    has_archived_history = (
+        any("archive" in (item.source_url or "").lower() for item in stable_evidence)
+        or any("webcache" in (item.source_url or "").lower() for item in stable_evidence)
+        or bool(re.search(r"\b(archive|archived|wayback|snapshot)\b", claim_blob))
+        or bool(re.search(r"\b(archive|archived|wayback|snapshot)\b", evidence_snippet_blob))
+    )
+    has_timeline = (
+        len(timeline) >= (2 if report_type == "person" else 1)
+        or bool(re.search(r"\b(19|20)\d{2}\b", claim_blob))
+        or ("biography_history" in claim_sections and bool(verified_claims))
+        or ("org_activity_and_history" in claim_sections and bool(verified_claims))
+        or ("timeline_normalization" in section_map and bool(verified_claims))
+    )
     has_limits = True
 
     return CoverageLedgerModel(
         identity_resolved=item(has_identity, 0.9 if has_identity else 0.2, "Canonical identity resolved." if has_identity else "Identity evidence remains thin."),
+        aliases_resolved=item(has_aliases, 0.76 if has_aliases else 0.2, "Alias and handle variants were resolved." if has_aliases else "Alias and handle evidence remains thin."),
         affiliations_resolved=item(has_affiliation, 0.76 if has_affiliation else 0.25, "Affiliation signals found." if has_affiliation else "No stable affiliation evidence found."),
         education_resolved=item(has_education, 0.72 if has_education else 0.2, "Education timeline markers found." if has_education else "Education remains unresolved."),
         publications_resolved=item(has_publications, 0.82 if has_publications else 0.15, "Publication/thesis inventory present." if has_publications else "No publication-grade evidence found."),
         relationships_resolved=item(has_relationships, 0.8 if has_relationships else 0.2, "Typed relationship graph present." if has_relationships else "Associates/collaborators remain unresolved."),
+        contacts_resolved=item(has_contacts, 0.78 if has_contacts else 0.2, "Public contact evidence was found." if has_contacts else "Public contact coverage remains incomplete."),
         handles_resolved=item(has_handles, 0.85 if has_handles else 0.2, "Profile index present." if has_handles else "No handle/profile baseline established."),
+        code_presence_resolved=item(has_code_presence, 0.8 if has_code_presence else 0.2, "Code/software footprint found." if has_code_presence else "No public code footprint was confirmed."),
+        business_roles_resolved=item(has_business_roles, 0.72 if has_business_roles else 0.2, "Business/directorship evidence found." if has_business_roles else "Business-role coverage remains unresolved."),
+        archived_history_resolved=item(has_archived_history, 0.7 if has_archived_history else 0.2, "Archived history evidence found." if has_archived_history else "Archived-history coverage remains unresolved."),
         timeline_resolved=item(has_timeline, 0.8 if has_timeline else 0.2, "Structured timeline present." if has_timeline else "Timeline remains incomplete."),
         limits_explained=item(has_limits, 0.9, "Limits classify unresolved gaps and contradictions." if not_found_reasons else "Limits will enumerate unresolved gaps and contradictions."),
     )
+
+
+def build_depth_quality_issues(
+    *,
+    report_type: str,
+    primary_entities: List[str],
+    stage1_receipts: List["ToolReceipt"],
+    section_drafts: List[SectionDraftModel],
+) -> List[str]:
+    if report_type != "person":
+        return []
+    candidates = _extract_related_depth_candidates(stage1_receipts, primary_entities)
+    if not candidates:
+        return []
+    draft_blob = " ".join(draft.content for draft in section_drafts).casefold()
+    issues: List[str] = []
+    for candidate in candidates:
+        entity_name = str(candidate.get("entity_name") or "").strip()
+        entity_type = str(candidate.get("entity_type") or "").strip()
+        if not entity_name or not entity_type:
+            continue
+        if _stage1_receipts_investigated_related_entity(stage1_receipts, entity_name, entity_type):
+            continue
+        mentioned_in_report = entity_name.casefold() in draft_blob
+        prefix = "Depth gap" if mentioned_in_report else "Missing depth follow-up"
+        issues.append(
+            f"{prefix}: related {entity_type} {entity_name} was discovered but not investigated beyond mention-level coverage."
+        )
+    return dedupe_str_list(issues)
 
 
 def run_consistency_validator(
@@ -683,8 +897,10 @@ def coverage_is_complete(coverage: CoverageLedgerModel, report_type: str = "pers
     if report_type == "org":
         required_fields = (
             "identity_resolved",
+            "aliases_resolved",
             "affiliations_resolved",
             "relationships_resolved",
+            "contacts_resolved",
             "handles_resolved",
             "timeline_resolved",
             "limits_explained",
@@ -692,10 +908,12 @@ def coverage_is_complete(coverage: CoverageLedgerModel, report_type: str = "pers
     else:
         required_fields = (
             "identity_resolved",
+            "aliases_resolved",
             "affiliations_resolved",
             "education_resolved",
             "publications_resolved",
             "relationships_resolved",
+            "contacts_resolved",
             "handles_resolved",
             "timeline_resolved",
             "limits_explained",
@@ -794,6 +1012,7 @@ def _derive_structured_outputs(
     *,
     report_type: str,
     primary_entities: List[str],
+    noteboard: List[str],
     stage1_receipts: List[ToolReceipt],
     claims: List[ClaimModel],
     evidence: List[EvidenceRefModel],
@@ -804,7 +1023,7 @@ def _derive_structured_outputs(
         "canonical_identity": _build_canonical_identity(primary_entities, stage1_receipts),
         "disambiguation_evidence": _build_disambiguation_evidence(stage1_receipts),
         "attempt_log": _build_attempt_log(stage1_receipts),
-        "not_found_reasons": _build_not_found_reasons(stage1_receipts),
+        "not_found_reasons": _build_not_found_reasons(stage1_receipts, noteboard),
         "timeline": _build_timeline(claims, evidence),
         "publication_inventory": _build_publication_inventory(stage1_receipts, evidence),
         "thesis_inventory": _build_thesis_inventory(stage1_receipts, evidence),
@@ -850,6 +1069,122 @@ def _build_canonical_identity(primary_entities: List[str], receipts: List[ToolRe
         low_social_footprint=low_social,
         high_academic_footprint=high_academic,
     )
+
+
+def _extract_related_depth_candidates(receipts: List["ToolReceipt"], primary_entities: List[str]) -> List[Dict[str, Any]]:
+    primary_people = {item.casefold() for item in primary_entities}
+    candidates: Dict[str, Dict[str, Any]] = {}
+    person_keys = {"relatedPeople", "coauthors", "authors", "advisor", "advisors", "collaborators", "colleagues", "mentors"}
+    org_keys = {"organizations", "organization", "affiliations", "institution", "institutions", "employers", "companies", "company", "labs", "lab", "schools", "school"}
+
+    def ensure(name: str, entity_type: str) -> Dict[str, Any]:
+        key = f"{entity_type}:{name.casefold()}"
+        item = candidates.get(key)
+        if item is None:
+            item = {"entity_name": name, "entity_type": entity_type, "score": 0, "mentions": 0}
+            candidates[key] = item
+        return item
+
+    for receipt in receipts:
+        if not receipt.ok:
+            continue
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            for key in person_keys:
+                if key not in fact:
+                    continue
+                for person in _related_people_from_value(fact.get(key)):
+                    if person.casefold() in primary_people:
+                        continue
+                    item = ensure(person, "person")
+                    item["score"] += 2 if key in {"coauthors", "advisor", "advisors", "collaborators"} else 1
+                    item["mentions"] += 1
+            for key in org_keys:
+                if key not in fact:
+                    continue
+                for org in _related_orgs_from_value(fact.get(key)):
+                    item = ensure(org, "organization")
+                    item["score"] += 2 if key in {"companies", "company", "labs", "lab", "institution", "institutions"} else 1
+                    item["mentions"] += 1
+
+    ranked = [item for item in candidates.values() if int(item.get("score", 0)) >= 2]
+    ranked.sort(key=lambda item: (int(item.get("score", 0)), int(item.get("mentions", 0)), item.get("entity_name", "")), reverse=True)
+    people = 0
+    orgs = 0
+    limited: List[Dict[str, Any]] = []
+    for item in ranked:
+        if item["entity_type"] == "person":
+            if people >= 3:
+                continue
+            people += 1
+        else:
+            if orgs >= 2:
+                continue
+            orgs += 1
+        limited.append(item)
+    return limited
+
+
+def _related_people_from_value(value: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(value, str):
+        values.extend(extract_person_targets(value))
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(_related_people_from_value(item))
+    elif isinstance(value, dict):
+        for key in ("name", "person", "author", "advisor", "colleague", "collaborator", "displayName"):
+            item = value.get(key)
+            if isinstance(item, str):
+                values.extend(extract_person_targets(item))
+    return dedupe_str_list(values)
+
+
+def _related_orgs_from_value(value: Any) -> List[str]:
+    values: List[str] = []
+    if isinstance(value, str):
+        normalized = _normalize_related_org_candidate(value)
+        if normalized:
+            values.append(normalized)
+    elif isinstance(value, list):
+        for item in value:
+            values.extend(_related_orgs_from_value(item))
+    elif isinstance(value, dict):
+        for key in ("name", "organization", "institution", "company", "lab", "school", "department", "employer", "affiliation"):
+            item = value.get(key)
+            if isinstance(item, str):
+                normalized = _normalize_related_org_candidate(item)
+                if normalized:
+                    values.append(normalized)
+    return dedupe_str_list(values)
+
+
+def _normalize_related_org_candidate(value: str) -> str | None:
+    candidate = " ".join((value or "").split()).strip(" -,:;")
+    if len(candidate) < 3:
+        return None
+    lowered = candidate.casefold()
+    markers = ("university", "college", "school", "lab", "laboratory", "institute", "department", "company", "corp", "inc", "llc", "group", "center", "centre")
+    if not any(marker in lowered for marker in markers) and len(candidate.split()) < 2:
+        return None
+    return candidate
+
+
+def _stage1_receipts_investigated_related_entity(receipts: List["ToolReceipt"], entity_name: str, entity_type: str) -> bool:
+    person_tools = {"tavily_research", "tavily_person_search", "person_search", "github_identity_search", "gitlab_identity_search", "arxiv_search_and_download", "orcid_search", "semantic_scholar_search", "dblp_author_search"}
+    org_tools = {"tavily_research", "open_corporates_search", "company_officer_search", "domain_whois_search", "contact_page_extractor", "org_staff_page_search", "wayback_fetch_url"}
+    tool_set = person_tools if entity_type == "person" else org_tools
+    target = entity_name.casefold()
+    for receipt in receipts:
+        if not receipt.ok or receipt.tool_name not in tool_set:
+            continue
+        for value in receipt.arguments.values():
+            if isinstance(value, str) and value.strip() and target in value.casefold():
+                return True
+        if target in receipt.summary.casefold():
+            return True
+    return False
 
 
 def _build_disambiguation_evidence(receipts: List[ToolReceipt]) -> List[DisambiguationEvidenceModel]:
@@ -908,7 +1243,7 @@ def _build_attempt_log(receipts: List[ToolReceipt]) -> List[AttemptLogEntryModel
     return logs[:30]
 
 
-def _build_not_found_reasons(receipts: List[ToolReceipt]) -> List[NotFoundReasonModel]:
+def _build_not_found_reasons(receipts: List[ToolReceipt], noteboard: List[str] | None = None) -> List[NotFoundReasonModel]:
     reasons: List[NotFoundReasonModel] = []
     for receipt in receipts:
         summary = receipt.summary.lower()
@@ -921,6 +1256,14 @@ def _build_not_found_reasons(receipts: List[ToolReceipt]) -> List[NotFoundReason
             reasons.append(NotFoundReasonModel(category="ambiguous_identity", detail=receipt.summary, related_query=query or None))
         if "private" in summary:
             reasons.append(NotFoundReasonModel(category="private", detail=receipt.summary, related_query=query or None))
+    for note in noteboard or []:
+        text = str(note).strip()
+        lowered = text.lower()
+        if "unresolved coverage:" in lowered:
+            detail = text.split(":", 1)[1].strip() if ":" in text else text
+            reasons.append(NotFoundReasonModel(category="not_searched", detail=f"Coverage gap remained unresolved: {detail}"))
+        elif "coverage scorecard" in lowered:
+            reasons.append(NotFoundReasonModel(category="not_searched", detail=text))
     deduped: Dict[str, NotFoundReasonModel] = {}
     for reason in reasons:
         deduped[f"{reason.category}|{reason.detail}"] = reason
@@ -931,7 +1274,7 @@ def _build_timeline(claims: List[ClaimModel], evidence: List[EvidenceRefModel]) 
     events: List[TimelineEventModel] = []
     citation_map = {item.citation_key: item for item in evidence}
     for claim in claims:
-        if not claim.source_url:
+        if not claim.evidence_keys:
             continue
         years = re.findall(r"\b(?:19|20)\d{2}\b", claim.text)
         if not years:
@@ -942,7 +1285,7 @@ def _build_timeline(claims: List[ClaimModel], evidence: List[EvidenceRefModel]) 
                 date_label=years[0],
                 event=claim.text[:220],
                 citation_keys=claim.evidence_keys[:3],
-                source_url=source.source_url if source else claim.source_url,
+                source_url=(source.source_url if source else None) or claim.source_url,
             )
         )
     deduped: Dict[str, TimelineEventModel] = {}
@@ -984,6 +1327,38 @@ def _build_publication_inventory(receipts: List[ToolReceipt], evidence: List[Evi
                         coauthors=dedupe_str_list(coauthors)[:12],
                         links=dedupe_str_list(links)[:5],
                     )
+            candidates = fact.get("candidates")
+            if isinstance(candidates, list):
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    for evidence_item in candidate.get("evidence", []) if isinstance(candidate.get("evidence"), list) else []:
+                        if not isinstance(evidence_item, dict):
+                            continue
+                        title = str(evidence_item.get("title") or "").strip()
+                        if not title:
+                            continue
+                        url = str(evidence_item.get("url") or "").strip()
+                        publications[title.lower()] = PublicationInventoryItemModel(
+                            title=title,
+                            year=str(evidence_item.get("year") or "").strip() or None,
+                            venue=str(evidence_item.get("venue") or evidence_item.get("source") or "").strip() or None,
+                            coauthors=[],
+                            links=[url] if url else [],
+                        )
+    for item in evidence:
+        if not _looks_like_publication_evidence(item):
+            continue
+        title = (item.title or "").strip() or _title_from_snippet(item.snippet)
+        if not title:
+            continue
+        publications[title.lower()] = PublicationInventoryItemModel(
+            title=title,
+            year=_first_year(item.snippet or item.source_url or ""),
+            venue=_venue_from_url(item.source_url),
+            coauthors=[],
+            links=[item.source_url] if item.source_url else [],
+        )
     return list(publications.values())[:25]
 
 
@@ -1089,23 +1464,33 @@ def _build_profile_index(receipts: List[ToolReceipt]) -> List[ProfileIndexItemMo
         for fact in receipt.key_facts:
             if not isinstance(fact, dict):
                 continue
-            url = ""
-            for key in ("profileUrl", "profile_url", "url"):
-                value = fact.get(key)
-                if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
-                    url = value.strip()
-                    break
-            if not url:
-                continue
-            profiles[url] = ProfileIndexItemModel(
-                platform=result_platform,
-                url=url,
-                last_active=str(fact.get("lastActive") or fact.get("last_active") or "").strip() or None,
-                title=str(fact.get("title") or "").strip() or None,
-                affiliation=str(fact.get("affiliation") or fact.get("organization") or "").strip() or None,
-                projects=[str(item).strip() for item in fact.get("projects", []) if str(item).strip()] if isinstance(fact.get("projects"), list) else [],
-                pinned_items=[str(item).strip() for item in fact.get("repositories", []) if isinstance(item, str) and str(item).strip()] if isinstance(fact.get("repositories"), list) else [],
-            )
+            direct_urls = _extract_urls_from_fact(fact, ("profileUrl", "profile_url", "url", "sourceUrl", "source_url"))
+            for url in direct_urls:
+                _upsert_profile_index_item(
+                    profiles,
+                    url=url,
+                    platform=_platform_from_url(url) or result_platform,
+                    last_active=str(fact.get("lastActive") or fact.get("last_active") or "").strip() or None,
+                    title=str(fact.get("title") or fact.get("displayName") or "").strip() or None,
+                    affiliation=str(fact.get("affiliation") or fact.get("organization") or fact.get("institution") or "").strip() or None,
+                    projects=[str(item).strip() for item in fact.get("projects", []) if str(item).strip()] if isinstance(fact.get("projects"), list) else [],
+                    pinned_items=[str(item).strip() for item in fact.get("repositories", []) if isinstance(item, str) and str(item).strip()] if isinstance(fact.get("repositories"), list) else [],
+                )
+            for list_key in ("matchedProfiles", "platformHits", "externalLinks", "pages", "sourceUrls", "source_urls", "profileUrls", "profile_urls"):
+                values = fact.get(list_key)
+                if not isinstance(values, list):
+                    continue
+                for item in values:
+                    url = _url_from_mixed_value(item)
+                    if not url:
+                        continue
+                    _upsert_profile_index_item(
+                        profiles,
+                        url=url,
+                        platform=_platform_from_url(url) or result_platform,
+                        title=_string_from_mixed_value(item, ("title", "displayName", "name")),
+                        affiliation=_string_from_mixed_value(item, ("affiliation", "organization", "institution", "company")),
+                    )
     return list(profiles.values())[:20]
 
 
@@ -1248,6 +1633,80 @@ def pick_str(payload: Dict[str, Any], keys: List[str]) -> str | None:
     return None
 
 
+def _graph_row_from_entity_payload(
+    entity_id: str,
+    props: Dict[str, Any],
+    labels: List[Any],
+    score: float,
+    rel_types: List[str] | None = None,
+) -> Dict[str, Any] | None:
+    if not props:
+        return None
+    canonical_name = pick_str(props, ["canonical_name", "name", "title", "display_name"]) or entity_id
+    attributes = props.get("attributes") if isinstance(props.get("attributes"), list) else []
+    rel_text = f" relations={', '.join(rel_types[:3])}." if rel_types else ""
+    attr_text = "; ".join(str(item).strip() for item in attributes[:4] if str(item).strip())
+    snippet_parts = [
+        f"Graph entity {canonical_name}.",
+        f"type={pick_str(props, ['type', 'osint_bucket']) or (labels[0] if labels else 'Entity')}.",
+    ]
+    if attr_text:
+        snippet_parts.append(f"attributes={attr_text}.")
+    if rel_text:
+        snippet_parts.append(rel_text)
+    source_url = pick_str(props, ["source_url", "sourceUrl", "uri", "url"])
+    graph_ref = {
+        "entityId": pick_str(props, ["node_id", "person_id", "org_id", "location_id", "address", "uri", "name"]) or entity_id,
+        "labels": [str(item) for item in labels if isinstance(item, str)],
+    }
+    if rel_types:
+        graph_ref["relTypes"] = rel_types[:5]
+    row: Dict[str, Any] = {
+        "graph_entity_id": graph_ref["entityId"],
+        "graph_ref": graph_ref,
+        "snippet": " ".join(part for part in snippet_parts if part).strip(),
+        "title": canonical_name,
+        "sourceUrl": source_url,
+        "document_id": pick_str(props, ["evidence_document_id"]),
+        "score": score,
+        "db_source": "graph",
+    }
+    evidence_ref = {
+        "bucket": pick_str(props, ["evidence_bucket"]),
+        "objectKey": pick_str(props, ["evidence_object_key"]),
+        "versionId": pick_str(props, ["evidence_version_id"]),
+        "etag": pick_str(props, ["evidence_etag"]),
+        "documentId": pick_str(props, ["evidence_document_id"]),
+    }
+    if any(evidence_ref.values()):
+        row["objectRef"] = {key: value for key, value in evidence_ref.items() if value}
+    return row
+
+
+def _row_has_database_evidence(row: Dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    object_ref = pick_dict(row, ["objectRef", "object_ref"])
+    if pick_str(row, ["db_source"]) == "graph":
+        return bool(
+            pick_str(row, ["graph_entity_id", "graph_relation_id"])
+            or pick_dict(row, ["graph_ref"])
+            or pick_str(row, ["document_id", "documentId"])
+            or object_ref
+        )
+    return bool(
+        pick_str(row, ["document_id", "documentId"])
+        or object_ref
+    )
+
+
+def _first_url_in_text(text: str) -> str | None:
+    match = re.search(r"https?://[^\s\])>]+", text or "")
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;")
+
+
 def _domain_from_url(url: str | None) -> str | None:
     if not url:
         return None
@@ -1255,6 +1714,130 @@ def _domain_from_url(url: str | None) -> str | None:
         return urlparse(url).netloc.lower() or None
     except Exception:
         return None
+
+
+def _looks_like_publication_evidence(item: EvidenceRefModel) -> bool:
+    blob = " ".join(filter(None, [item.title, item.snippet, item.source_url])).lower()
+    return bool(re.search(r"\b(arxiv|paper|preprint|proceedings|conference|journal|doi|emnlp|acl|neurips|iclr|openreview|semanticscholar|sciencedirect)\b", blob))
+
+
+def _title_from_snippet(snippet: str) -> str | None:
+    text = " ".join((snippet or "").split())
+    if not text:
+        return None
+    before_url = re.split(r"https?://", text, maxsplit=1)[0].strip(" -|:")
+    candidate = before_url[:160].strip(" .,:;")
+    return candidate or None
+
+
+def _first_year(text: str) -> str | None:
+    match = re.search(r"\b(?:19|20)\d{2}\b", text or "")
+    return match.group(0) if match else None
+
+
+def _venue_from_url(url: str | None) -> str | None:
+    domain = _domain_from_url(url)
+    if not domain:
+        return None
+    if "arxiv" in domain:
+        return "arXiv"
+    if "aclanthology" in domain:
+        return "ACL Anthology"
+    if "openreview" in domain:
+        return "OpenReview"
+    if "semanticscholar" in domain:
+        return "Semantic Scholar"
+    if "sciencedirect" in domain:
+        return "ScienceDirect"
+    return domain
+
+
+def _extract_urls_from_fact(fact: Dict[str, Any], keys: tuple[str, ...]) -> List[str]:
+    urls: List[str] = []
+    for key in keys:
+        value = fact.get(key)
+        if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+            urls.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip().startswith(("http://", "https://")):
+                    urls.append(item.strip())
+    return dedupe_str_list(urls)
+
+
+def _url_from_mixed_value(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip().startswith(("http://", "https://")):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("url", "profileUrl", "profile_url", "sourceUrl", "source_url"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip().startswith(("http://", "https://")):
+                return item.strip()
+    return None
+
+
+def _string_from_mixed_value(value: Any, keys: tuple[str, ...]) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return None
+
+
+def _platform_from_url(url: str) -> str | None:
+    domain = _domain_from_url(url) or ""
+    if "github.com" in domain:
+        return "github"
+    if "gitlab.com" in domain:
+        return "gitlab"
+    if "linkedin.com" in domain:
+        return "linkedin"
+    if "openreview.net" in domain:
+        return "openreview"
+    if "researchgate.net" in domain:
+        return "researchgate"
+    if "semanticscholar.org" in domain:
+        return "semanticscholar"
+    if "arxiv.org" in domain:
+        return "arxiv"
+    return domain or None
+
+
+def _upsert_profile_index_item(
+    profiles: Dict[str, ProfileIndexItemModel],
+    *,
+    url: str,
+    platform: str | None = None,
+    last_active: str | None = None,
+    title: str | None = None,
+    affiliation: str | None = None,
+    projects: List[str] | None = None,
+    pinned_items: List[str] | None = None,
+) -> None:
+    existing = profiles.get(url)
+    if existing is None:
+        profiles[url] = ProfileIndexItemModel(
+            platform=platform or "web",
+            url=url,
+            last_active=last_active,
+            title=title,
+            affiliation=affiliation,
+            projects=projects or [],
+            pinned_items=pinned_items or [],
+        )
+        return
+    if platform and existing.platform == "web":
+        existing.platform = platform
+    if last_active and not existing.last_active:
+        existing.last_active = last_active
+    if title and not existing.title:
+        existing.title = title
+    if affiliation and not existing.affiliation:
+        existing.affiliation = affiliation
+    existing.projects = dedupe_str_list(existing.projects + (projects or []))[:12]
+    existing.pinned_items = dedupe_str_list(existing.pinned_items + (pinned_items or []))[:12]
 
 
 def _infer_source_type(row: Dict[str, Any]) -> str:

@@ -12,7 +12,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
 from mcp_client import McpClientProtocol
-from openrouter_llm import OpenRouterLLM
+from openrouter_llm import OpenRouterLLM, invoke_complete_json
 from receipt_store import insert_artifact, insert_artifact_summary, insert_run_note, insert_tool_receipt
 from run_events import emit_run_event
 from system_prompts import (
@@ -27,6 +27,7 @@ from system_prompts import (
     GITLAB_TOOL_SUMMARY_SYSTEM_PROMPT,
     GRANT_TOOL_SUMMARY_SYSTEM_PROMPT,
     GOOGLE_SERP_PERSON_SEARCH_TOOL_SUMMARY_SYSTEM_PROMPT,
+    GRAPH_CONSTRUCTION_SYSTEM_PROMPT,
     GRAPH_INGEST_SYSTEM_PROMPT,
     PACKAGE_REGISTRY_TOOL_SUMMARY_SYSTEM_PROMPT,
     PATENT_TOOL_SUMMARY_SYSTEM_PROMPT,
@@ -68,7 +69,7 @@ TOOL_CONFIDENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
     "osint_foca_manual": {"type": "manual", "confidence": None},
     "person_search": {"type": "person_recon", "confidence": 0.65},
     "tavily_research": {"type": "deep_research", "confidence": 0.86},
-    "tavily_person_search": {"type": "web_search", "confidence": 0.82},
+    "tavily_person_search": {"type": "web_search", "confidence": 0.9},
     "x_get_user_posts_api": {"type": "social_posts", "confidence": 0.8},
     "linkedin_download_html_ocr": {"type": "social_profile_capture", "confidence": 0.75},
     "google_serp_person_search": {"type": "web_search", "confidence": 0.7},
@@ -156,6 +157,7 @@ class ToolWorkerResult:
 
 def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
     graph = StateGraph(ToolWorkerState)
+    worker_llm = _build_tool_llm()
 
     def emit_stage(state: ToolWorkerState, stage: str, status: str, **payload: Any) -> None:
         emit_run_event(
@@ -181,6 +183,7 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             arguments=state["arguments"],
             result=state.get("result", {}),
             ok=bool(state.get("ok", False)),
+            llm=worker_llm,
         )
         emit_stage(
             state,
@@ -195,11 +198,10 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         if not _should_run_post_ingest(state["tool_name"], bool(state.get("ok", False))):
             emit_stage(state, "vector_ingest_worker", "completed", skipped=True)
             return {"vector_ingest_result": {}}
-        llm = _build_tool_llm()
         emit_stage(state, "vector_ingest_worker", "started")
         try:
             result = _run_vector_ingest_worker(
-                llm=llm,
+                llm=worker_llm,
                 mcp_client=mcp_client,
                 run_id=state["run_id"],
                 tool_name=state["tool_name"],
@@ -234,11 +236,10 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         if not _should_run_post_ingest(state["tool_name"], bool(state.get("ok", False))):
             emit_stage(state, "graph_ingest_worker", "completed", skipped=True)
             return {"graph_ingest_result": {}}
-        llm = _build_tool_llm()
         emit_stage(state, "graph_ingest_worker", "started")
         try:
             result = _run_graph_ingest_worker(
-                llm=llm,
+                llm=worker_llm,
                 mcp_client=mcp_client,
                 run_id=state["run_id"],
                 tool_name=state["tool_name"],
@@ -273,14 +274,14 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         if not _should_run_post_ingest(state["tool_name"], bool(state.get("ok", False))):
             emit_stage(state, "receipt_summarize_worker", "completed", skipped=True)
             return {"receipt_llm_result": {}}
-        llm = _build_tool_llm()
-        if llm is None:
+        if worker_llm is None:
             emit_stage(state, "receipt_summarize_worker", "completed", skipped=True, reason="llm_unavailable")
             return {"receipt_llm_result": {}}
         emit_stage(state, "receipt_summarize_worker", "started")
         try:
             result = _run_receipt_summarize_worker(
-                llm=llm,
+                llm=worker_llm,
+                run_id=state["run_id"],
                 tool_name=state["tool_name"],
                 tool_result_summary=state.get("tool_result_summary", ""),
                 graph_ingest_result=state.get("graph_ingest_result", {}),
@@ -313,7 +314,7 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         llm_key_facts = llm_enrichment.get("key_facts")
         llm_next_hints = llm_enrichment.get("next_hints")
         if isinstance(llm_key_facts, list) and llm_key_facts:
-            key_facts = llm_key_facts
+            key_facts = _merge_key_fact_lists(key_facts, llm_key_facts)
         if isinstance(llm_next_hints, list):
             next_hints = _dedupe_str_list(next_hints + [str(item) for item in llm_next_hints])
 
@@ -425,11 +426,11 @@ def _summarize_tool_output_for_ingestion(
     arguments: Dict[str, Any],
     result: Dict[str, Any],
     ok: bool,
+    llm: OpenRouterLLM | None = None,
 ) -> str:
     fallback = _build_tool_result_text(tool_name, arguments, result)
     if not ok:
         return fallback
-    llm = _build_tool_llm()
     if llm is None:
         return fallback
     payload = {
@@ -438,13 +439,22 @@ def _summarize_tool_output_for_ingestion(
         "result": result,
         "output_schema": {"summary_text": "string"},
     }
+    run_id = arguments.get("runId")
     try:
-        parsed = llm.complete_json(_tool_summary_prompt(tool_name), payload, temperature=0.1, timeout=30)
+        parsed = invoke_complete_json(
+            llm,
+            _tool_summary_prompt(tool_name),
+            payload,
+            temperature=0.1,
+            timeout=30,
+            run_id=(str(run_id) if isinstance(run_id, str) else None),
+            operation=f"tool_worker.summary.{tool_name}",
+        )
     except Exception:
         return fallback
     summary_text = parsed.get("summary_text")
     if isinstance(summary_text, str) and summary_text.strip():
-        return summary_text.strip()
+        return _validate_summary_text(tool_name, summary_text.strip(), arguments, result)
     return fallback
 
 
@@ -580,7 +590,12 @@ def _run_vector_ingest_worker(
     llm_args = seed_args
     if llm is not None:
         try:
-            llm_args = llm.refine_tool_arguments(VECTOR_INGEST_SYSTEM_PROMPT, "ingest_text", seed_args)
+            llm_args = llm.refine_tool_arguments(
+                VECTOR_INGEST_SYSTEM_PROMPT,
+                "ingest_text",
+                seed_args,
+                run_id=run_id,
+            )
         except Exception:
             llm_args = seed_args
 
@@ -610,6 +625,78 @@ def _run_graph_ingest_worker(
     result: Dict[str, Any],
     tool_result_summary: str,
 ) -> Dict[str, Any]:
+    if llm is not None:
+        extracted_graph = _extract_graph_construction_payload(
+            llm=llm,
+            run_id=run_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+            tool_result_summary=tool_result_summary,
+        )
+        entities, relations = _build_graph_construction_batches(
+            run_id=run_id,
+            tool_name=tool_name,
+            result=result,
+            extracted_graph=extracted_graph,
+        )
+        if entities:
+            entity_tool_result = mcp_client.call_tool(
+                "ingest_graph_entities",
+                _normalize_tool_arguments(
+                    "ingest_graph_entities",
+                    {"runId": run_id, "entitiesJson": entities},
+                ),
+            )
+            if not entity_tool_result.ok:
+                raise RuntimeError(f"ingest_graph_entities failed: {entity_tool_result.content}")
+            if not isinstance(entity_tool_result.content, dict):
+                raise RuntimeError("ingest_graph_entities returned non-dict content")
+
+            relation_result: Dict[str, Any] = {}
+            if relations:
+                relation_tool_result = mcp_client.call_tool(
+                    "ingest_graph_relations",
+                    _normalize_tool_arguments(
+                        "ingest_graph_relations",
+                        {"runId": run_id, "relationsJson": relations},
+                    ),
+                )
+                if not relation_tool_result.ok:
+                    raise RuntimeError(f"ingest_graph_relations failed: {relation_tool_result.content}")
+                if not isinstance(relation_tool_result.content, dict):
+                    raise RuntimeError("ingest_graph_relations returned non-dict content")
+                relation_result = relation_tool_result.content
+
+            return {
+                "entityCount": len(entities),
+                "relationCount": len(relations),
+                "entities": entity_tool_result.content.get("entities", []),
+                "entityWarnings": entity_tool_result.content.get("warnings", []),
+                "relationWarnings": relation_result.get("warnings", []),
+                "graphSchema": "sample_v1",
+            }
+
+    return _run_legacy_graph_ingest_worker(
+        llm=llm,
+        mcp_client=mcp_client,
+        run_id=run_id,
+        tool_name=tool_name,
+        arguments=arguments,
+        result=result,
+        tool_result_summary=tool_result_summary,
+    )
+
+
+def _run_legacy_graph_ingest_worker(
+    llm: OpenRouterLLM | None,
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    result: Dict[str, Any],
+    tool_result_summary: str,
+) -> Dict[str, Any]:
     seed_args: Dict[str, Any] = {
         "runId": run_id,
         "entityType": "Snippet",
@@ -629,7 +716,10 @@ def _run_graph_ingest_worker(
     if llm is not None:
         try:
             llm_args = llm.refine_tool_arguments(
-                GRAPH_INGEST_SYSTEM_PROMPT, "ingest_graph_entity", seed_args
+                GRAPH_INGEST_SYSTEM_PROMPT,
+                "ingest_graph_entity",
+                seed_args,
+                run_id=run_id,
             )
         except Exception:
             llm_args = seed_args
@@ -655,6 +745,217 @@ def _run_graph_ingest_worker(
     return tool_result.content
 
 
+def _extract_graph_construction_payload(
+    llm: OpenRouterLLM,
+    run_id: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    result: Dict[str, Any],
+    tool_result_summary: str,
+) -> Dict[str, Any]:
+    payload = {
+        "tool_name": tool_name,
+        "arguments": arguments,
+        "result": result,
+        "tool_result_summary": tool_result_summary,
+        "output_schema": {
+            "entities": [
+                {
+                    "canonical_name": "string",
+                    "type": "string",
+                    "alt_names": ["string"],
+                    "attributes": ["string"],
+                }
+            ],
+            "relations": [
+                {
+                    "src": "string",
+                    "dst": "string",
+                    "canonical_name": "string",
+                    "rel_type": "string",
+                    "alt_names": ["string"],
+                }
+            ],
+        },
+    }
+    parsed = invoke_complete_json(
+        llm,
+        GRAPH_CONSTRUCTION_SYSTEM_PROMPT,
+        payload,
+        temperature=0.1,
+        timeout=30,
+        run_id=run_id,
+        operation=f"tool_worker.graph_extract.{tool_name}",
+    )
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_graph_construction_batches(
+    run_id: str,
+    tool_name: str,
+    result: Dict[str, Any],
+    extracted_graph: Dict[str, Any],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_entities = extracted_graph.get("entities")
+    raw_relations = extracted_graph.get("relations")
+    if not isinstance(raw_entities, list):
+        raw_entities = []
+    if not isinstance(raw_relations, list):
+        raw_relations = []
+    raw_entities = list(raw_entities) + _supplemental_graph_entities_from_result(result)
+
+    evidence_ref = _extract_evidence(result)
+    grouped_entities: Dict[str, Dict[str, Any]] = {}
+    for row in raw_entities:
+        if not isinstance(row, dict):
+            continue
+        names = _graph_unique_strings(
+            [row.get("canonical_name"), *list(row.get("alt_names") or [])]
+        )
+        if not names:
+            continue
+        canonical_name = _choose_graph_canonical_name(names)
+        normalized_key = _normalize_graph_name(canonical_name)
+        if not normalized_key:
+            continue
+        entity_type = _canonical_graph_entity_type(
+            str(row.get("type") or "").strip() or "Unknown",
+            canonical_name,
+            [str(item).strip() for item in (row.get("attributes") or []) if str(item).strip()],
+        )
+        bucket = grouped_entities.setdefault(
+            normalized_key,
+            {
+                "names": [],
+                "types": [],
+                "attributes": [],
+                "canonical_name": canonical_name,
+                "entity_type": entity_type,
+            },
+        )
+        bucket["names"].extend(names)
+        bucket["types"].append(entity_type)
+        bucket["attributes"].extend(
+            [str(item).strip() for item in (row.get("attributes") or []) if str(item).strip()]
+        )
+
+    entities: List[Dict[str, Any]] = []
+    entity_lookup: Dict[str, Dict[str, Any]] = {}
+    for normalized_name, bucket in grouped_entities.items():
+        names = _graph_unique_strings(bucket["names"])
+        canonical_name = _choose_graph_canonical_name(names)
+        entity_type = _majority_value(bucket["types"], fallback="Unknown")
+        attributes = _graph_unique_strings(bucket["attributes"])
+        entity_payload = {
+            "node_id": _stable_graph_node_id(run_id, entity_type, canonical_name),
+            "type": entity_type,
+            "canonical_name": canonical_name,
+            "alt_names": [name for name in names if _normalize_graph_name(name) != normalized_name],
+            "attributes": attributes,
+            "osint_bucket": _infer_osint_bucket(entity_type, canonical_name, attributes),
+            "source_tools": [tool_name],
+        }
+        if evidence_ref:
+            entity_payload["evidence"] = {"objectRef": evidence_ref}
+        entities.append(entity_payload)
+        for name in [canonical_name, *entity_payload["alt_names"]]:
+            alias_key = _normalize_graph_name(str(name))
+            if alias_key:
+                entity_lookup[alias_key] = entity_payload
+
+    relations: List[Dict[str, Any]] = []
+    seen_relations: set[str] = set()
+    for row in raw_relations:
+        if not isinstance(row, dict):
+            continue
+        src_name = _normalize_graph_name(str(row.get("src") or ""))
+        dst_name = _normalize_graph_name(str(row.get("dst") or ""))
+        if not src_name or not dst_name:
+            continue
+        src_entity = entity_lookup.get(src_name)
+        dst_entity = entity_lookup.get(dst_name)
+        if src_entity is None or dst_entity is None:
+            continue
+        rel_type = _canonical_graph_relation_type(
+            str(row.get("rel_type") or "").strip() or "RELATED_TO",
+            str(src_entity.get("type") or ""),
+            str(dst_entity.get("type") or ""),
+        )
+        canonical_name = str(row.get("canonical_name") or rel_type).strip() or rel_type
+        alt_names = _graph_unique_strings(row.get("alt_names") or [])
+        fingerprint = "|".join(
+            [
+                str(src_entity["node_id"]),
+                str(dst_entity["node_id"]),
+                _normalize_graph_name(rel_type),
+                _normalize_graph_name(canonical_name),
+            ]
+        )
+        if fingerprint in seen_relations:
+            continue
+        seen_relations.add(fingerprint)
+        relation_payload = {
+            "edge_id": _stable_graph_edge_id(
+                str(src_entity["node_id"]),
+                str(dst_entity["node_id"]),
+                rel_type,
+                canonical_name,
+            ),
+            "src_id": src_entity["node_id"],
+            "dst_id": dst_entity["node_id"],
+            "rel_type": rel_type,
+            "canonical_name": canonical_name,
+            "alt_names": alt_names,
+            "source_tool": tool_name,
+        }
+        if evidence_ref:
+            relation_payload["evidenceRef"] = evidence_ref
+        relations.append(relation_payload)
+
+    for entity in entities:
+        entity_type = str(entity.get("type") or "")
+        canonical_name = str(entity.get("canonical_name") or "").strip()
+        if entity_type not in {"Website", "Document"} or not canonical_name.startswith(("http://", "https://")):
+            continue
+        host = (urlparse(canonical_name).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        domain_entity = entity_lookup.get(_normalize_graph_name(host))
+        if domain_entity is None:
+            continue
+        rel_type = "HAS_DOMAIN"
+        fingerprint = "|".join(
+            [
+                str(entity["node_id"]),
+                str(domain_entity["node_id"]),
+                rel_type,
+                rel_type,
+            ]
+        )
+        if fingerprint in seen_relations:
+            continue
+        seen_relations.add(fingerprint)
+        relation_payload = {
+            "edge_id": _stable_graph_edge_id(
+                str(entity["node_id"]),
+                str(domain_entity["node_id"]),
+                rel_type,
+                rel_type,
+            ),
+            "src_id": entity["node_id"],
+            "dst_id": domain_entity["node_id"],
+            "rel_type": rel_type,
+            "canonical_name": rel_type,
+            "alt_names": [],
+            "source_tool": tool_name,
+        }
+        if evidence_ref:
+            relation_payload["evidenceRef"] = evidence_ref
+        relations.append(relation_payload)
+
+    return entities, relations
+
+
 def _stable_snippet_entity_id(
     run_id: str,
     tool_name: str,
@@ -667,10 +968,11 @@ def _stable_snippet_entity_id(
         str(evidence.get("objectKey") or ""),
         str(result.get("documentId") or ""),
         str(result.get("sourceUrl") or ""),
+        tool_name,
         tool_result_summary[:400],
     ]
     digest = hashlib.sha256("|".join(stable_bits).encode("utf-8")).hexdigest()[:16]
-    return f"snippet:{run_id}:{tool_name}:{digest}"
+    return f"snippet:{tool_name}:{digest}"
 
 
 def _coerce_json_argument_fields(
@@ -737,8 +1039,169 @@ def _ingest_graph_entity_has_merge_key(arguments: Dict[str, Any]) -> bool:
     )
 
 
+def _normalize_graph_name(value: str) -> str:
+    lowered = str(value or "").strip().lower()
+    lowered = re.sub(r"[\W_]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def _graph_unique_strings(values: List[Any]) -> List[str]:
+    output: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        normalized = _normalize_graph_name(text)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(text)
+    return output
+
+
+def _choose_graph_canonical_name(values: List[Any]) -> str:
+    candidates = _graph_unique_strings(values)
+    if not candidates:
+        return "unknown"
+    candidates.sort(key=lambda item: (len(item), item), reverse=True)
+    return candidates[0]
+
+
+def _majority_value(values: List[str], fallback: str) -> str:
+    counts: Dict[str, int] = {}
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized:
+            continue
+        counts[normalized] = counts.get(normalized, 0) + 1
+    if not counts:
+        return fallback
+    return sorted(counts.items(), key=lambda item: (item[1], item[0]), reverse=True)[0][0]
+
+
+def _stable_graph_node_id(run_id: str, entity_type: str, canonical_name: str) -> str:
+    digest = hashlib.sha256(
+        f"{_normalize_graph_name(entity_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"ent_{digest}"
+
+
+def _stable_graph_edge_id(src_id: str, dst_id: str, rel_type: str, canonical_name: str) -> str:
+    digest = hashlib.sha256(
+        f"{src_id}|{dst_id}|{_normalize_graph_name(rel_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"rel_{digest}"
+
+
+def _infer_osint_bucket(entity_type: str, canonical_name: str, attributes: List[str]) -> str:
+    type_text = _normalize_graph_name(entity_type)
+    joined = " ".join([type_text, _normalize_graph_name(canonical_name), *[_normalize_graph_name(item) for item in attributes]])
+    if any(token in joined for token in ("person", "author", "researcher", "founder", "director", "employee")):
+        return "person"
+    if any(token in joined for token in ("organization", "company", "institution", "lab", "agency", "university")):
+        return "organization"
+    if any(token in joined for token in ("domain", "website", "hostname", "subdomain", "repo", "repository", "account", "username", "email")):
+        return "digital_asset"
+    if any(token in joined for token in ("article", "paper", "publication", "patent", "grant", "conference")):
+        return "publication"
+    if any(token in joined for token in ("city", "country", "location", "address", "region")):
+        return "location"
+    if any(token in joined for token in ("snippet", "evidence", "document")):
+        return "evidence"
+    return "unknown"
+
+
+def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attributes: List[str]) -> str:
+    normalized = _normalize_graph_name(" ".join([entity_type, canonical_name, *attributes]))
+    if any(token in normalized for token in ("orcid", "researcher", "author", "person", "advisor", "coauthor", "employee", "founder", "director")):
+        return "Person"
+    if any(token in normalized for token in ("university", "college", "institute", "school", "department", "lab", "laboratory")):
+        return "Institution"
+    if any(token in normalized for token in ("company", "organization", "corp", "llc", "committee", "agency", "firm")):
+        return "Organization"
+    if any(token in normalized for token in ("conference", "workshop", "symposium", "venue")):
+        return "Conference"
+    if any(token in normalized for token in ("paper", "publication", "preprint", "journal", "article")):
+        return "Publication"
+    lower_name = canonical_name.lower()
+    if lower_name.startswith(("http://", "https://")):
+        if lower_name.endswith(".pdf") or any(token in normalized for token in ("thesis", "dissertation", "cv", "resume", "pdf")):
+            return "Document"
+        return "Website"
+    if re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}", lower_name):
+        return "Domain"
+    if re.fullmatch(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", canonical_name, re.IGNORECASE):
+        return "Email"
+    if canonical_name.startswith("@") or "username" in normalized or "handle" in normalized:
+        return "Handle"
+    if any(token in normalized for token in ("city", "country", "location", "address", "state", "region")):
+        return "Location"
+    return entity_type if entity_type and entity_type != "Unknown" else "Unknown"
+
+
+def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) -> str:
+    normalized = _normalize_graph_name(rel_type).replace(" ", "_").upper()
+    mapping = {
+        "AFFILIATED_WITH": "AFFILIATED_WITH",
+        "WORKS_AT": "WORKS_AT",
+        "MEMBER_OF": "MEMBER_OF",
+        "FOUNDED": "FOUNDED",
+        "OWNS": "OWNS",
+        "USES_DOMAIN": "HAS_DOMAIN",
+        "HAS_DOMAIN": "HAS_DOMAIN",
+        "HAS_EMAIL": "HAS_EMAIL",
+        "HAS_HANDLE": "HAS_HANDLE",
+        "HAS_PROFILE": "HAS_PROFILE",
+        "PUBLISHED": "PUBLISHED",
+        "COAUTHORED_WITH": "COAUTHORED_WITH",
+        "COAUTHOR_OF": "COAUTHORED_WITH",
+        "MAINTAINS": "MAINTAINS",
+        "LOCATED_IN": "LOCATED_IN",
+        "APPEARS_IN_ARCHIVE": "APPEARS_IN_ARCHIVE",
+        "STUDIED_AT": "STUDIED_AT",
+        "ADVISED_BY": "ADVISED_BY",
+    }
+    if normalized in mapping:
+        return mapping[normalized]
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{1,63}", normalized):
+        return normalized
+    if src_type == "Person" and dst_type in {"Organization", "Institution"}:
+        return "AFFILIATED_WITH"
+    if dst_type == "Email":
+        return "HAS_EMAIL"
+    if dst_type == "Handle":
+        return "HAS_HANDLE"
+    if dst_type == "Domain":
+        return "HAS_DOMAIN"
+    if dst_type == "Website":
+        return "HAS_PROFILE"
+    if src_type == "Person" and dst_type == "Publication":
+        return "PUBLISHED"
+    return "RELATED_TO"
+
+
+def _supplemental_graph_entities_from_result(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    entities: List[Dict[str, Any]] = []
+    for url in _extract_url_candidates(result)[:8]:
+        lower_url = url.lower()
+        entity_type = "Document" if lower_url.endswith(".pdf") or any(token in lower_url for token in ("/thesis", "/dissertation", "cv.pdf")) else "Website"
+        attributes = [f"url: {url}"]
+        if entity_type == "Document" and any(token in lower_url for token in ("thesis", "dissertation")):
+            attributes.append("document_type: thesis")
+        entities.append({"canonical_name": url, "type": entity_type, "alt_names": [], "attributes": attributes})
+        host = (urlparse(url).hostname or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host:
+            entities.append({"canonical_name": host, "type": "Domain", "alt_names": [], "attributes": [f"host: {host}"]})
+    return entities
+
+
 def _run_receipt_summarize_worker(
     llm: OpenRouterLLM,
+    run_id: str,
     tool_name: str,
     tool_result_summary: str,
     graph_ingest_result: Dict[str, Any],
@@ -754,7 +1217,15 @@ def _run_receipt_summarize_worker(
         },
     }
     try:
-        parsed = llm.complete_json(WORKER_SUMMARIZE_RECEIPT_SYSTEM_PROMPT, payload, temperature=0.1, timeout=30)
+        parsed = invoke_complete_json(
+            llm,
+            WORKER_SUMMARIZE_RECEIPT_SYSTEM_PROMPT,
+            payload,
+            temperature=0.1,
+            timeout=30,
+            run_id=run_id,
+            operation=f"tool_worker.receipt_summary.{tool_name}",
+        )
     except Exception:
         return {}
 
@@ -1120,6 +1591,8 @@ def _summarize_result(
         key_facts.append({"targetName": result.get("target_name"), "outputDir": result.get("output_dir")})
         if tool_name == "tavily_research":
             key_facts.append({"requestId": result.get("request_id"), "status": result.get("status")})
+        elif tool_name == "tavily_person_search":
+            key_facts.append({"requestId": result.get("request_id"), "responseTime": result.get("response_time")})
         rows = result.get("extracted_results")
         if isinstance(rows, list):
             urls = [
@@ -2032,6 +2505,34 @@ def _summary_from_normalized_text(normalized_text: str, fallback: str) -> str:
     return summary[:1400] if len(summary) > 1400 else summary
 
 
+def _validate_summary_text(tool_name: str, summary_text: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> str:
+    present = summary_text.lower()
+    payload = {"arguments": arguments, "result": result}
+    missing: List[str] = []
+    urls = _extract_url_candidates(payload)
+    emails = _extract_strings_from_text(json.dumps(payload, ensure_ascii=False, default=str), kind="email")
+    years = _extract_year_candidates(payload)
+    orgs = _extract_org_like_candidates(payload)
+
+    if urls and not any(url.lower() in present for url in urls[:5]):
+        missing.extend(urls[:3])
+    if emails and not any(email.lower() in present for email in emails[:3]):
+        missing.extend(emails[:2])
+    if years and not any(year in summary_text for year in years[:3]):
+        missing.extend(years[:2])
+    if tool_name in {"institution_directory_search", "orcid_search", "semantic_scholar_search", "dblp_author_search"}:
+        if orgs and not any(org.lower() in present for org in orgs[:3]):
+            missing.extend(orgs[:2])
+    for marker in ("orcid", "doi", "pmid", "arxiv", "openreview", "dblp"):
+        if marker in json.dumps(payload, ensure_ascii=False, default=str).lower() and marker not in present:
+            missing.append(marker)
+    missing = _dedupe_str_list([item for item in missing if item])
+    if not missing:
+        return summary_text
+    output = f"{summary_text} PIVOTS: {'; '.join(missing[:6])}"
+    return output[:2500]
+
+
 def _get_tool_metadata(tool_name: str) -> tuple[str | None, float | None]:
     metadata = TOOL_CONFIDENCE_REGISTRY.get(tool_name, {})
     tool_type = metadata.get("type")
@@ -2058,12 +2559,27 @@ def _build_tool_result_text(tool_name: str, arguments: Dict[str, Any], result: D
 
 
 def _extract_source_url(arguments: Dict[str, Any], result: Dict[str, Any]) -> str | None:
-    for key in ("url", "profile", "target", "sourceUrl"):
+    source_keys = (
+        "url",
+        "profile",
+        "target",
+        "sourceUrl",
+        "source_url",
+        "profile_url",
+        "profileUrl",
+        "repo_url",
+        "org_url",
+        "site_url",
+        "filing_url",
+        "blog",
+        "homepage",
+    )
+    for key in source_keys:
         value = arguments.get(key)
         if isinstance(value, str) and value.startswith(("http://", "https://")):
             return value
     if isinstance(result, dict):
-        for key in ("url", "sourceUrl"):
+        for key in source_keys:
             value = result.get(key)
             if isinstance(value, str) and value.startswith(("http://", "https://")):
                 return value
@@ -2084,7 +2600,7 @@ def _graph_upsert_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
     output: Dict[str, Any] = {}
-    for key in ("entityType", "relationCount", "count"):
+    for key in ("entityType", "relationCount", "count", "entityCount", "graphSchema"):
         if key in result:
             output[key] = result.get(key)
     return output
@@ -2144,6 +2660,33 @@ def _extract_url_candidates(value: Any) -> List[str]:
 
     walk(value)
     return _dedupe_str_list(found)
+
+
+def _extract_year_candidates(value: Any) -> List[str]:
+    found: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            found.extend(re.findall(r"\b(?:19|20)\d{2}\b", node))
+            return
+        if isinstance(node, dict):
+            for nested in node.values():
+                walk(nested)
+            return
+        if isinstance(node, list):
+            for nested in node:
+                walk(nested)
+
+    walk(value)
+    return _dedupe_str_list(found)
+
+
+def _extract_org_like_candidates(value: Any) -> List[str]:
+    blob = json.dumps(value, ensure_ascii=False, default=str)
+    pattern = re.compile(
+        r"\b(?:[A-Z][A-Za-z&.-]+(?:\s+[A-Z][A-Za-z&.-]+){0,5})\s+(?:University|College|Institute|School|Department|Lab|Laboratory|Company|Inc|LLC|Corp)\b"
+    )
+    return _dedupe_str_list([item.strip() for item in pattern.findall(blob) if item.strip()])
 
 
 def _extract_handles_from_tweets(tweets: Any) -> List[str]:
@@ -2416,6 +2959,23 @@ def _dedupe_evidence_refs(refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen.add(key)
         unique.append(ref)
     return unique
+
+
+def _merge_key_fact_lists(base_facts: List[Dict[str, Any]], llm_facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for bucket in (base_facts, llm_facts):
+        for fact in bucket:
+            if not isinstance(fact, dict) or len(fact) != 1:
+                continue
+            key = next(iter(fact.keys()))
+            value = fact.get(key)
+            fingerprint = f"{key}|{json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)}"
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            merged.append(fact)
+    return merged
 
 
 def _dedupe_str_list(values: List[str]) -> List[str]:

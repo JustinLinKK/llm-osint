@@ -71,6 +71,7 @@ def _load_tool_worker_graph_module(monkeypatch):
         "GITLAB_TOOL_SUMMARY_SYSTEM_PROMPT",
         "GRANT_TOOL_SUMMARY_SYSTEM_PROMPT",
         "GOOGLE_SERP_PERSON_SEARCH_TOOL_SUMMARY_SYSTEM_PROMPT",
+        "GRAPH_CONSTRUCTION_SYSTEM_PROMPT",
         "GRAPH_INGEST_SYSTEM_PROMPT",
         "PACKAGE_REGISTRY_TOOL_SUMMARY_SYSTEM_PROMPT",
         "PATENT_TOOL_SUMMARY_SYSTEM_PROMPT",
@@ -128,15 +129,54 @@ def test_normalize_ingest_text_drops_null_source_url(monkeypatch) -> None:
     assert "sourceUrl" not in normalized
 
 
-def test_run_graph_ingest_worker_falls_back_to_seed_snippet_when_refined_args_lack_merge_key(monkeypatch) -> None:
+def test_extract_source_url_supports_worker_url_variants(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    assert (
+        tool_worker_graph._extract_source_url(
+            {"profile_url": "https://example.com/profile"},
+            {},
+        )
+        == "https://example.com/profile"
+    )
+    assert (
+        tool_worker_graph._extract_source_url(
+            {},
+            {"repo_url": "https://github.com/example/project"},
+        )
+        == "https://github.com/example/project"
+    )
+
+
+def test_run_graph_ingest_worker_batches_entities_and_relations_from_graph_construction(monkeypatch) -> None:
     tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
 
     class _FakeLLM:
-        def refine_tool_arguments(self, prompt: str, tool_name: str, seed_args: Dict[str, Any]) -> Dict[str, Any]:
+        def complete_json(self, prompt: str, payload: Dict[str, Any], temperature: float = 0.1, timeout: int = 30, **kwargs: Any) -> Dict[str, Any]:
             return {
-                "runId": seed_args["runId"],
-                "entityType": "Person",
-                "propertiesJson": json.dumps({"profileUrls": ["https://example.com/profile"]}),
+                "entities": [
+                    {
+                        "canonical_name": "Ada Lovelace",
+                        "type": "Person",
+                        "alt_names": ["Augusta Ada Lovelace"],
+                        "attributes": ["mathematician"],
+                    },
+                    {
+                        "canonical_name": "Analytical Engine",
+                        "type": "Machine",
+                        "alt_names": [],
+                        "attributes": ["computing engine"],
+                    },
+                ],
+                "relations": [
+                    {
+                        "src": "Ada Lovelace",
+                        "dst": "Analytical Engine",
+                        "canonical_name": "wrote notes on",
+                        "rel_type": "WROTE_ABOUT",
+                        "alt_names": [],
+                    }
+                ],
             }
 
     class _FakeToolResult:
@@ -155,7 +195,7 @@ def test_run_graph_ingest_worker_falls_back_to_seed_snippet_when_refined_args_la
     mcp_client = _FakeMcpClient()
     result = {"target_name": "Ada Lovelace", "summary_path": "/tmp/search_results.json"}
 
-    tool_worker_graph._run_graph_ingest_worker(
+    ingest_result = tool_worker_graph._run_graph_ingest_worker(
         llm=_FakeLLM(),
         mcp_client=mcp_client,
         run_id="123e4567-e89b-12d3-a456-426614174000",
@@ -165,24 +205,55 @@ def test_run_graph_ingest_worker_falls_back_to_seed_snippet_when_refined_args_la
         tool_result_summary="Ran Google SERP person search for Ada Lovelace and archived result pages.",
     )
 
-    assert len(mcp_client.calls) == 1
-    called_tool_name, called_args = mcp_client.calls[0]
-    assert called_tool_name == "ingest_graph_entity"
-    assert called_args["entityType"] == "Snippet"
-    assert called_args["entityId"].startswith("snippet:123e4567-e89b-12d3-a456-426614174000:google_serp_person_search:")
+    assert len(mcp_client.calls) == 2
+    entity_tool_name, entity_args = mcp_client.calls[0]
+    relation_tool_name, relation_args = mcp_client.calls[1]
+    assert entity_tool_name == "ingest_graph_entities"
+    assert relation_tool_name == "ingest_graph_relations"
+    entities = json.loads(entity_args["entitiesJson"])
+    relations = json.loads(relation_args["relationsJson"])
+    assert entities[0]["canonical_name"] == "Augusta Ada Lovelace"
+    assert entities[0]["osint_bucket"] == "person"
+    assert relations[0]["rel_type"] == "WROTE_ABOUT"
+    assert ingest_result["entityCount"] == 2
+    assert ingest_result["relationCount"] == 1
 
 
-def test_run_graph_ingest_worker_drops_invalid_relations_json(monkeypatch) -> None:
+def test_graph_ids_are_stable_across_runs(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    first = tool_worker_graph._stable_graph_node_id("run-1", "Person", "Ada Lovelace")
+    second = tool_worker_graph._stable_graph_node_id("run-2", "Person", "Ada Lovelace")
+    snippet_first = tool_worker_graph._stable_snippet_entity_id(
+        "run-1",
+        "google_serp_person_search",
+        {"sourceUrl": "https://example.com/profile"},
+        "Ada Lovelace profile summary",
+    )
+    snippet_second = tool_worker_graph._stable_snippet_entity_id(
+        "run-2",
+        "google_serp_person_search",
+        {"sourceUrl": "https://example.com/profile"},
+        "Ada Lovelace profile summary",
+    )
+
+    assert first == second
+    assert snippet_first == snippet_second
+
+
+def test_run_graph_ingest_worker_falls_back_to_legacy_snippet_when_graph_construction_is_empty(monkeypatch) -> None:
     tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
 
     class _FakeLLM:
+        def complete_json(self, prompt: str, payload: Dict[str, Any], temperature: float = 0.1, timeout: int = 30, **kwargs: Any) -> Dict[str, Any]:
+            return {"entities": [], "relations": []}
+
         def refine_tool_arguments(self, prompt: str, tool_name: str, seed_args: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "runId": seed_args["runId"],
                 "entityType": "Snippet",
                 "entityId": seed_args["entityId"],
                 "propertiesJson": seed_args["propertiesJson"],
-                "relationsJson": "{not valid json",
             }
 
     class _FakeToolResult:
@@ -211,6 +282,20 @@ def test_run_graph_ingest_worker_drops_invalid_relations_json(monkeypatch) -> No
     )
 
     assert len(mcp_client.calls) == 1
-    _, called_args = mcp_client.calls[0]
+    called_tool_name, called_args = mcp_client.calls[0]
+    assert called_tool_name == "ingest_graph_entity"
     assert called_args["entityType"] == "Snippet"
-    assert "relationsJson" not in called_args
+
+
+def test_merge_key_fact_lists_preserves_tool_specific_and_llm_facts(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    merged = tool_worker_graph._merge_key_fact_lists(
+        [{"profileUrl": "https://github.com/FrederickPi"}, {"publications": [{"title": "Paper A"}]}],
+        [{"source_urls": ["https://github.com/FrederickPi"]}, {"uncertainties": ["limited directory visibility"]}],
+    )
+
+    assert {"profileUrl": "https://github.com/FrederickPi"} in merged
+    assert {"publications": [{"title": "Paper A"}]} in merged
+    assert {"source_urls": ["https://github.com/FrederickPi"]} in merged
+    assert {"uncertainties": ["limited directory visibility"]} in merged
