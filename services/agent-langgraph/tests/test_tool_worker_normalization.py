@@ -45,6 +45,16 @@ def _load_tool_worker_graph_module(monkeypatch):
 
     openrouter_module = types.ModuleType("openrouter_llm")
     openrouter_module.OpenRouterLLM = object
+    openrouter_module.get_openrouter_timeout = lambda env_var, default: default
+    openrouter_module.invoke_complete_json = (
+        lambda llm, system_prompt, user_payload, *, temperature, timeout, **kwargs: llm.complete_json(
+            system_prompt,
+            user_payload,
+            temperature=temperature,
+            timeout=timeout,
+            **kwargs,
+        )
+    )
     monkeypatch.setitem(sys.modules, "openrouter_llm", openrouter_module)
 
     receipt_store_module = types.ModuleType("receipt_store")
@@ -275,10 +285,10 @@ def test_run_graph_ingest_worker_falls_back_to_legacy_snippet_when_graph_constru
         llm=_FakeLLM(),
         mcp_client=mcp_client,
         run_id="123e4567-e89b-12d3-a456-426614174000",
-        tool_name="google_serp_person_search",
-        arguments={"target_name": "Ada Lovelace"},
-        result={"target_name": "Ada Lovelace"},
-        tool_result_summary="Ran Google SERP person search for Ada Lovelace and archived result pages.",
+        tool_name="fetch_url",
+        arguments={"url": "https://example.com"},
+        result={},
+        tool_result_summary="Fetched a generic page with no structured entity extraction.",
     )
 
     assert len(mcp_client.calls) == 1
@@ -299,3 +309,260 @@ def test_merge_key_fact_lists_preserves_tool_specific_and_llm_facts(monkeypatch)
     assert {"publications": [{"title": "Paper A"}]} in merged
     assert {"source_urls": ["https://github.com/FrederickPi"]} in merged
     assert {"uncertainties": ["limited directory visibility"]} in merged
+
+
+def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_graph(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="github_identity_search",
+        arguments={
+            "person_name": "Xinyu Pi",
+            "field_keywords": ["large language models", "logical reasoning"],
+        },
+        result={
+            "canonical_name": "Xinyu Pi",
+            "profile_url": "https://github.com/jerrydwelly",
+            "external_links": [
+                {"type": "profile", "url": "https://html.duckduckgo.com/html/?q=site%3Agithub.com+%22Xinyu+Pi%22"},
+            ],
+            "organizations": [
+                {
+                    "name": "University of Illinois Urbana-Champaign (UIUC)",
+                    "summary": "Public research university in Illinois.",
+                    "focus": ["computer science", "machine learning"],
+                },
+                {"name": "University of Illinois at Urbana-Champaign"},
+                {"name": "Stealth Startup", "relation": "member", "summary": "Applied AI startup.", "industry": "artificial intelligence"},
+            ],
+            "repositories": [
+                {"name": "logos", "url": "https://github.com/xinyu/logos", "language": "Python"},
+            ],
+            "top_languages": ["Python", "TypeScript"],
+            "spoken_languages": ["English"],
+            "topics": ["Large Language Models", "Logical Reasoning"],
+            "publications": [
+                {
+                    "title": "Reasoning Like Program Executors",
+                    "year": "2022",
+                    "conference": "EMNLP 2024",
+                    "authors": ["Xinyu Pi", "Qian Liu"],
+                    "affiliations": ["University of Illinois Urbana-Champaign"],
+                }
+            ],
+            "roles": [
+                {
+                    "title": "PhD student",
+                    "organization": "University of California, San Diego",
+                    "start_date": "2021",
+                    "source_url": "https://example.com/profile",
+                }
+            ],
+        },
+        extracted_graph={
+            "entities": [
+                {
+                    "canonical_name": "University of Illinois Urbana-Champaign",
+                    "type": "Institution",
+                    "alt_names": [],
+                    "attributes": [],
+                }
+            ],
+            "relations": [],
+        },
+    )
+
+    illinois_entities = [
+        entity for entity in entities if entity["type"] == "Institution" and "illinois" in entity["canonical_name"].lower()
+    ]
+    assert len(illinois_entities) == 1
+    assert "University of Illinois at Urbana-Champaign" in illinois_entities[0]["alt_names"]
+    assert any(key.startswith("sig:org:university illinois urbana champaign") for key in illinois_entities[0]["merge_keys"])
+
+    assert any(entity["type"] == "Repository" and entity["canonical_name"] == "logos" for entity in entities)
+    assert any(entity["type"] == "Website" and entity["canonical_name"] == "GitHub profile for Xinyu Pi" for entity in entities)
+    assert not any(entity["type"] == "Website" and entity["canonical_name"] == "https://github.com/jerrydwelly" for entity in entities)
+    assert any(entity["type"] == "Language" and entity["canonical_name"] == "Python" for entity in entities)
+    assert any(entity["type"] == "Language" and entity["canonical_name"] == "English" for entity in entities)
+    assert any(entity["type"] == "Topic" and entity["canonical_name"] == "Large Language Models" for entity in entities)
+    assert any(entity["type"] == "Publication" and entity["canonical_name"] == "Reasoning Like Program Executors" for entity in entities)
+    assert any(entity["type"] == "Role" and entity["canonical_name"] == "PhD student at University of California, San Diego" for entity in entities)
+    assert any(entity["type"] == "ContactPoint" and "xinyu pi" in " ".join(entity.get("attributes") or []).lower() for entity in entities)
+    assert any(entity["type"] == "OrganizationProfile" and "University of Illinois" in entity["canonical_name"] for entity in entities)
+    assert any(entity["type"] == "Experience" and "University of California, San Diego" in entity["canonical_name"] for entity in entities)
+    assert any(entity["type"] == "EducationalCredential" and "University of California, San Diego" in entity["canonical_name"] for entity in entities)
+    assert any(entity["type"] == "Occupation" and entity["canonical_name"] == "PhD student" for entity in entities)
+    assert any(entity["type"] == "TimelineEvent" and "University of California, San Diego" in entity["canonical_name"] for entity in entities)
+    assert not any("duckduckgo" in entity["canonical_name"].lower() for entity in entities)
+
+    relation_types = {relation["rel_type"] for relation in relations}
+    assert "HAS_CONTACT_POINT" in relation_types
+    assert "HAS_EXPERIENCE" in relation_types
+    assert "HAS_CREDENTIAL" in relation_types
+    assert "HAS_AFFILIATION" in relation_types
+    assert "HAS_TIMELINE_EVENT" in relation_types
+    assert "HAS_ROLE" in relation_types
+    assert "ISSUED_BY" in relation_types
+    assert "MAINTAINS" in relation_types
+    assert "USES_LANGUAGE" in relation_types
+    assert "KNOWS_LANGUAGE" in relation_types
+    assert "RESEARCHES" in relation_types
+    assert "PUBLISHED" in relation_types
+    assert "PUBLISHED_IN" in relation_types
+    assert "COAUTHORED_WITH" in relation_types
+    assert "HOLDS_ROLE" in relation_types
+    assert "STUDIED_AT" in relation_types
+    assert "HAS_ORGANIZATION_PROFILE" in relation_types
+
+
+def test_store_artifacts_and_summary_collects_compact_artifact_documents(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    artifact_calls: list[dict[str, Any]] = []
+    tool_worker_graph.insert_artifact = lambda **kwargs: artifact_calls.append(kwargs) or f"artifact-{len(artifact_calls)}"
+    tool_worker_graph.insert_artifact_summary = (
+        lambda artifact_id, summary, key_facts, confidence=None: f"summary-for-{artifact_id}"
+    )
+
+    artifact_ids, document_ids, summary_id = tool_worker_graph._store_artifacts_and_summary(
+        run_id="run-1",
+        tool_name="arxiv_paper_ingest",
+        arguments={"runId": "run-1", "arxiv_id": "2402.04333", "person_name": "Ada Lovelace"},
+        result={
+            "evidence": {
+                "documentId": "doc-json",
+                "bucket": "osint-raw",
+                "objectKey": "runs/run-1/raw/python/arxiv_paper_ingest/result.json",
+            },
+            "artifactDocuments": [
+                {
+                    "documentId": "doc-pdf",
+                    "bucket": "osint-raw",
+                    "objectKey": "runs/run-1/raw/python/arxiv_paper_ingest/paper.pdf",
+                    "contentType": "application/pdf",
+                }
+            ],
+        },
+        summary="Fetched one arXiv paper.",
+        key_facts=[{"paperTitle": "Reasoning Like Program Executors"}],
+        confidence_score=0.92,
+    )
+
+    assert summary_id == "summary-for-artifact-1"
+    assert artifact_ids == ["artifact-1", "artifact-2"]
+    assert document_ids == ["doc-json", "doc-pdf"]
+    assert artifact_calls[1]["kind"] == "artifact_document"
+    assert artifact_calls[1]["document_id"] == "doc-pdf"
+
+
+def test_build_graph_construction_batches_adds_coauthor_email_contacts(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="arxiv_paper_ingest",
+        arguments={
+            "person_name": "Ada Lovelace",
+            "arxiv_id": "2402.04333",
+        },
+        result={
+            "paper": {
+                "title": "Reasoning Like Program Executors",
+                "arxiv_id": "2402.04333",
+                "published": "2024-02-07",
+                "authors": ["Ada Lovelace", "Alan Turing"],
+                "affiliations": ["Analytical Engine Institute"],
+                "topics": ["reasoning", "program executors"],
+                "pdf_url": "https://arxiv.org/pdf/2402.04333",
+            },
+            "papers": [
+                {
+                    "title": "Reasoning Like Program Executors",
+                    "arxiv_id": "2402.04333",
+                    "published": "2024-02-07",
+                    "authors": ["Ada Lovelace", "Alan Turing"],
+                    "affiliations": ["Analytical Engine Institute"],
+                    "topics": ["reasoning", "program executors"],
+                    "pdf_url": "https://arxiv.org/pdf/2402.04333",
+                }
+            ],
+            "topics": ["reasoning", "program executors"],
+            "coauthors": [
+                {"name": "Alan Turing", "email": "aturing@example.edu", "match_confidence": 0.9},
+            ],
+            "author_contacts": [
+                {"name": "Ada Lovelace", "email": "ada@example.edu", "match_confidence": 0.95},
+                {"name": "Alan Turing", "email": "aturing@example.edu", "match_confidence": 0.9},
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert any(entity["type"] == "Email" and entity["canonical_name"] == "ada@example.edu" for entity in entities)
+    assert any(entity["type"] == "Email" and entity["canonical_name"] == "aturing@example.edu" for entity in entities)
+    assert any(entity["type"] == "Topic" and entity["canonical_name"] == "reasoning" for entity in entities)
+    assert any(entity["type"] == "Publication" and entity["canonical_name"] == "Reasoning Like Program Executors" for entity in entities)
+
+    relation_types = {relation["rel_type"] for relation in relations}
+    assert "COAUTHORED_WITH" in relation_types
+    assert "HAS_CONTACT_POINT" in relation_types
+    assert "HAS_EMAIL" in relation_types
+    assert "HAS_TOPIC" in relation_types
+    assert "RESEARCHES" in relation_types
+
+    node_ids = {entity["canonical_name"]: entity["node_id"] for entity in entities}
+    assert any(
+        relation["rel_type"] == "HAS_TOPIC"
+        and relation["src_id"] == node_ids["Reasoning Like Program Executors"]
+        and relation["dst_id"] == node_ids["reasoning"]
+        for relation in relations
+    )
+    assert any(
+        relation["rel_type"] == "RESEARCHES"
+        and relation["src_id"] == node_ids["Alan Turing"]
+        and relation["dst_id"] == node_ids["program executors"]
+        for relation in relations
+    )
+
+
+def test_build_graph_construction_batches_emits_management_and_staff_histories(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="open_corporates_search",
+        arguments={"company_name": "Acme Bio", "org_name": "Acme Bio"},
+        result={
+            "company_name": "Acme Bio",
+            "company_number": "12345",
+            "jurisdiction": "us_de",
+            "source_url": "https://acmebio.example.com",
+            "topics": ["protein engineering"],
+            "officers": [
+                {"name": "Grace Hopper", "position": "Chief Executive Officer", "start_date": "2020"},
+            ],
+            "staff": [
+                {"name": "Alan Turing", "title": "Research Scientist", "source_url": "https://acmebio.example.com/team"},
+            ],
+            "overlaps": [
+                {"name": "Barbara Liskov", "companies": ["Acme Bio", "Genome Works"], "roles": ["Director"]},
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert any(entity["type"] == "Person" and entity["canonical_name"] == "Grace Hopper" for entity in entities)
+    assert any(entity["type"] == "Person" and entity["canonical_name"] == "Alan Turing" for entity in entities)
+    assert any(entity["type"] == "Person" and entity["canonical_name"] == "Barbara Liskov" for entity in entities)
+    assert any(entity["type"] in {"Organization", "Institution"} and entity["canonical_name"] == "Acme Bio" for entity in entities)
+    assert any(entity["type"] in {"Organization", "Institution"} and entity["canonical_name"] == "Genome Works" for entity in entities)
+    assert any(entity["type"] == "Topic" and entity["canonical_name"] == "protein engineering" for entity in entities)
+
+    relation_types = {relation["rel_type"] for relation in relations}
+    assert "OFFICER_OF" in relation_types
+    assert "WORKS_AT" in relation_types
+    assert "DIRECTOR_OF" in relation_types
+    assert "HAS_EXPERIENCE" in relation_types
+    assert "HAS_ROLE" in relation_types
+    assert "HOLDS_ROLE" in relation_types

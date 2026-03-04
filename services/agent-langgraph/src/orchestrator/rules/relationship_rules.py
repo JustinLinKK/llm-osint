@@ -15,6 +15,7 @@ ACADEMIC_RELATIONSHIP_TOOLS = {
     "grant_search_person",
     "conference_profile_search",
     "arxiv_search_and_download",
+    "arxiv_paper_ingest",
 }
 BUSINESS_RELATIONSHIP_TOOLS = {
     "open_corporates_search",

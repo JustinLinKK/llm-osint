@@ -154,6 +154,33 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 
     def fake_run_tool_worker(_mcp_client, run_id: str, tool_name: str, arguments: Dict[str, Any]) -> ToolWorkerResultStub:
+        if tool_name == "tavily_person_search":
+            target_name = str(arguments.get("target_name") or "")
+            query = str(arguments.get("query") or target_name)
+            key_facts = [{"targetName": target_name, "query": query}]
+            next_hints: List[str] = []
+
+            if "github" in query.lower():
+                key_facts.extend(
+                    [
+                        {"profileUrl": "https://github.com/ada"},
+                        {"username": "ada"},
+                        {"displayName": "Ada Lovelace"},
+                    ]
+                )
+                next_hints.extend(["https://github.com/ada", "ada"])
+
+            receipt = ReceiptStub(
+                run_id=run_id,
+                tool_name=tool_name,
+                ok=True,
+                summary=f"Executed {tool_name}.",
+                arguments=arguments,
+                key_facts=key_facts,
+                next_hints=next_hints,
+            )
+            return ToolWorkerResultStub(receipt=receipt, result={"query": query, "target_name": target_name})
+
         if tool_name == "github_identity_search":
             result = {
                 "tool": "github_identity_search",
@@ -178,6 +205,7 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Resolved GitHub profile ada.",
+                arguments=arguments,
                 key_facts=[
                     {"profileUrl": "https://github.com/ada"},
                     {"username": "ada"},
@@ -212,6 +240,7 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Registry search found package publications.",
+                arguments=arguments,
                 key_facts=[
                     {"repositories": [{"name": "@acme/widget", "url": "https://github.com/acme/widget"}]},
                     {"publications": [{"name": "@acme/widget", "url": "https://www.npmjs.com/package/@acme/widget"}]},
@@ -242,6 +271,7 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Resolved personal site.",
+                arguments=arguments,
                 key_facts=[
                     {"profileUrl": "https://ada.dev"},
                     {"externalLinks": [{"type": "github", "url": "https://github.com/ada"}]},
@@ -271,6 +301,7 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Wayback returned 1 snapshot.",
+                arguments=arguments,
                 key_facts=[
                     {"originalUrl": arguments.get("url")},
                     {"archivedUrl": f"https://web.archive.org/web/20240101000000/{arguments.get('url')}"},
@@ -286,11 +317,12 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Ingested graph entities in batch.",
+                arguments=arguments,
                 key_facts=[{"count": 1}],
             )
             return ToolWorkerResultStub(receipt=receipt, result={"count": 1})
 
-        receipt = ReceiptStub(run_id=run_id, tool_name=tool_name, ok=True, summary=f"Executed {tool_name}.")
+        receipt = ReceiptStub(run_id=run_id, tool_name=tool_name, ok=True, summary=f"Executed {tool_name}.", arguments=arguments)
         return ToolWorkerResultStub(receipt=receipt, result={})
 
     monkeypatch.setattr(planner_graph, "run_tool_worker", fake_run_tool_worker)
@@ -326,12 +358,15 @@ def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
     final_state = graph.compile().invoke(state)
 
     tool_names = [receipt.tool_name for receipt in final_state["tool_receipts"]]
-    assert "github_identity_search" in tool_names
-    assert "ingest_graph_entities" in tool_names
-    queued_tool_names = [item["tool_name"] for item in final_state["queued_tasks"]]
-    assert queued_tool_names
+    tavily_github_receipts = [
+        receipt
+        for receipt in final_state["tool_receipts"]
+        if receipt.tool_name == "tavily_person_search"
+        and receipt.arguments.get("query") == "Find the public GitHub profile, account, or repositories associated with Ada Lovelace."
+    ]
+    assert tavily_github_receipts
+    assert "github_identity_search" not in tool_names
     assert final_state["coverage_ledger"]["identity"] is True
-    assert final_state["coverage_ledger"]["code_presence"] is True
     assert final_state["next_stage"] == "stage2"
 
 
@@ -524,3 +559,341 @@ def test_inject_noteboard_renders_structured_sections(monkeypatch) -> None:
     assert "Known gaps or unresolved questions:" in prompt
     assert "Depth candidates worth expanding:" in prompt
     assert "Next iteration To Do:" in prompt
+
+
+def test_planner_review_receipts_queues_source_followups_from_search_results(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    planner_review_receipts = graph.nodes["planner_review_receipts"]
+
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="tavily_person_search",
+                ok=True,
+                summary="Ran Tavily person search for Ada Lovelace.",
+                arguments={"runId": "run-1", "target_name": "Ada Lovelace"},
+                key_facts=[
+                    {
+                        "sourceUrls": [
+                            "https://www.example.edu/people/ada-lovelace",
+                            "https://arxiv.org/abs/1234.5678",
+                            "https://en.wikipedia.org/wiki/Ada_Lovelace",
+                        ]
+                    }
+                ],
+                next_hints=[
+                    "https://www.example.edu/people/ada-lovelace",
+                    "https://arxiv.org/abs/1234.5678",
+                    "https://en.wikipedia.org/wiki/Ada_Lovelace",
+                ],
+            )
+        ],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    updated = planner_review_receipts(state)
+    queued_tools = [(item["tool_name"], item["payload"]) for item in updated["queued_tasks"]]
+
+    assert ("fetch_url", {"runId": "run-1", "url": "https://www.example.edu/people/ada-lovelace"}) in queued_tools
+    assert (
+        "arxiv_paper_ingest",
+        {"runId": "run-1", "paper_url": "https://arxiv.org/abs/1234.5678", "author_hint": "Ada Lovelace"},
+    ) in queued_tools
+    assert not any(payload.get("url") == "https://en.wikipedia.org/wiki/Ada_Lovelace" for tool, payload in queued_tools if tool == "fetch_url")
+
+
+def test_planner_review_receipts_adds_fetched_host_to_allowed_hosts(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    planner_review_receipts = graph.nodes["planner_review_receipts"]
+
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": ["https://www.acme.com/about"],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="fetch_url",
+                ok=True,
+                summary="Fetched URL.",
+                arguments={"runId": "run-1", "url": "https://www.acme.com/about"},
+                key_facts=[{"finalUrl": "https://www.acme.com/about"}],
+                next_hints=["https://www.acme.com/team"],
+            )
+        ],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    updated = planner_review_receipts(state)
+
+    assert updated["allowed_hosts"] == ["acme.com"]
+    assert updated["pending_urls"] == ["https://www.acme.com/team"]
+
+
+def test_planner_review_receipts_expands_topics_management_and_org_staff(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    planner_review_receipts = graph.nodes["planner_review_receipts"]
+
+    def fake_extract_person_targets(text: str) -> list[str]:
+        matches: list[str] = []
+        for name in ("Ada Lovelace", "Grace Hopper", "Alan Turing"):
+            if name in (text or ""):
+                matches.append(name)
+        return matches
+
+    monkeypatch.setattr(planner_graph, "extract_person_targets", fake_extract_person_targets)
+
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="open_corporates_search",
+                ok=True,
+                summary="Resolved company Analytical Bio Systems with officer records.",
+                arguments={"runId": "run-1", "company_name": "Analytical Bio Systems"},
+                key_facts=[
+                    {"companyName": "Analytical Bio Systems"},
+                    {"officers": [{"name": "Grace Hopper", "position": "Chief Executive Officer"}]},
+                ],
+                next_hints=["Grace Hopper"],
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="tavily_research",
+                ok=True,
+                summary="Research found the company website and topic coverage.",
+                arguments={"runId": "run-1", "input": "Analytical Bio Systems"},
+                key_facts=[
+                    {
+                        "organizations": [
+                            {
+                                "name": "Analytical Bio Systems",
+                                "url": "https://abio.example.com",
+                                "topics": ["computational pathology"],
+                            }
+                        ]
+                    },
+                    {"topics": ["computational pathology"]},
+                ],
+                next_hints=["https://abio.example.com"],
+            ),
+        ],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    updated = planner_review_receipts(state)
+    assert any(
+        item["tool_name"] == "company_officer_search"
+        and item["payload"] == {"runId": "run-1", "person_name": "Grace Hopper", "max_results": 8}
+        for item in updated["queued_tasks"]
+    )
+    assert any(
+        item["tool_name"] == "org_staff_page_search"
+        and item["payload"] == {"runId": "run-1", "org_url": "https://abio.example.com", "org_name": "Analytical Bio Systems"}
+        for item in updated["queued_tasks"]
+    )
+    assert any(
+        item["tool_name"] == "arxiv_search_and_download"
+        and item["payload"] == {"runId": "run-1", "author": "Ada Lovelace", "topic": "computational pathology", "max_results": 6}
+        for item in updated["queued_tasks"]
+    )
+
+
+def test_planner_review_receipts_filters_low_signal_source_followups(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    planner_review_receipts = graph.nodes["planner_review_receipts"]
+
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Frederick Xinyu Pi",
+        "inputs": ["Frederick Xinyu Pi"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="tavily_research",
+                ok=True,
+                summary="Returned a mixture of official and generic links.",
+                arguments={"runId": "run-1", "input": "Frederick Xinyu Pi"},
+                key_facts=[
+                    {
+                        "sourceUrls": [
+                            "https://wordunscrambler.net/unscramble/notpi",
+                            "https://github.com/USPS",
+                            "https://www.usps.com/",
+                            "https://example.edu/people/frederick-pi",
+                        ]
+                    }
+                ],
+                next_hints=[],
+            )
+        ],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    updated = planner_review_receipts(state)
+    fetch_payloads = [
+        item["payload"]
+        for item in updated["queued_tasks"]
+        if item["tool_name"] == "fetch_url"
+    ]
+
+    assert {"runId": "run-1", "url": "https://example.edu/people/frederick-pi"} in fetch_payloads
+    assert {"runId": "run-1", "url": "https://wordunscrambler.net/unscramble/notpi"} not in fetch_payloads
+    assert {"runId": "run-1", "url": "https://github.com/USPS"} not in fetch_payloads
+    assert {"runId": "run-1", "url": "https://www.usps.com/"} not in fetch_payloads
+
+
+def test_plan_tools_uses_tavily_github_search_before_github_identity_search(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    monkeypatch.setattr(planner_graph, "emit_run_event", lambda *args, **kwargs: None)
+
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    plan_tools = graph.nodes["plan_tools"]
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace and her public code footprint",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 2,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    planned = plan_tools(state)
+    tavily_items = [item for item in planned["tool_plan"] if item.tool == "tavily_person_search"]
+    github_items = [item for item in planned["tool_plan"] if item.tool == "github_identity_search"]
+
+    assert any(
+        item.arguments.get("query") == "Find the public GitHub profile, account, or repositories associated with Ada Lovelace."
+        for item in tavily_items
+    )
+    assert github_items == []

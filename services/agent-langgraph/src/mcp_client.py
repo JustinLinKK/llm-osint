@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Protocol
 import requests
 
 from logger import get_logger
+from run_monitor import notify_progress
 
 logger = get_logger(__name__)
 
@@ -95,6 +96,7 @@ class StdioMcpClient:
             "params": {"name": name, "arguments": arguments},
         }
         logger.info("MCP tool call", extra={"tool": name, "request_id": request_id})
+        notify_progress(f"MCP_TOOL_CALL:{name}")
 
         with self._lock:
             self._process.stdin.write(json.dumps(request) + "\n")
@@ -117,9 +119,11 @@ class StdioMcpClient:
 
         if response is None:
             logger.error("MCP empty response", extra={"tool": name, "request_id": request_id})
+            notify_progress(f"MCP_TOOL_RETURNED:{name}")
             return McpCallResult(ok=False, content={"error": "empty or invalid response", "raw": last_line}, raw={})
         if "error" in response:
             logger.error("MCP tool error", extra={"tool": name, "request_id": request_id, "error": response.get("error")})
+            notify_progress(f"MCP_TOOL_RETURNED:{name}")
             return McpCallResult(ok=False, content=response["error"], raw=response)
 
         result = response.get("result", {})
@@ -129,6 +133,7 @@ class StdioMcpClient:
             logger.error("MCP tool returned error", extra={"tool": name, "request_id": request_id})
         else:
             logger.info("MCP tool returned", extra={"tool": name, "request_id": request_id})
+        notify_progress(f"MCP_TOOL_RETURNED:{name}")
         return McpCallResult(ok=not is_error, content=content, raw=response)
 
 
@@ -217,6 +222,7 @@ class StreamableHttpMcpClient:
             "params": {"name": name, "arguments": arguments},
         }
         logger.info("MCP tool call", extra={"tool": name, "request_id": request_id})
+        notify_progress(f"MCP_TOOL_CALL:{name}")
 
         response = self._post(
             request,
@@ -226,16 +232,19 @@ class StreamableHttpMcpClient:
         )
         if response is None:
             logger.error("MCP empty response", extra={"tool": name, "request_id": request_id})
+            notify_progress(f"MCP_TOOL_RETURNED:{name}")
             return McpCallResult(ok=False, content={"error": "empty response"}, raw={})
 
         try:
             payload = response.json()
         except ValueError:
             logger.error("MCP invalid JSON response", extra={"tool": name, "request_id": request_id})
+            notify_progress(f"MCP_TOOL_RETURNED:{name}")
             return McpCallResult(ok=False, content={"error": "invalid JSON response"}, raw={})
 
         if "error" in payload:
             logger.error("MCP tool error", extra={"tool": name, "request_id": request_id, "error": payload.get("error")})
+            notify_progress(f"MCP_TOOL_RETURNED:{name}")
             return McpCallResult(ok=False, content=payload.get("error", {}), raw=payload)
 
         result = payload.get("result", {})
@@ -245,6 +254,7 @@ class StreamableHttpMcpClient:
             logger.error("MCP tool returned error", extra={"tool": name, "request_id": request_id})
         else:
             logger.info("MCP tool returned", extra={"tool": name, "request_id": request_id})
+        notify_progress(f"MCP_TOOL_RETURNED:{name}")
 
         return McpCallResult(ok=not is_error, content=content, raw=payload)
 

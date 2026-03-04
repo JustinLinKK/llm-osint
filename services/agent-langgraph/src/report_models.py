@@ -13,6 +13,8 @@ class SectionTaskModel(BaseModel):
     title: str
     objective: str
     required: bool = True
+    section_group: str = ""
+    graph_chain: List[str] = Field(default_factory=list)
     entity_ids: List[str] = Field(default_factory=list)
     query_hints: List[str] = Field(default_factory=list)
     current_content: str = ""

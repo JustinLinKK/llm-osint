@@ -7,6 +7,7 @@ import { listRunEvents } from "./services/events.js";
 import { pool } from "./clients/pg.js";
 import { minio } from "./clients/minio.js";
 import { neo4jDriver } from "./clients/neo4j.js";
+import { projectRunGraph } from "./graph.js";
 
 const app = Fastify({ logger: true });
 
@@ -43,79 +44,6 @@ function normalizeNeo4jValue(value: unknown): unknown {
     );
   }
   return value;
-}
-
-function pickFirstString(
-  props: Record<string, unknown>,
-  keys: string[]
-): string | null {
-  for (const key of keys) {
-    const value = props[key];
-    if (typeof value === "string" && value.trim()) return value.trim();
-  }
-  return null;
-}
-
-function truncateGraphText(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
-}
-
-function formatRelationType(type: string): string {
-  return type
-    .toLowerCase()
-    .split("_")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function deriveGraphNodeDisplay(
-  labels: string[],
-  props: Record<string, unknown>,
-  fallbackId: string
-): string {
-  const preferred = pickFirstString(props, [
-    "canonical_name",
-    "display_name",
-    "displayName",
-    "name",
-    "title",
-    "username",
-    "handle",
-    "domain",
-    "address",
-    "email",
-    "uri",
-    "url",
-    "snippet_id",
-    "sourceTool"
-  ]);
-  if (preferred) return truncateGraphText(preferred, 96);
-
-  if (props.type === "Snippet" || labels.includes("Snippet")) {
-    const text = pickFirstString(props, ["text", "toolSummary"]);
-    if (text) return `Snippet: ${truncateGraphText(text, 84)}`;
-  }
-
-  if (props.type === "Article" || labels.includes("Article")) {
-    const articleRef = pickFirstString(props, ["uri", "url"]);
-    if (articleRef) return truncateGraphText(articleRef, 96);
-  }
-
-  const stableKey = pickFirstString(props, [
-    "node_id",
-    "canonical_name_normalized",
-    "snippet_id"
-  ]);
-  const primaryLabel = pickFirstString(props, ["type", "osint_bucket"]) ?? labels[0] ?? "Entity";
-  if (stableKey) return `${primaryLabel}: ${truncateGraphText(stableKey, 72)}`;
-
-  const sourceTool = pickFirstString(props, ["sourceTool"]);
-  if (sourceTool) return `${primaryLabel}: ${truncateGraphText(sourceTool, 72)}`;
-
-  return primaryLabel;
 }
 
 function buildStage2Markdown(finalReport?: string | null, evidenceAppendix?: string | null): string | null {
@@ -584,11 +512,14 @@ app.get("/runs/:runId/graph", async (req, reply) => {
   const nodeOffset = parseNonNegativeInt(query.nodeOffset, 0);
   const edgeLimit = parsePositiveInt(query.edgeLimit, 120, 600);
   const edgeOffset = parseNonNegativeInt(query.edgeOffset, 0);
-  const nodeLimitInt = neo4j.int(nodeLimit);
-  const nodeOffsetInt = neo4j.int(nodeOffset);
-  const edgeLimitInt = neo4j.int(edgeLimit);
-  const edgeOffsetInt = neo4j.int(edgeOffset);
+  const fetchNodeLimit = Math.min(Math.max(nodeLimit * 4, 400), 1200);
+  const fetchEdgeLimit = Math.min(Math.max(edgeLimit * 4, 600), 1600);
+  const fetchNodeLimitInt = neo4j.int(fetchNodeLimit);
+  const fetchEdgeLimitInt = neo4j.int(fetchEdgeLimit);
 
+  const runRes = await pool.query(`SELECT prompt, title FROM runs WHERE run_id = $1 LIMIT 1`, [runId]);
+  const runPrompt = String(runRes.rows[0]?.prompt ?? "");
+  const runTitle = String(runRes.rows[0]?.title ?? "");
   const docRes = await pool.query(`SELECT document_id::text FROM documents WHERE run_id = $1`, [runId]);
   const documentIds: string[] = docRes.rows.map((row) => row.document_id);
   if (!documentIds.length) {
@@ -599,27 +530,13 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       page: {
         nodes: { limit: nodeLimit, offset: nodeOffset, total: 0 },
         edges: { limit: edgeLimit, offset: edgeOffset, total: 0 }
-      }
+      },
+      graphRoot: null
     };
   }
 
   const session = neo4jDriver.session();
   try {
-    const edgeTotalResult = await session.run(
-      `MATCH (a)-[r]->(b)
-       WHERE r.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR a.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(a.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR b.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
-       RETURN count(DISTINCT r) AS total`,
-      { documentIds }
-    );
-    const totalEdges = Number(
-      normalizeNeo4jValue(edgeTotalResult.records[0]?.get("total")) ?? 0
-    );
-
     const edgeResult = await session.run(
       `MATCH (a)-[r]->(b)
        WHERE r.evidence_document_id IN $documentIds
@@ -630,45 +547,22 @@ app.get("/runs/:runId/graph", async (req, reply) => {
           OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
        WITH DISTINCT a, r, b
        ORDER BY coalesce(r.rel_type, type(r)), elementId(r)
-      SKIP $edgeOffset
-      LIMIT $edgeLimit
+       LIMIT $edgeLimit
       RETURN elementId(r) AS id,
               elementId(a) AS source,
               elementId(b) AS target,
               coalesce(r.rel_type, type(r)) AS type,
               properties(r) AS props`,
-      { documentIds, edgeLimit: edgeLimitInt, edgeOffset: edgeOffsetInt }
+      { documentIds, edgeLimit: fetchEdgeLimitInt }
     );
 
-    const edges = edgeResult.records.map((record) => {
-      const type = String(record.get("type"));
-      return {
+    const rawEdges = edgeResult.records.map((record) => ({
         id: String(record.get("id")),
         source: String(record.get("source")),
         target: String(record.get("target")),
-        type,
-        display: formatRelationType(type),
+        type: String(record.get("type")),
         properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
-      };
-    });
-
-    const nodeTotalResult = await session.run(
-      `MATCH (n)
-       WHERE n.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR EXISTS {
-            MATCH (n)-[r]-(m)
-            WHERE r.evidence_document_id IN $documentIds
-               OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
-               OR m.evidence_document_id IN $documentIds
-               OR any(docId IN coalesce(m.evidence_document_ids, []) WHERE docId IN $documentIds)
-          }
-       RETURN count(DISTINCT n) AS total`,
-      { documentIds }
-    );
-    const totalNodes = Number(
-      normalizeNeo4jValue(nodeTotalResult.records[0]?.get("total")) ?? 0
-    );
+      }));
 
     const nodeResult = await session.run(
       `MATCH (n)
@@ -683,28 +577,21 @@ app.get("/runs/:runId/graph", async (req, reply) => {
           }
        WITH DISTINCT n
        ORDER BY coalesce(n.canonical_name, n.node_id, elementId(n))
-       SKIP $nodeOffset
        LIMIT $nodeLimit
        RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
-      { documentIds, nodeLimit: nodeLimitInt, nodeOffset: nodeOffsetInt }
+      { documentIds, nodeLimit: fetchNodeLimitInt }
     );
 
-    const nodeRecords = nodeResult.records.map((record) => {
-      const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
-      const labels = normalizeNeo4jValue(record.get("labels")) as string[];
-      const id = String(record.get("id"));
-      return {
-        id,
-        labels,
-        properties: props,
-        display: deriveGraphNodeDisplay(labels, props, id)
-      };
-    });
+    const rawNodes = nodeResult.records.map((record) => ({
+      id: String(record.get("id")),
+      labels: normalizeNeo4jValue(record.get("labels")) as string[],
+      properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
+    }));
 
-    const nodeIds = new Set(nodeRecords.map((node) => node.id));
+    const rawNodeIds = new Set(rawNodes.map((node) => node.id));
     const missingEndpointIds = Array.from(
       new Set(
-        edges.flatMap((edge) => [edge.source, edge.target]).filter((nodeId) => nodeId && !nodeIds.has(nodeId))
+        rawEdges.flatMap((edge) => [edge.source, edge.target]).filter((nodeId) => nodeId && !rawNodeIds.has(nodeId))
       )
     );
 
@@ -717,28 +604,42 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       );
 
       for (const record of missingNodeResult.records) {
-        const props = normalizeNeo4jValue(record.get("props")) as Record<string, unknown>;
-        const labels = normalizeNeo4jValue(record.get("labels")) as string[];
         const id = String(record.get("id"));
-        if (nodeIds.has(id)) continue;
-        nodeIds.add(id);
-        nodeRecords.push({
+        if (rawNodeIds.has(id)) continue;
+        rawNodeIds.add(id);
+        rawNodes.push({
           id,
-          labels,
-          properties: props,
-          display: deriveGraphNodeDisplay(labels, props, id)
+          labels: normalizeNeo4jValue(record.get("labels")) as string[],
+          properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
         });
       }
     }
 
+    const projection = projectRunGraph(rawNodes, rawEdges, {
+      prompt: runPrompt,
+      title: runTitle,
+      nodeLimit,
+      nodeOffset,
+      edgeLimit,
+      edgeOffset
+    });
+
     return {
       runId,
-      nodes: nodeRecords,
-      edges,
+      nodes: projection.nodes,
+      edges: projection.edges,
       page: {
-        nodes: { limit: nodeLimit, offset: nodeOffset, total: totalNodes },
-        edges: { limit: edgeLimit, offset: edgeOffset, total: totalEdges }
-      }
+        nodes: { limit: nodeLimit, offset: nodeOffset, total: projection.totalNodes },
+        edges: { limit: edgeLimit, offset: edgeOffset, total: projection.totalEdges }
+      },
+      graphRoot: projection.rootNodeId
+        ? {
+            nodeId: projection.rootNodeId,
+            display: projection.rootDisplay,
+            recommendedLayout: projection.recommendedLayout,
+            recommendedEgoDepth: projection.recommendedEgoDepth
+          }
+        : null
     };
   } finally {
     await session.close();

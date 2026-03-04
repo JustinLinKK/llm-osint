@@ -36,6 +36,13 @@ PERSON_CANDIDATE_STOPWORDS = {
     "website",
     "company",
     "organization",
+    "account",
+    "accounts",
+    "repository",
+    "repositories",
+    "github",
+    "gitlab",
+    "linkedin",
 }
 PERSON_CANDIDATE_BREAKWORDS = {
     "and",
@@ -92,8 +99,52 @@ PERSON_CANDIDATE_REJECT_TOKENS = {
     "contact",
     "relationship",
     "relationships",
+    "account",
+    "accounts",
     "biography",
     "biographic",
+    "women",
+    "woman",
+    "men",
+    "man",
+    "her",
+    "him",
+    "you",
+    "your",
+    "our",
+    "their",
+    "them",
+    "us",
+    "engineer",
+    "engineers",
+    "engineering",
+    "biomedical",
+    "mechanical",
+    "electrical",
+    "software",
+    "technology",
+    "technologies",
+    "science",
+    "sciences",
+    "department",
+    "guide",
+    "overview",
+    "article",
+    "articles",
+    "occupation",
+    "occupations",
+    "specialization",
+    "specializations",
+    "career",
+    "careers",
+    "tech",
+    "wikipedia",
+    "society",
+    "github",
+    "gitlab",
+    "linkedin",
+    "repository",
+    "repositories",
 }
 
 PERSON_CANDIDATE_REJECT_PHRASES = (
@@ -106,6 +157,42 @@ PERSON_CANDIDATE_REJECT_PHRASES = (
     "queried arxiv",
     "source types include",
 )
+
+PERSON_CANDIDATE_REJECT_SUFFIXES = {
+    "article",
+    "account",
+    "accounts",
+    "articles",
+    "career",
+    "careers",
+    "contact",
+    "department",
+    "details",
+    "engineer",
+    "engineers",
+    "engineering",
+    "guide",
+    "history",
+    "occupation",
+    "occupations",
+    "overview",
+    "page",
+    "pages",
+    "profile",
+    "profiles",
+    "research",
+    "repository",
+    "repositories",
+    "science",
+    "sciences",
+    "source",
+    "sources",
+    "specialization",
+    "specializations",
+    "tech",
+    "technology",
+    "university",
+}
 
 
 def _dedupe(items: List[str]) -> List[str]:
@@ -171,6 +258,17 @@ def _is_valid_person_candidate(value: str) -> bool:
 
     reject_hits = sum(1 for word in words if word.casefold() in PERSON_CANDIDATE_REJECT_TOKENS)
     if reject_hits:
+        return False
+
+    generic_hits = sum(
+        1
+        for word in words
+        if word.casefold() in PERSON_CANDIDATE_REJECT_TOKENS or word.casefold() in PERSON_CANDIDATE_REJECT_SUFFIXES
+    )
+    if generic_hits >= 2:
+        return False
+
+    if words[-1].casefold() in PERSON_CANDIDATE_REJECT_SUFFIXES:
         return False
 
     if any(len(word) == 1 for word in words):
@@ -239,7 +337,11 @@ def sanitize_search_tool_arguments(
         target = coerce_target("target_name", "query", "name")
         if target:
             normalized["target_name"] = target
-            normalized["query"] = target
+            explicit_query = normalized.get("query")
+            if isinstance(explicit_query, str) and explicit_query.strip():
+                normalized["query"] = explicit_query.strip()
+            else:
+                normalized["query"] = target
             if "name" in normalized:
                 normalized["name"] = target
 

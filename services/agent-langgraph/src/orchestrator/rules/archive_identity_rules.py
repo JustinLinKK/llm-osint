@@ -23,6 +23,29 @@ class ReceiptLike(Protocol):
     key_facts: List[Dict[str, Any]]
 
 
+LOW_VALUE_ARCHIVE_HOSTS = {
+    "duckduckgo.com",
+    "google.com",
+    "googleusercontent.com",
+    "medium.com",
+    "reddit.com",
+    "researchgate.net",
+    "wikipedia.org",
+    "wordunscrambler.net",
+    "x.com",
+}
+PROFILE_ARCHIVE_HOSTS = {
+    "dblp.org",
+    "github.com",
+    "gitlab.com",
+    "huggingface.co",
+    "linkedin.com",
+    "orcid.org",
+    "scholar.google.com",
+    "semanticscholar.org",
+}
+
+
 def _fact_value(receipt: ReceiptLike, key: str) -> Any:
     for fact in receipt.key_facts:
         if isinstance(fact, dict) and key in fact:
@@ -60,6 +83,57 @@ def _domain_from_url(value: str) -> str:
     return host
 
 
+def _path_from_url(value: str) -> str:
+    return (urlparse(value).path or "").strip()
+
+
+def _domain_matches(domain: str, suffix: str) -> bool:
+    lowered = domain.lower()
+    normalized_suffix = suffix.lower()
+    return lowered == normalized_suffix or lowered.endswith(f".{normalized_suffix}")
+
+
+def _url_host_matches(host: str, domains: set[str]) -> bool:
+    return any(_domain_matches(host, domain) for domain in domains)
+
+
+def _is_officialish_host(host: str) -> bool:
+    return (
+        host.endswith(".edu")
+        or ".edu." in host
+        or host.endswith(".gov")
+        or host.startswith("ac.")
+        or ".ac." in host
+    )
+
+
+def _is_confident_identity_handle(username: str, primary_name: str) -> bool:
+    candidate = str(username or "").strip()
+    if len(candidate) < 3:
+        return False
+    if candidate.isdigit():
+        return False
+    if candidate.upper() == candidate and len(candidate) <= 6:
+        name_tokens = {token.casefold() for token in str(primary_name or "").split() if len(token) >= 3}
+        if candidate.casefold() not in name_tokens:
+            return False
+    return True
+
+
+def _is_archiveworthy_identity_url(url: str) -> bool:
+    if not url.startswith(("http://", "https://")):
+        return False
+    host = _domain_from_url(url)
+    if not host or _url_host_matches(host, LOW_VALUE_ARCHIVE_HOSTS):
+        return False
+    path = _path_from_url(url)
+    if _url_host_matches(host, PROFILE_ARCHIVE_HOSTS):
+        return path not in {"", "/"}
+    if _is_officialish_host(host):
+        return path not in {"", "/"}
+    return False
+
+
 def derive_archive_identity_follow_up_tasks(
     *,
     run_id: str,
@@ -84,7 +158,7 @@ def derive_archive_identity_follow_up_tasks(
         latest_url = str(_fact_value(receipt, "latestArchivedUrl") or "").strip()
 
         strong_url = profile_url or source_url
-        if strong_url.startswith(("http://", "https://")) and receipt.tool_name != "wayback_fetch_url":
+        if _is_archiveworthy_identity_url(strong_url) and receipt.tool_name != "wayback_fetch_url":
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -95,7 +169,8 @@ def derive_archive_identity_follow_up_tasks(
                 reason="Strong profile/source URL detected; fetch Wayback archive snapshots.",
             )
 
-        if username and receipt.tool_name != "username_permutation_search":
+        confident_handle = _is_confident_identity_handle(username, primary_name)
+        if username and confident_handle and receipt.tool_name != "username_permutation_search":
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -122,7 +197,7 @@ def derive_archive_identity_follow_up_tasks(
                 payload={"runId": run_id, "username": username},
                 priority=PRIORITY_MEDIUM,
                 reason="Username signal detected; check direct Medium author profile.",
-            )
+                )
 
         if domain:
             if primary_name:
@@ -160,7 +235,7 @@ def derive_archive_identity_follow_up_tasks(
                     priority=PRIORITY_MEDIUM,
                     reason="Substack profile/publication URL detected; resolve author and linkage signals.",
                 )
-            if host == "medium.com" and "/@" in hint_url:
+            if host == "medium.com" and "/@" in hint_url and confident_handle:
                 add_task_if_new(
                     tasks,
                     dedupe_store,
@@ -173,7 +248,7 @@ def derive_archive_identity_follow_up_tasks(
             if ("/@" in hint_url or host.endswith("mastodon.social") or host.endswith("hachyderm.io")) and host not in {
                 "medium.com",
                 "www.medium.com",
-            }:
+            } and confident_handle:
                 add_task_if_new(
                     tasks,
                     dedupe_store,
@@ -211,7 +286,7 @@ def derive_archive_identity_follow_up_tasks(
                     values = fact.get(key)
                     if isinstance(values, list):
                         for item in values:
-                            if isinstance(item, str) and item.startswith(("http://", "https://")):
+                            if isinstance(item, str) and _is_archiveworthy_identity_url(item):
                                 add_task_if_new(
                                     tasks,
                                     dedupe_store,

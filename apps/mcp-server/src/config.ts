@@ -28,6 +28,8 @@ export const cfg = {
       process.env.EMBEDDING_MODEL ??
       process.env.OPENROUTER_EMBED_MODEL ??
       "openai/text-embedding-3-small",
+    timeoutMs: Math.max(1000, Number(process.env.EMBEDDING_TIMEOUT_MS ?? "180000")),
+    queryTimeoutMs: Math.max(1000, Number(process.env.EMBEDDING_QUERY_TIMEOUT_MS ?? "60000")),
   },
 
   openrouter: {

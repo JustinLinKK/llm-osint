@@ -77,11 +77,14 @@ def test_derive_technical_follow_up_tasks_from_personal_site_linked_github() -> 
 
 
 def test_coverage_led_stop_condition_requires_identity_history_relationships_and_anchor() -> None:
-    assert not coverage_led_stop_condition({"identity": False, "history": True, "relationships": True, "code_presence": True, "academic": False, "business_roles": False})
-    assert not coverage_led_stop_condition({"identity": True, "history": False, "relationships": True, "code_presence": True, "academic": False, "business_roles": False})
-    assert not coverage_led_stop_condition({"identity": True, "history": True, "relationships": False, "code_presence": True, "academic": False, "business_roles": False})
-    assert coverage_led_stop_condition({"identity": True, "history": True, "relationships": True, "code_presence": True, "academic": False, "business_roles": False})
-    assert coverage_led_stop_condition({"identity": True, "history": True, "relationships": True, "code_presence": False, "academic": True, "business_roles": False})
+    base = {"identity": True, "aliases": True, "history": True, "contacts": True, "relationships": True}
+    assert not coverage_led_stop_condition({**base, "identity": False, "code_presence": True, "academic": False, "business_roles": False})
+    assert not coverage_led_stop_condition({**base, "history": False, "code_presence": True, "academic": False, "business_roles": False})
+    assert not coverage_led_stop_condition({**base, "relationships": False, "code_presence": True, "academic": False, "business_roles": False})
+    assert not coverage_led_stop_condition({**base, "aliases": False, "code_presence": True, "academic": False, "business_roles": False})
+    assert not coverage_led_stop_condition({**base, "contacts": False, "code_presence": True, "academic": False, "business_roles": False})
+    assert coverage_led_stop_condition({**base, "code_presence": True, "academic": False, "business_roles": False})
+    assert coverage_led_stop_condition({**base, "code_presence": False, "academic": True, "business_roles": False})
 
 
 def test_package_repository_enqueues_github_and_wayback() -> None:

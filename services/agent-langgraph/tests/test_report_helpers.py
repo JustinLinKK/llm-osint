@@ -44,9 +44,16 @@ def test_coverage_ledger_marks_complete_when_baselines_exist() -> None:
         ClaimModel(
             claim_id="c5",
             section_id="social_accounts_and_interests",
-            text="Public profile handles were identified.",
+            text="Public profile handle username ada was identified.",
             confidence=0.6,
             evidence_keys=["SOC_1"],
+        ),
+        ClaimModel(
+            claim_id="c6",
+            section_id="public_contact_methods",
+            text="A public contact email ada@example.com is listed on the profile.",
+            confidence=0.7,
+            evidence_keys=["CON_1"],
         ),
     ]
     evidence = [
@@ -55,6 +62,7 @@ def test_coverage_ledger_marks_complete_when_baselines_exist() -> None:
         EvidenceRefModel(citation_key="AC_1", section_id="academic_research", snippet="Paper with coauthor listed in DBLP.", source_url="https://dblp.org/pid/ada"),
         EvidenceRefModel(citation_key="REL_1", section_id="relationships_and_associates", snippet="Collaborator Charles Babbage listed on lab page.", source_url="https://lab.example/team"),
         EvidenceRefModel(citation_key="SOC_1", section_id="social_accounts_and_interests", snippet="GitHub profile github.com/ada.", source_url="https://github.com/ada"),
+        EvidenceRefModel(citation_key="CON_1", section_id="public_contact_methods", snippet="Contact: ada@example.com", source_url="https://example.com/contact"),
     ]
     drafts = [SectionDraftModel(section_id=claim.section_id, title=claim.section_id, content=claim.text) for claim in claims]
 
@@ -66,6 +74,7 @@ def test_coverage_ledger_marks_complete_when_baselines_exist() -> None:
     assert coverage.publications_resolved.resolved is True
     assert coverage.relationships_resolved.resolved is True
     assert coverage.handles_resolved.resolved is True
+    assert coverage.contacts_resolved.resolved is True
     assert coverage.timeline_resolved.resolved is True
     assert coverage_is_complete(coverage) is True
 
@@ -177,6 +186,7 @@ def test_build_report_memory_recovers_profile_and_publication_inventory_from_rec
         question="profile Xinyu Pi",
         report_type="person",
         primary_entities=["Xinyu Frederick Pi"],
+        noteboard=[],
         stage1_receipts=receipts,
         claims=[],
         evidence=[],
@@ -214,6 +224,40 @@ def test_assemble_final_report_accepts_long_form_llm_output() -> None:
     report = assemble_final_report(state, _FakeLLM())
 
     assert report.startswith("# Xinyu Pi")
+
+
+def test_assemble_final_report_rejects_legacy_ledger_format() -> None:
+    class _LegacyLLM:
+        def complete_json(self, prompt: str, payload: dict, temperature: float, timeout: int, **kwargs: object) -> dict:
+            return {
+                "report_text": "Findings\n- item\n\nCanonical Identity\n- item\n\nCoverage Ledger\n- item\n\nEvidence Index\n1. item"
+            }
+
+    state = {
+        "prompt": "profile Xinyu Pi",
+        "report_type": "person",
+        "primary_entities": ["Xinyu Pi"],
+        "section_drafts": [
+            SectionDraftModel(
+                section_id="identity_profile",
+                title="Core Identity and Professional Branding",
+                content="Xinyu Pi appears publicly as both Xinyu Pi and Frederick Pi [ID_1].",
+            )
+        ],
+        "claim_ledger": [],
+        "evidence_refs": [],
+        "section_issues": ["identity evidence remains partially ambiguous"],
+        "stage1_receipts": [],
+        "noteboard": [],
+        "report_memory": None,
+    }
+
+    report = assemble_final_report(state, _LegacyLLM())
+
+    assert report.startswith("Qwen Deep Research")
+    assert "## Core Identity and Professional Branding" in report
+    assert "Coverage Ledger" not in report
+    assert "Evidence Index" not in report
 
 
 def test_pack_evidence_accepts_graph_backed_rows_and_rejects_unbacked_rows() -> None:

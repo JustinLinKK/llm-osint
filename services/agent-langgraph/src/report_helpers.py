@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from openrouter_llm import OpenRouterLLM
     from tool_worker_graph import ToolReceipt
 
-from openrouter_llm import invoke_complete_json
+from openrouter_llm import get_openrouter_timeout, invoke_complete_json
 
 logger = get_logger(__name__)
 
@@ -49,6 +49,26 @@ def _env_flag(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _report_final_timeout() -> float:
+    return get_openrouter_timeout(
+        "OPENROUTER_REPORT_TIMEOUT_SECONDS",
+        get_openrouter_timeout(
+            "OPENROUTER_PLANNER_TIMEOUT_SECONDS",
+            get_openrouter_timeout("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+        ),
+    )
+
+
+def _report_worker_timeout() -> float:
+    return get_openrouter_timeout(
+        "OPENROUTER_REPORT_WORKER_TIMEOUT_SECONDS",
+        get_openrouter_timeout(
+            "OPENROUTER_WORKER_TIMEOUT_SECONDS",
+            get_openrouter_timeout("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+        ),
+    )
 
 
 def decide_report_type(prompt: str, notes: List[str]) -> str:
@@ -78,170 +98,200 @@ def decide_report_type(prompt: str, notes: List[str]) -> str:
     return "person"
 
 
+def _section_graph_profile(report_type: str, section_id: str) -> tuple[str, List[str]]:
+    if report_type == "org":
+        mapping = {
+            "org_identity": ("Identity", ["Organization", "Official Profile", "Identifiers", "Aliases"]),
+            "org_people_and_relations": ("People", ["Organization", "Role/Team", "Person", "External Relationship"]),
+            "org_presence_and_assets": ("Technical", ["Organization", "Domain/Profile", "Repository/Asset", "Topic"]),
+            "org_activity_and_history": ("Timeline", ["Organization", "TimelineEvent", "Document/Announcement", "Impact"]),
+            "org_timeline": ("Timeline", ["Organization", "TimelineEvent", "Role/Document", "Date"]),
+            "org_source_documents": ("Documents", ["Organization", "Document", "Institution/Registry", "TimelineEvent"]),
+            "org_risks_uncertainty": ("Risk", ["Organization", "Document/Issue", "TimelineEvent", "Uncertainty"]),
+            "methodological_limits": ("Limits", ["Primary Subject", "Missing Branch", "Blocked Pivot", "Why unresolved"]),
+        }
+    else:
+        mapping = {
+            "identity_profile": ("Identity", ["Person", "ContactPoint/Profile", "Handle/Domain", "Location"]),
+            "biography_history": ("Work", ["Person", "Experience/EducationalCredential", "Organization/Institution", "TimelineEvent"]),
+            "timeline_normalization": ("Timeline", ["Person", "TimelineEvent", "Experience/Affiliation/Credential", "Organization/Publication"]),
+            "academic_research": ("Research", ["Person", "Publication", "Conference/Grant/Patent", "Topic"]),
+            "code_software_footprint": ("Technical", ["Person", "Repository/Project", "Organization", "Topic"]),
+            "public_contact_methods": ("Contacts", ["Person", "ContactPoint", "Email/Phone/Profile", "Domain/Location"]),
+            "relationships_and_associates": ("People", ["Person", "Affiliation/Experience/Publication", "Person/Organization", "Why it matters"]),
+            "collaboration_clusters": ("People", ["Person", "Publication", "Coauthor Cluster", "Institution"]),
+            "source_documents": ("Documents", ["Person", "Document", "Organization/Institution", "TimelineEvent"]),
+            "social_accounts_and_interests": ("Contacts", ["Person", "Handle/Profile", "Topic/Community", "Organization"]),
+            "legal_risk_history": ("Risk", ["Person", "Document/Organization", "TimelineEvent", "Uncertainty"]),
+            "methodological_limits": ("Limits", ["Primary Subject", "Missing Branch", "Blocked Pivot", "Why unresolved"]),
+        }
+    return mapping.get(section_id, ("Other", ["Primary Subject", "Related Entity", "Evidence", "Uncertainty"]))
+
+
 def default_outline(report_type: str, primary_entities: List[str]) -> List[SectionTaskModel]:
     core_ids = primary_entities[:4]
+    def make_task(
+        *,
+        section_id: str,
+        title: str,
+        objective: str,
+        required: bool,
+        query_hints: List[str],
+    ) -> SectionTaskModel:
+        section_group, graph_chain = _section_graph_profile(report_type, section_id)
+        return SectionTaskModel(
+            section_id=section_id,
+            title=title,
+            objective=objective,
+            required=required,
+            section_group=section_group,
+            graph_chain=graph_chain,
+            entity_ids=core_ids,
+            query_hints=query_hints,
+        )
+
     if report_type == "org":
         return [
-            SectionTaskModel(
+            make_task(
                 section_id="org_identity",
                 title="Organization identity",
                 objective="Legal/brand names, aliases, ownership clues, registration and official properties.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["legal name", "registry", "about", "official website"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_people_and_relations",
                 title="People and relationships",
                 objective="Leadership, employees, partners, subsidiaries, and notable external relationships.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["founder", "CEO", "team", "partners", "subsidiary"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_presence_and_assets",
                 title="Presence and assets",
                 objective="Domains, infrastructure, social media accounts, public channels, and digital footprint.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["domain", "subdomain", "linkedin", "x.com", "github"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_activity_and_history",
                 title="Activity and history",
                 objective="Timeline of announcements, products, incidents, events, hiring, and public milestones.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["news", "press release", "launch", "timeline", "history"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_timeline",
                 title="Timeline",
                 objective="Render a dated chronology of corporate milestones, leadership changes, filings, launches, and archived changes.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["timeline", "year", "filing date", "history", "milestone"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_source_documents",
                 title="Source documents",
                 objective="Highlight official documents, filings, archived pages, PDFs, and primary-source pages that anchor the organization profile.",
                 required=False,
-                entity_ids=core_ids,
                 query_hints=["pdf", "filing", "official document", "archive", "about page"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="org_risks_uncertainty",
                 title="Risks and uncertainties",
                 objective="Conflicts, unresolved claims, legal/regulatory signals, and confidence caveats.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["lawsuit", "violation", "complaint", "controversy", "risk"],
             ),
-            SectionTaskModel(
+            make_task(
                 section_id="methodological_limits",
                 title="Methodological limits",
                 objective="State unresolved coverage gaps, blocked pivots, ambiguous identities, and why some deterministic follow-ups could not be completed.",
                 required=True,
-                entity_ids=core_ids,
                 query_hints=["limitations", "uncertainty", "not found", "ambiguous", "archive"],
             ),
         ]
     return [
-        SectionTaskModel(
+        make_task(
             section_id="identity_profile",
             title="Identity profile",
             objective="Name variants, identifiers, known aliases, demographics clues, and core biographic markers.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["full name", "alias", "bio", "about", "profile"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="biography_history",
             title="Biography and history",
             objective="Educational, academic, employment, publication, and historical milestones with dates and institutions.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["education", "academic history", "employment history", "publication", "research", "timeline"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="timeline_normalization",
             title="Timeline",
             objective="Render a chronological sequence of dated milestones across identity, education, employment, publications, archives, and business roles.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["timeline", "year", "date", "joined", "graduated", "published"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="academic_research",
             title="Academic / Research",
             objective="Resolved academic identities, ORCID/DBLP/Semantic Scholar/PubMed profiles, publication patterns, grants, patents, venues, and traceable evidence.",
             required=False,
-            entity_ids=core_ids,
             query_hints=["orcid", "semantic scholar", "dblp", "pubmed", "grant", "patent", "conference", "publication count", "evidence url"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="code_software_footprint",
             title="Code / Software Footprint",
             objective="Public GitHub and personal-site signals, repository footprint, org memberships, package/container publishing clues, and technical affiliation evidence.",
             required=False,
-            entity_ids=core_ids,
             query_hints=["github", "gitlab", "hugging face", "personal site", "repository", "npm", "pypi", "crates", "docker hub"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="public_contact_methods",
             title="Public contact methods",
             objective="Publicly available emails, phone numbers, websites, contact pages, directories, and location/contact signals.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["address", "location", "city", "email", "phone"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="relationships_and_associates",
             title="Relationships and associates",
             objective="Related people, colleagues, co-authors, advisors, employers, collaborators, and publicly visible relationship types.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["co-author", "advisor", "colleague", "works at", "lab", "department", "network"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="collaboration_clusters",
             title="Collaboration clusters",
             objective="Describe collaborator groupings, repeated coauthor clusters, labs, departments, and how those clusters relate to the primary target.",
             required=False,
-            entity_ids=core_ids,
             query_hints=["coauthor cluster", "collaboration group", "lab", "advisor", "coauthor graph"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="source_documents",
             title="Source documents",
             objective="Highlight official documents, theses, archived pages, PDFs, and primary-source records that anchor the profile.",
             required=False,
-            entity_ids=core_ids,
             query_hints=["pdf", "thesis", "dissertation", "cv", "official page", "archive"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="social_accounts_and_interests",
             title="Social accounts and interests",
             objective="Social media accounts, recurring topics, hobbies, interests, affiliations, and public behavior patterns from posts/content.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["linkedin", "x.com", "instagram", "hobby", "interest", "posts", "activity", "community"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="legal_risk_history",
             title="Legal and risk history",
             objective="Public legal, court, crime, sanction, controversy, conflict, and uncertainty signals with caveats.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["crime", "arrest", "court", "lawsuit", "controversy", "conflict", "risk", "uncertain"],
         ),
-        SectionTaskModel(
+        make_task(
             section_id="methodological_limits",
             title="Methodological limits",
             objective="State unresolved coverage gaps, ambiguous pivots, negative searches, and why specific follow-up chains were not completed.",
             required=True,
-            entity_ids=core_ids,
             query_hints=["limitations", "uncertainty", "not found", "ambiguous", "blocked"],
         ),
     ]
@@ -323,7 +373,10 @@ def graph_context_signals(mcp_client: McpClientProtocol, entity_ids: List[str]) 
 
 def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None, run_id: str | None = None) -> List[str]:
     base_queries = dedupe_str_list(
-        [task.title, task.objective, task.revision_focus, task.next_step_suggestion] + task.query_hints + task.entity_ids
+        [task.title, task.objective, task.section_group, task.revision_focus, task.next_step_suggestion, " -> ".join(task.graph_chain)]
+        + task.query_hints
+        + task.entity_ids
+        + task.graph_chain
     )
     if llm3 is None:
         return base_queries[:3]
@@ -339,7 +392,7 @@ def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None, ru
             "Generate compact OSINT retrieval query variants. Return JSON only.",
             payload,
             temperature=0.1,
-            timeout=30,
+            timeout=_report_worker_timeout(),
             run_id=run_id,
             operation="stage2.query_variants",
             metadata={"sectionId": task.section_id},
@@ -426,6 +479,50 @@ def graph_multi_entity_query(
     return list(deduped.values())
 
 
+PLACEHOLDER_EMAIL_RE = re.compile(r"error-[^@\s]+@duckduckgo\.com", re.IGNORECASE)
+
+
+def _sanitize_snippet(snippet: str) -> str:
+    text = snippet or ""
+    if not text:
+        return ""
+    text = PLACEHOLDER_EMAIL_RE.sub("[placeholder-email]", text)
+    # Filter known placeholder URLs from leaking into report citations.
+    text = text.replace("https://hi", "[invalid-url]")
+    return text
+
+
+def _looks_like_tool_invocation_json(snippet: str) -> bool:
+    compact = (snippet or "").lstrip()
+    if not compact.startswith("{"):
+        return False
+    lowered = compact[:400].lower()
+    return '"tool"' in lowered and '"arguments"' in lowered
+
+
+def _is_valid_public_source_url(url: str) -> bool:
+    candidate = (url or "").strip()
+    if not candidate.startswith(("http://", "https://")):
+        return False
+    try:
+        domain = urlparse(candidate).netloc.lower()
+    except Exception:
+        return False
+    if not domain or "." not in domain:
+        return False
+    if domain.startswith("localhost") or domain.startswith("127.0.0.1"):
+        return False
+    return True
+
+
+def _include_in_evidence_appendix(item: EvidenceRefModel) -> bool:
+    if _looks_like_tool_invocation_json(item.snippet or ""):
+        return False
+    if item.source_url:
+        return _is_valid_public_source_url(item.source_url)
+    return bool(item.document_id or item.object_ref)
+
+
 def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[EvidenceRefModel]:
     sorted_rows = sorted(
         [row for row in rows if _row_has_database_evidence(row)],
@@ -438,14 +535,24 @@ def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[E
         metadata = pick_dict(row, ["metadata", "payload"])
         if not source_url and metadata:
             source_url = pick_str(metadata, ["sourceUrl", "source_url", "url"])
-        snippet = str(row.get("snippet") or row.get("text") or "").strip()[:500]
+        snippet = _sanitize_snippet(str(row.get("snippet") or row.get("text") or "").strip()[:500])
+        if _looks_like_tool_invocation_json(snippet):
+            continue
         if not source_url:
             source_url = _first_url_in_text(snippet)
+        if source_url and not _is_valid_public_source_url(source_url):
+            source_url = None
+        document_id = str(row.get("document_id") or row.get("documentId") or "") or None
+        object_ref = pick_dict(row, ["objectRef", "object_ref"]) or pick_dict(metadata, ["objectRef", "object_ref"])
+        graph_ref = pick_dict(row, ["graph_ref"])
+        if not source_url and not document_id and not object_ref and not graph_ref:
+            # Do not cite tool receipts or internal artifacts as evidence.
+            continue
         packed.append(
             EvidenceRefModel(
                 citation_key=f"{section_id.upper()}_{idx}",
                 section_id=section_id,
-                document_id=str(row.get("document_id") or row.get("documentId") or "") or None,
+                document_id=document_id,
                 snippet=snippet,
                 source_url=source_url,
                 title=pick_str(row, ["title", "document_title", "page_title"]),
@@ -455,8 +562,8 @@ def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[E
                 source_type=_infer_source_type(row),
                 score=float(row.get("score", 0.0) or 0.0),
                 db_source=pick_str(row, ["db_source"]) or ("graph" if row.get("graph_entity_id") or row.get("graph_ref") else "vector"),
-                object_ref=pick_dict(row, ["objectRef", "object_ref"]) or pick_dict(metadata, ["objectRef", "object_ref"]),
-                graph_ref=pick_dict(row, ["graph_ref"]),
+                object_ref=object_ref,
+                graph_ref=graph_ref,
             )
         )
     return packed
@@ -491,6 +598,10 @@ def draft_section_content(
 ) -> str:
     if llm3 is None:
         lines = [f"Section: {task.title}", f"Objective: {task.objective}"]
+        if task.section_group:
+            lines.append(f"Section group: {task.section_group}")
+        if task.graph_chain:
+            lines.append(f"Graph chain: {' -> '.join(task.graph_chain)}")
         if task.revision_focus:
             lines.append(f"Revision focus: {task.revision_focus}")
         if task.next_step_suggestion:
@@ -515,7 +626,7 @@ def draft_section_content(
             REPORT_SECTION_DRAFT_SYSTEM_PROMPT,
             payload,
             temperature=0.2,
-            timeout=45,
+            timeout=_report_worker_timeout(),
             run_id=run_id,
             operation="stage2.section_draft",
             metadata={"sectionId": task.section_id},
@@ -580,7 +691,12 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
             latest_observation="",
         )
 
-    ordered = _deterministic_report_text(report_memory)
+    ordered = _benchmark_style_report_text(
+        report_memory,
+        drafts,
+        str(state.get("report_type", "person")),
+        list(state.get("section_issues", [])),
+    )
     if llm3 is None:
         return ordered
 
@@ -597,14 +713,14 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
             FINAL_REPORT_ASSEMBLY_SYSTEM_PROMPT,
             payload,
             temperature=0.2,
-            timeout=45,
+            timeout=_report_final_timeout(),
             run_id=state.get("run_id"),
             operation="stage2.final_report",
         )
         report_text = parsed.get("report_text")
         if isinstance(report_text, str) and report_text.strip():
             assembled = report_text.strip()
-            if len(assembled) >= 200 or len(drafts) <= 2:
+            if _looks_like_benchmark_report(assembled) and (len(assembled) >= 200 or len(drafts) <= 2):
                 return assembled
     except Exception:
         logger.exception("Final report assembly failed")
@@ -613,13 +729,16 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
 
 def assemble_evidence_appendix(items: List[EvidenceRefModel]) -> str:
     lines = ["Evidence Index"]
-    for index, item in enumerate(items, start=1):
+    visible = [item for item in items if _include_in_evidence_appendix(item)]
+    if not visible:
+        lines.append("1. [NO_EVIDENCE] -:- | unknown-date | - | No stable evidence refs collected.")
+        return "\n".join(lines)
+    for index, item in enumerate(visible, start=1):
         domain = item.domain or _domain_from_url(item.source_url) or "-"
         src = item.source_url or "-"
         retrieved = item.retrieved_at or "unknown-date"
-        lines.append(
-            f"{index}. [{item.citation_key}] {item.db_source}:{domain} | {retrieved} | {src} | {item.snippet[:160]}"
-        )
+        snippet = _sanitize_snippet(item.snippet or "")[:160]
+        lines.append(f"{index}. [{item.citation_key}] {item.db_source}:{domain} | {retrieved} | {src} | {snippet}")
     return "\n".join(lines)
 
 
@@ -928,77 +1047,73 @@ def contradiction_query_hints(issues: List[ConsistencyIssueModel]) -> List[str]:
     return dedupe_str_list(hints)
 
 
-def _deterministic_report_text(memory: ReportMemoryModel) -> str:
-    lines = ["Findings"]
-    if memory.claims:
-        for claim in sorted(memory.claims, key=lambda item: item.confidence, reverse=True):
-            confidence = f"{claim.confidence:.2f}"
-            refs = ", ".join(claim.evidence_keys) if claim.evidence_keys else "no-evidence"
-            lines.append(f"- [{confidence}] {claim.text} ({refs})")
+def _benchmark_style_report_text(
+    memory: ReportMemoryModel,
+    drafts: List[SectionDraftModel],
+    report_type: str,
+    section_issues: List[str],
+) -> str:
+    lines = [_benchmark_report_title(memory, report_type)]
+    if drafts:
+        for draft in drafts:
+            heading = _normalize_report_heading(draft.title)
+            content = draft.content.strip()
+            if not content:
+                continue
+            lines.append(f"## {heading}")
+            lines.append(content)
     else:
-        lines.append("- No evidence-backed findings were finalized.")
+        lines.append("## Findings")
+        lines.append("No report sections were generated from the available evidence.")
 
-    lines.append("")
-    lines.append("Canonical Identity")
-    if memory.canonical_identity.canonical_name:
-        lines.append(f"- canonical_name: {memory.canonical_identity.canonical_name}")
-        lines.append(f"- aliases: {', '.join(memory.canonical_identity.aliases) if memory.canonical_identity.aliases else '-'}")
-        lines.append(f"- low_social_footprint: {'yes' if memory.canonical_identity.low_social_footprint else 'no'}")
-        lines.append(f"- high_academic_footprint: {'yes' if memory.canonical_identity.high_academic_footprint else 'no'}")
-    else:
-        lines.append("- Canonical identity not finalized.")
-
-    lines.append("")
-    lines.append("Timeline")
-    if memory.timeline:
-        for event in memory.timeline[:10]:
-            refs = ", ".join(event.citation_keys) if event.citation_keys else "-"
-            lines.append(f"- {event.date_label}: {event.event} [{refs}]")
-    else:
-        lines.append("- No structured timeline events extracted.")
-
-    lines.append("")
-    lines.append("Publication Inventory")
-    if memory.publication_inventory:
-        for publication in memory.publication_inventory[:10]:
-            lines.append(f"- {publication.year or 'unknown'} | {publication.title} | {publication.venue or '-'}")
-    else:
-        lines.append("- No structured publication inventory extracted.")
-
-    lines.append("")
-    lines.append("Profile Index")
-    if memory.profile_index:
-        for profile in memory.profile_index[:10]:
-            lines.append(f"- {profile.platform}: {profile.url} | last_active={profile.last_active or '-'}")
-    else:
-        lines.append("- No structured profile index extracted.")
-
-    lines.append("")
-    lines.append("Coverage Ledger")
-    for name, item in memory.coverage.model_dump().items():
-        status = "yes" if item["resolved"] else "no"
-        notes = "; ".join(item["notes"]) if item["notes"] else ""
-        lines.append(f"- {name}: {status} ({item['confidence']:.2f}) {notes}".rstrip())
-
-    lines.append("")
-    lines.append("Evidence Index")
-    if memory.evidence:
-        for index, item in enumerate(memory.evidence, start=1):
-            domain = item.domain or _domain_from_url(item.source_url) or "-"
-            when = item.retrieved_at or "unknown-date"
-            why = _why_evidence_matters(item.citation_key, memory.claims)
-            lines.append(f"{index}. [{item.citation_key}] {domain} | {when} | {item.source_url or '-'} | {why}")
-    else:
-        lines.append("1. No evidence captured.")
-
-    lines.append("")
-    lines.append("Limits")
-    if memory.limits:
-        for item in memory.limits:
-            lines.append(f"- {item}")
-    else:
-        lines.append("- No explicit limits were recorded.")
+    limitations = dedupe_str_list(list(memory.limits) + list(section_issues) + list(memory.open_questions))
+    if limitations:
+        lines.append("## Synthesis of Findings and Methodological Limitations")
+        lines.append(_limitations_paragraph(limitations))
     return "\n".join(lines).strip()
+
+
+def _benchmark_report_title(memory: ReportMemoryModel, report_type: str) -> str:
+    subject = memory.canonical_identity.canonical_name or (memory.entities[0].name if memory.entities else "Target")
+    scope = "Profile"
+    if report_type == "org":
+        scope = "Organizational Profile"
+    elif memory.publication_inventory or memory.thesis_inventory:
+        scope = "Research and Public Presence Profile"
+    return f"Qwen Deep Research {scope} of {subject}"
+
+
+def _normalize_report_heading(title: str) -> str:
+    cleaned = " ".join(str(title or "").strip().split())
+    if not cleaned:
+        return "Section"
+    return cleaned.lstrip("#").strip()
+
+
+def _limitations_paragraph(items: List[str]) -> str:
+    cleaned = [item.strip().rstrip(".") for item in items if isinstance(item, str) and item.strip()]
+    if not cleaned:
+        return "This report did not surface material methodological gaps in the available public evidence."
+    summary = "; ".join(cleaned[:6])
+    return (
+        "This report is limited by the currently retrieved public evidence. "
+        f"Key remaining gaps or cautions include: {summary}."
+    )
+
+
+def _looks_like_benchmark_report(report_text: str) -> bool:
+    normalized = report_text.strip()
+    if len(normalized) < 120:
+        return False
+    legacy_markers = (
+        "\nFindings\n",
+        "\nCanonical Identity\n",
+        "\nCoverage Ledger\n",
+        "\nEvidence Index\n",
+    )
+    if any(marker in normalized for marker in legacy_markers):
+        return False
+    return normalized.startswith("Qwen Deep Research") or "\n## " in normalized
 
 
 def _why_evidence_matters(citation_key: str, claims: List[ClaimModel]) -> str:

@@ -211,11 +211,13 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     else:
         raise RuntimeError("Set EMBEDDING_API_URL for non-openrouter embedding provider")
 
+    timeout_seconds = max(1, int(os.getenv("EMBEDDING_TIMEOUT_SECONDS", "180")))
+
     response = requests.post(
         url,
         headers=headers,
         json={"model": model, "input": texts},
-        timeout=120,
+        timeout=timeout_seconds,
     )
     response.raise_for_status()
     data = response.json()

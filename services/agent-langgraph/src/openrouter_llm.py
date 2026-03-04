@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import threading
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from env import load_env
 from run_events import emit_run_event
+
+
+def get_openrouter_timeout(env_var: str, default: float) -> float:
+    raw_value = os.getenv(env_var)
+    if raw_value is None or not raw_value.strip():
+        return max(0.1, float(default))
+    try:
+        return max(0.1, float(raw_value))
+    except ValueError:
+        return max(0.1, float(default))
 
 
 class OpenRouterLLM:
@@ -20,6 +32,10 @@ class OpenRouterLLM:
         self._model = model or os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
         self._api_key = api_key
         self._base_url = "https://openrouter.ai/api/v1"
+        self._default_timeout = get_openrouter_timeout("OPENROUTER_TIMEOUT_SECONDS", 120.0)
+        self._planner_timeout = get_openrouter_timeout("OPENROUTER_PLANNER_TIMEOUT_SECONDS", self._default_timeout)
+        self._worker_timeout = get_openrouter_timeout("OPENROUTER_WORKER_TIMEOUT_SECONDS", self._default_timeout)
+        self._title_timeout = get_openrouter_timeout("OPENROUTER_TITLE_TIMEOUT_SECONDS", min(self._default_timeout, 45.0))
 
     def plan_tools(
         self,
@@ -52,7 +68,7 @@ class OpenRouterLLM:
             system,
             user,
             temperature=0.2,
-            timeout=30,
+            timeout=self._planner_timeout,
             run_id=run_id,
             operation="planner.plan_tools",
         )
@@ -86,7 +102,7 @@ class OpenRouterLLM:
             system_prompt,
             user,
             temperature=0.1,
-            timeout=30,
+            timeout=self._worker_timeout,
             run_id=run_id,
             operation=f"tool.refine_arguments.{tool_name}",
         )
@@ -101,11 +117,12 @@ class OpenRouterLLM:
         system_prompt: str,
         user_payload: Dict[str, Any],
         temperature: float = 0.1,
-        timeout: int = 30,
+        timeout: float | None = None,
         run_id: Optional[str] = None,
         operation: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        timeout = self._default_timeout if timeout is None else max(0.1, float(timeout))
         if run_id:
             emit_run_event(
                 run_id,
@@ -127,17 +144,7 @@ class OpenRouterLLM:
         }
 
         try:
-            response = requests.post(
-                f"{self._base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
-                },
-                data=json.dumps(payload),
-                timeout=timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
+            data = self._post_json_with_wall_clock_timeout(payload, timeout)
             content = (
                 data.get("choices", [{}])[0]
                 .get("message", {})
@@ -174,6 +181,40 @@ class OpenRouterLLM:
                 )
             raise
 
+    def _post_json_with_wall_clock_timeout(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        connect_timeout = min(10.0, timeout)
+
+        def _request() -> None:
+            try:
+                response = requests.post(
+                    f"{self._base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self._api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=(connect_timeout, timeout),
+                )
+                response.raise_for_status()
+                result_queue.put((True, response.json()))
+            except Exception as exc:
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=_request, name="openrouter-request", daemon=True)
+        thread.start()
+
+        try:
+            ok, value = result_queue.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise requests.exceptions.Timeout(
+                f"OpenRouter wall-clock timeout after {timeout} seconds"
+            ) from exc
+
+        if ok:
+            return value if isinstance(value, dict) else {}
+        raise value
+
     def generate_run_title(self, prompt: str, inputs: List[str]) -> str | None:
         system = (
             "You generate concise investigation titles. "
@@ -185,7 +226,7 @@ class OpenRouterLLM:
             "inputs": inputs[:8],
         }
 
-        parsed = self.complete_json(system, user, temperature=0.2, timeout=30)
+        parsed = self.complete_json(system, user, temperature=0.2, timeout=self._title_timeout)
 
         title = parsed.get("title") if isinstance(parsed, dict) else None
         if not isinstance(title, str):
@@ -202,7 +243,7 @@ def invoke_complete_json(
     user_payload: Dict[str, Any],
     *,
     temperature: float,
-    timeout: int,
+    timeout: float,
     **kwargs: Any,
 ) -> Dict[str, Any]:
     try:

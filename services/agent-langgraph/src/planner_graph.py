@@ -18,7 +18,7 @@ from target_normalization import extract_person_targets, normalize_person_candid
 from tool_worker_graph import ToolReceipt, run_tool_worker, tool_argument_signature
 from logger import get_logger
 from env import load_env
-from orchestrator.rules.academic_rules import PRIORITY_HIGH, add_task_if_new, derive_academic_follow_up_tasks, prune_dedupe_store
+from orchestrator.rules.academic_rules import PRIORITY_HIGH, PRIORITY_MEDIUM, add_task_if_new, derive_academic_follow_up_tasks, prune_dedupe_store
 from orchestrator.rules.archive_identity_rules import derive_archive_identity_follow_up_tasks
 from orchestrator.rules.business_rules import derive_business_follow_up_tasks
 from orchestrator.rules.relationship_rules import derive_relationship_follow_up_tasks
@@ -41,16 +41,23 @@ STAGE1_MAX_RELATED_PERSON_EXPANSIONS = max(
 STAGE1_MAX_RELATED_ORG_EXPANSIONS = max(
     1, int(os.getenv("STAGE1_MAX_RELATED_ORG_EXPANSIONS", "2"))
 )
+STAGE1_MAX_RELATED_TOPIC_EXPANSIONS = max(
+    1, int(os.getenv("STAGE1_MAX_RELATED_TOPIC_EXPANSIONS", "3"))
+)
 STAGE1_RELATED_ENTITY_MIN_SCORE = max(
     1, int(os.getenv("STAGE1_RELATED_ENTITY_MIN_SCORE", "2"))
 )
 STAGE1_MIN_ITERATIONS = max(
     1, int(os.getenv("STAGE1_MIN_ITERATIONS", "2"))
 )
+SOURCE_FOLLOW_UP_MAX_TASKS = max(
+    1, int(os.getenv("STAGE1_SOURCE_FOLLOW_UP_MAX_TASKS", "6"))
+)
 
 URL_REGEX = re.compile(r"https?://[^\s\]]+")
 EMAIL_REGEX = re.compile(
     r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+PLACEHOLDER_EMAIL_REGEX = re.compile(r"^error-[^@]*@duckduckgo\.com$", re.IGNORECASE)
 DOMAIN_REGEX = re.compile(
     r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
 USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,32})")
@@ -88,6 +95,59 @@ DERIVED_DOMAIN_RECON_BLOCKLIST = {
     "twitter.com",
     "x.com",
 }
+HIGH_SIGNAL_SOURCE_HOSTS = {
+    "aclanthology.org",
+    "arxiv.org",
+    "dblp.org",
+    "escholarship.org",
+    "openreview.net",
+    "orcid.org",
+    "semanticscholar.org",
+}
+LOW_SIGNAL_SOURCE_HOSTS = {
+    "alltogether.swe.org",
+    "bls.gov",
+    "duckduckgo.com",
+    "github.com",
+    "google.com",
+    "googleusercontent.com",
+    "html.duckduckgo.com",
+    "kaggle.com",
+    "linkedin.com",
+    "medium.com",
+    "reddit.com",
+    "researchgate.net",
+    "wikipedia.org",
+    "x.com",
+}
+SOURCE_FOLLOW_UP_BLOCKLIST_HOSTS = {
+    "duckduckgo.com",
+    "google.com",
+    "googleusercontent.com",
+    "html.duckduckgo.com",
+    "linkedin.com",
+    "medium.com",
+    "reddit.com",
+    "researchgate.net",
+    "webcache.allorigins.win",
+    "wikipedia.org",
+    "wordunscrambler.net",
+    "x.com",
+}
+OFFICIAL_PAGE_PATH_HINTS = (
+    "/about",
+    "/about-us",
+    "/company",
+    "/contact",
+    "/faculty",
+    "/lab",
+    "/leadership",
+    "/people",
+    "/person",
+    "/research",
+    "/staff",
+    "/team",
+)
 AUTO_GRAPH_ENTITY_LIMIT = 50
 PERSON_CANDIDATE_STOPWORDS = {
     "please",
@@ -123,6 +183,62 @@ PERSON_CANDIDATE_BREAKWORDS = {
     "find",
     "look",
     "into",
+}
+RELATED_TOPIC_STOPWORDS = {
+    "about",
+    "company",
+    "contact",
+    "department",
+    "education",
+    "evidence",
+    "general",
+    "history",
+    "institution",
+    "lab",
+    "organization",
+    "paper",
+    "papers",
+    "people",
+    "profile",
+    "publication",
+    "publications",
+    "public records",
+    "records",
+    "research",
+    "result",
+    "results",
+    "school",
+    "source",
+    "sources",
+    "staff",
+    "target",
+    "team",
+    "topic",
+    "topics",
+    "university",
+    "website",
+}
+RELATED_TOPIC_SINGLE_TOKEN_STOPWORDS = {
+    "analysis",
+    "business",
+    "company",
+    "data",
+    "education",
+    "engineering",
+    "history",
+    "management",
+    "people",
+    "profile",
+    "publication",
+    "publications",
+    "research",
+    "science",
+    "staff",
+    "systems",
+    "team",
+    "technology",
+    "topic",
+    "topics",
 }
 
 
@@ -837,6 +953,12 @@ def build_planner_graph(
             for target_name in primary_person_targets[:3]:
                 has_tavily_research = _receipt_has_value(state, "tavily_research", {"input": target_name})
                 has_tavily_search = _receipt_has_value(state, "tavily_person_search", {"targetName": target_name})
+                github_query = _tavily_github_query(target_name)
+                has_tavily_github_search = _receipt_has_argument_signature(
+                    state,
+                    "tavily_person_search",
+                    {"target_name": target_name, "query": github_query, "max_results": 5},
+                )
                 if not _receipt_has_argument_signature(state, "alias_variant_generator", {"person_name": target_name}):
                     plan.append(
                         ToolPlanItem(
@@ -869,6 +991,19 @@ def build_planner_graph(
                             rationale=f"Use Tavily search as the broad discovery layer for biography, history, contact, and relationship clues for: {target_name}",
                         )
                     )
+                if not has_tavily_github_search:
+                    plan.append(
+                        ToolPlanItem(
+                            tool="tavily_person_search",
+                            arguments={
+                                "runId": state["run_id"],
+                                "target_name": target_name,
+                                "query": github_query,
+                                "max_results": 5,
+                            },
+                            rationale=f"Use Tavily search to discover GitHub account/profile evidence before repo-native GitHub resolution for: {target_name}",
+                        )
+                    )
                 if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
                     plan.append(
                         ToolPlanItem(
@@ -885,7 +1020,7 @@ def build_planner_graph(
                             rationale=f"Run broad person search to collect corroborating public profiles, history, and contact signals for: {target_name}",
                         )
                     )
-                if not _receipt_has_argument_signature(state, "github_identity_search", {"person_name": target_name}):
+                if has_tavily_github_search and not _receipt_has_argument_signature(state, "github_identity_search", {"person_name": target_name}):
                     plan.append(
                         ToolPlanItem(
                             tool="github_identity_search",
@@ -935,6 +1070,12 @@ def build_planner_graph(
             for target_name in related_person_targets[:4]:
                 has_tavily_research = _receipt_has_value(state, "tavily_research", {"input": target_name})
                 has_tavily_search = _receipt_has_value(state, "tavily_person_search", {"targetName": target_name})
+                github_query = _tavily_github_query(target_name)
+                has_tavily_github_search = _receipt_has_argument_signature(
+                    state,
+                    "tavily_person_search",
+                    {"target_name": target_name, "query": github_query, "max_results": 5},
+                )
                 if not has_tavily_research:
                     plan.append(
                         ToolPlanItem(
@@ -949,6 +1090,19 @@ def build_planner_graph(
                             tool="tavily_person_search",
                             arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
                             rationale=f"Expand related-person coverage using Tavily search for discovered person: {target_name}",
+                        )
+                    )
+                if not has_tavily_github_search:
+                    plan.append(
+                        ToolPlanItem(
+                            tool="tavily_person_search",
+                            arguments={
+                                "runId": state["run_id"],
+                                "target_name": target_name,
+                                "query": github_query,
+                                "max_results": 5,
+                            },
+                            rationale=f"Discover GitHub account/profile evidence for related person before repo-native GitHub resolution: {target_name}",
                         )
                     )
                 if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
@@ -1023,6 +1177,25 @@ def build_planner_graph(
                     )
 
             for username in usernames[:6]:
+                github_query = _tavily_github_query(username)
+                has_tavily_github_search = _receipt_has_argument_signature(
+                    state,
+                    "tavily_person_search",
+                    {"target_name": username, "query": github_query, "max_results": 5},
+                )
+                if not has_tavily_github_search:
+                    plan.append(
+                        ToolPlanItem(
+                            tool="tavily_person_search",
+                            arguments={
+                                "runId": state["run_id"],
+                                "target_name": username,
+                                "query": github_query,
+                                "max_results": 5,
+                            },
+                            rationale=f"Use Tavily search to check whether username pivot maps to a GitHub account before repo-native GitHub resolution: {username}",
+                        )
+                    )
                 if not _receipt_has_argument_signature(state, "username_permutation_search", {"username": username}):
                     plan.append(
                         ToolPlanItem(
@@ -1031,7 +1204,7 @@ def build_planner_graph(
                             rationale=f"Check direct cross-platform URL permutations for discovered username pivot: {username}",
                         )
                     )
-                if not _receipt_has_argument_signature(state, "github_identity_search", {"username": username}):
+                if has_tavily_github_search and not _receipt_has_argument_signature(state, "github_identity_search", {"username": username}):
                     plan.append(
                         ToolPlanItem(
                             tool="github_identity_search",
@@ -1100,6 +1273,7 @@ def build_planner_graph(
 
         plan = _dedupe_tool_plan(plan)
         plan = _filter_completed_tool_plan(state, plan)
+        plan = _prioritize_tool_plan(state, plan)
         uncapped_count = len(plan)
         if len(plan) > STAGE1_MAX_TOOLS_PER_ITERATION:
             plan = plan[:STAGE1_MAX_TOOLS_PER_ITERATION]
@@ -1235,6 +1409,9 @@ def build_planner_graph(
                 source_url = _extract_fetch_receipt_url(receipt)
                 if source_url:
                     visited_urls.append(source_url)
+                    source_host = _domain_from_url(source_url)
+                    if source_host:
+                        allowed_hosts.append(source_host)
             for hint in receipt.next_hints:
                 discovered = _normalize_crawl_url(hint)
                 if discovered:
@@ -1443,6 +1620,33 @@ def build_planner_graph(
             )
         _extend_noteboard_items(noteboard_sections, "gaps", consistency_notes)
 
+        source_follow_up_tasks, archive_identity_task_dedupe, source_follow_up_notes = _derive_source_follow_up_tasks(
+            run_id=state["run_id"],
+            receipts=all_receipts,
+            primary_person_targets=primary_person_targets,
+            iteration=state.get("iteration", 0),
+            dedupe_store=archive_identity_task_dedupe,
+        )
+        if source_follow_up_tasks:
+            queued_tasks.extend(
+                [
+                    {
+                        "tool_name": task.tool_name,
+                        "payload": task.payload,
+                        "priority": task.priority,
+                        "reason": task.reason,
+                        "dedupe_key": task.dedupe_key,
+                    }
+                    for task in source_follow_up_tasks
+                ]
+            )
+            _append_noteboard_item(
+                noteboard_sections,
+                "follow_ups",
+                f"Queued {len(source_follow_up_tasks)} source-level follow-up task(s)."
+            )
+        _extend_noteboard_items(noteboard_sections, "gaps", source_follow_up_notes)
+
         related_entity_candidates = _rank_related_entity_candidates(
             receipts=all_receipts,
             primary_person_targets=primary_person_targets,
@@ -1451,6 +1655,7 @@ def build_planner_graph(
             run_id=state["run_id"],
             receipts=all_receipts,
             candidates=related_entity_candidates,
+            primary_person_targets=primary_person_targets,
             iteration=state.get("iteration", 0),
             dedupe_store=depth_task_dedupe,
         )
@@ -1501,6 +1706,7 @@ def build_planner_graph(
             "pending_urls": pending_urls,
             "current_fetch_urls": [],
             "visited_urls": visited_urls,
+            "allowed_hosts": _dedupe(allowed_hosts),
             "queued_tasks": queued_tasks,
             "related_entity_candidates": related_entity_candidates,
             "academic_task_dedupe": academic_task_dedupe,
@@ -1523,6 +1729,13 @@ def build_planner_graph(
         existing_gap_lines = [item for item in noteboard_sections.get("gaps", []) if not item.startswith("Coverage scorecard ")]
         noteboard_sections["gaps"] = existing_gap_lines[-7:]
         _append_noteboard_item(noteboard_sections, "gaps", scorecard)
+
+        hard_anchor_ok, hard_anchor_note = _hard_anchor_gate(state)
+        if not hard_anchor_ok:
+            coverage_ok = False
+            if hard_anchor_note:
+                _append_noteboard_item(noteboard_sections, "gaps", hard_anchor_note)
+
         min_iterations_reached = iteration >= min(
             state.get("max_iterations", 1),
             STAGE1_MIN_ITERATIONS,
@@ -1664,6 +1877,13 @@ def _extract_emails(text: str) -> List[str]:
     return EMAIL_REGEX.findall(text or "")
 
 
+def _is_placeholder_email(email: str) -> bool:
+    candidate = (email or "").strip()
+    if not candidate:
+        return False
+    return bool(PLACEHOLDER_EMAIL_REGEX.fullmatch(candidate))
+
+
 def _extract_domains(text: str) -> List[str]:
     return DOMAIN_REGEX.findall(text or "")
 
@@ -1680,6 +1900,13 @@ def _extract_phone_numbers(text: str) -> List[str]:
         if normalized and any(ch in normalized for ch in " +-.()") and not _looks_like_dateish_phone_candidate(normalized):
             numbers.append(normalized)
     return numbers
+
+
+def _tavily_github_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return "Find the public GitHub profile or account for this target."
+    return f"Find the public GitHub profile, account, or repositories associated with {normalized}.".strip()
 
 
 def _looks_like_dateish_phone_candidate(value: str) -> bool:
@@ -1748,7 +1975,10 @@ def _extract_emails_from_state(state: PlannerState) -> List[str]:
     emails: List[str] = []
     combined = _state_text_corpus(state)
     for item in combined:
-        emails.extend(_extract_emails(item))
+        for email in _extract_emails(item):
+            if _is_placeholder_email(email):
+                continue
+            emails.append(email)
     return _dedupe(emails)
 
 
@@ -1837,6 +2067,9 @@ def _extract_related_person_targets_from_receipts(state: PlannerState) -> List[s
         "colleagues",
         "mentors",
         "labMembers",
+        "officers",
+        "staff",
+        "overlaps",
     }
     for receipt in state.get("tool_receipts", []):
         for fact in receipt.key_facts:
@@ -1845,12 +2078,7 @@ def _extract_related_person_targets_from_receipts(state: PlannerState) -> List[s
             for key, value in fact.items():
                 if key not in interesting_keys:
                     continue
-                if isinstance(value, str):
-                    candidates.extend(extract_person_targets(value))
-                elif isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, str):
-                            candidates.extend(extract_person_targets(item))
+                candidates.extend(_extract_person_targets_from_mixed_value(value))
     return _dedupe(candidates)
 
 
@@ -1871,6 +2099,11 @@ def _extract_related_org_targets_from_receipts(receipts: List[ToolReceipt]) -> L
         "school",
         "departments",
         "staff",
+        "companyName",
+        "roles",
+        "directorships",
+        "overlaps",
+        "sharedOrganizations",
     }
     for receipt in receipts:
         for fact in receipt.key_facts:
@@ -1893,7 +2126,18 @@ def _extract_org_names_from_value(value: Any) -> List[str]:
         for item in value:
             names.extend(_extract_org_names_from_value(item))
     elif isinstance(value, dict):
-        for key in ("name", "organization", "institution", "company", "lab", "school", "department", "employer"):
+        for key in (
+            "name",
+            "organization",
+            "institution",
+            "company",
+            "company_name",
+            "companyName",
+            "lab",
+            "school",
+            "department",
+            "employer",
+        ):
             candidate = value.get(key)
             if isinstance(candidate, str):
                 normalized = _normalize_related_org_name(candidate)
@@ -1905,6 +2149,8 @@ def _extract_org_names_from_value(value: Any) -> List[str]:
                 normalized = _normalize_related_org_name(candidate)
                 if normalized:
                     names.append(normalized)
+        for key in ("companies", "organizations", "sharedOrganizations"):
+            names.extend(_extract_org_names_from_value(value.get(key)))
     return _dedupe(names)
 
 
@@ -1938,6 +2184,70 @@ def _normalize_related_org_name(value: str) -> str | None:
     if not any(marker in lowered for marker in org_markers) and len(candidate.split()) < 2:
         return None
     return candidate
+
+
+def _normalize_related_topic_name(value: str) -> str | None:
+    candidate = " ".join(str(value or "").strip().split()).strip(" -,:;|")
+    if len(candidate) < 3 or len(candidate) > 120:
+        return None
+    lowered = candidate.casefold()
+    if lowered in PERSON_CANDIDATE_STOPWORDS or lowered in RELATED_TOPIC_STOPWORDS:
+        return None
+    if candidate.startswith(("http://", "https://")) or "@" in candidate:
+        return None
+    if DOMAIN_REGEX.fullmatch(candidate):
+        return None
+    if candidate.count(" ") >= 7:
+        return None
+    topic_code = re.fullmatch(r"[a-z]{2}\.[A-Za-z][A-Za-z0-9-]{1,12}", candidate)
+    if topic_code:
+        return candidate
+    tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.+#/-]*", candidate)
+    if not tokens:
+        return None
+    if len(tokens) == 1 and tokens[0].casefold() in RELATED_TOPIC_SINGLE_TOKEN_STOPWORDS:
+        return None
+    if tokens[-1].casefold() in {"he", "her", "hers", "him", "his", "she", "they", "them"}:
+        return None
+    return candidate
+
+
+def _extract_topic_targets_from_mixed_value(value: Any) -> List[str]:
+    candidates: List[str] = []
+    if isinstance(value, str):
+        normalized = _normalize_related_topic_name(value)
+        if normalized:
+            candidates.append(normalized)
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_extract_topic_targets_from_mixed_value(item))
+    elif isinstance(value, dict):
+        for key in (
+            "topic",
+            "topics",
+            "keyword",
+            "keywords",
+            "field",
+            "fields",
+            "field_keywords",
+            "research_area",
+            "research_areas",
+            "research_interest",
+            "research_interests",
+            "focus",
+            "focus_values",
+            "industry",
+            "specialization",
+            "specializations",
+            "subject",
+            "subjects",
+            "skills",
+            "methods_keywords",
+            "abstract_keywords",
+            "categories",
+        ):
+            candidates.extend(_extract_topic_targets_from_mixed_value(value.get(key)))
+    return _dedupe(candidates)
 
 
 def _rank_related_entity_candidates(
@@ -1975,6 +2285,9 @@ def _rank_related_entity_candidates(
         "colleagues": "COLLEAGUE_OF",
         "mentors": "MENTORED_BY",
         "labMembers": "MEMBER_OF_LAB_WITH",
+        "officers": "OFFICER_OF",
+        "staff": "WORKS_AT",
+        "overlaps": "DIRECTOR_OF",
     }
     org_keys = {
         "organizations": "AFFILIATED_WITH",
@@ -1990,7 +2303,52 @@ def _rank_related_entity_candidates(
         "schools": "ATTENDED",
         "school": "ATTENDED",
         "departments": "MEMBER_OF_DEPARTMENT",
+        "companyName": "RELATED_TO_COMPANY",
+        "roles": "OFFICER_OF",
+        "directorships": "DIRECTOR_OF",
+        "overlaps": "DIRECTOR_OF",
+        "sharedOrganizations": "AFFILIATED_WITH",
     }
+    topic_keys = {
+        "topics": "HAS_TOPIC",
+        "research_interests": "RESEARCHES",
+        "field_keywords": "RESEARCHES",
+        "research_areas": "RESEARCHES",
+        "focus": "FOCUSES_ON",
+        "industry": "FOCUSES_ON",
+        "skills": "HAS_TOPIC",
+        "publications": "HAS_TOPIC",
+        "papers": "HAS_TOPIC",
+        "records": "HAS_TOPIC",
+        "candidates": "RESEARCHES",
+        "organizations": "FOCUSES_ON",
+        "roles": "HAS_TOPIC",
+    }
+
+    def _attach_urls(candidate: Dict[str, Any], value: Any) -> None:
+        urls = _extract_urls_from_value(value)
+        if not urls:
+            return
+        candidate["urls"] = _dedupe(candidate["urls"] + urls[:6])
+        domains = [domain for domain in (_domain_from_url(url) for url in urls) if domain]
+        if domains:
+            candidate["domains"] = _dedupe(candidate["domains"] + domains[:6])
+
+    def _register_candidate(
+        *,
+        name: str,
+        entity_type: str,
+        rel_type: str,
+        receipt: ToolReceipt,
+        value: Any,
+        score: int,
+    ) -> None:
+        candidate = ensure_candidate(name, entity_type)
+        candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
+        candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
+        candidate["mention_count"] += 1
+        candidate["score"] += score
+        _attach_urls(candidate, value)
 
     for receipt in receipts:
         if not receipt.ok:
@@ -2001,23 +2359,50 @@ def _rank_related_entity_candidates(
             for key, rel_type in person_keys.items():
                 if key not in fact:
                     continue
-                for name in _extract_person_targets_from_mixed_value(fact.get(key)):
-                    if name.casefold() in primary_people:
-                        continue
-                    candidate = ensure_candidate(name, "person")
-                    candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
-                    candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
-                    candidate["mention_count"] += 1
-                    candidate["score"] += 2 if key in {"coauthors", "advisor", "advisors", "collaborators"} else 1
+                values = fact.get(key)
+                items = values if isinstance(values, list) else [values]
+                for item in items:
+                    for name in _extract_person_targets_from_mixed_value(item):
+                        if name.casefold() in primary_people:
+                            continue
+                        _register_candidate(
+                            name=name,
+                            entity_type="person",
+                            rel_type=rel_type,
+                            receipt=receipt,
+                            value=item,
+                            score=2 if key in {"coauthors", "advisor", "advisors", "collaborators", "officers", "staff"} else 1,
+                        )
             for key, rel_type in org_keys.items():
                 if key not in fact:
                     continue
-                for name in _extract_org_names_from_value(fact.get(key)):
-                    candidate = ensure_candidate(name, "organization")
-                    candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
-                    candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
-                    candidate["mention_count"] += 1
-                    candidate["score"] += 2 if key in {"companies", "company", "labs", "lab", "institution", "institutions"} else 1
+                values = fact.get(key)
+                items = values if isinstance(values, list) else [values]
+                for item in items:
+                    for name in _extract_org_names_from_value(item):
+                        _register_candidate(
+                            name=name,
+                            entity_type="organization",
+                            rel_type=rel_type,
+                            receipt=receipt,
+                            value=item,
+                            score=2 if key in {"companies", "company", "labs", "lab", "institution", "institutions", "roles", "directorships", "companyName"} else 1,
+                        )
+            for key, rel_type in topic_keys.items():
+                if key not in fact:
+                    continue
+                values = fact.get(key)
+                items = values if isinstance(values, list) else [values]
+                for item in items:
+                    for name in _extract_topic_targets_from_mixed_value(item):
+                        _register_candidate(
+                            name=name,
+                            entity_type="topic",
+                            rel_type=rel_type,
+                            receipt=receipt,
+                            value=item,
+                            score=2 if key in {"topics", "research_interests", "field_keywords", "research_areas", "publications", "papers", "candidates"} else 1,
+                        )
             for url in _fact_urls(fact):
                 domain = _domain_from_url(url)
                 if not domain:
@@ -2032,6 +2417,7 @@ def _rank_related_entity_candidates(
     ranked.sort(key=lambda item: (int(item.get("score", 0)), int(item.get("mention_count", 0)), item.get("entity_name", "")), reverse=True)
     org_count = 0
     person_count = 0
+    topic_count = 0
     limited: List[Dict[str, Any]] = []
     for item in ranked:
         if item["entity_type"] == "organization":
@@ -2042,6 +2428,10 @@ def _rank_related_entity_candidates(
             if person_count >= STAGE1_MAX_RELATED_PERSON_EXPANSIONS:
                 continue
             person_count += 1
+        elif item["entity_type"] == "topic":
+            if topic_count >= STAGE1_MAX_RELATED_TOPIC_EXPANSIONS:
+                continue
+            topic_count += 1
         limited.append(item)
     return limited
 
@@ -2054,7 +2444,17 @@ def _extract_person_targets_from_mixed_value(value: Any) -> List[str]:
         for item in value:
             candidates.extend(_extract_person_targets_from_mixed_value(item))
     elif isinstance(value, dict):
-        for key in ("name", "person", "author", "advisor", "colleague", "collaborator", "displayName"):
+        for key in (
+            "name",
+            "person",
+            "person_name",
+            "author",
+            "advisor",
+            "colleague",
+            "collaborator",
+            "director_name",
+            "displayName",
+        ):
             item = value.get(key)
             if isinstance(item, str):
                 candidates.extend(extract_person_targets(item))
@@ -2148,7 +2548,7 @@ def _planner_has_minimum_person_coverage(state: PlannerState) -> bool:
     person_targets = _extract_person_targets_from_state(state)
     notes_blob = " ".join(_state_text_corpus(state)).lower()
     relationship_signal = len(person_targets) > len(primary_targets) or any(
-        marker in notes_blob for marker in ("co-author", "coauthor", "advisor", "colleague", "collaborator", "works at")
+        marker in notes_blob for marker in ("co-author", "coauthor", "advisor", "colleague", "collaborator", "works at", "officer", "director", "founder", "board member")
     )
     history_signal = any(
         marker in notes_blob for marker in (
@@ -2169,6 +2569,68 @@ def _planner_has_minimum_person_coverage(state: PlannerState) -> bool:
     )
     contact_signal = bool(emails or phones or _extract_linkedin_profiles_from_state(state))
     return history_signal and relationship_signal and contact_signal
+
+
+def _hard_anchor_gate(state: PlannerState) -> tuple[bool, str]:
+    # Enforce benchmark-like hard anchors for academic/researcher targets.
+    # This prevents Stage 1 from stopping after collecting only low-signal receipts
+    # (e.g., a LinkedIn snapshot + Wayback lookup).
+    primary_targets = _extract_primary_person_targets(state)
+    if not primary_targets:
+        return True, ""
+
+    notes_blob = " ".join(_state_text_corpus(state)).lower()
+    looks_academic = bool(
+        re.search(
+            r"\b(arxiv|openreview|semanticscholar|semantic scholar|dblp|orcid|paper|preprint|publication|phd|university|thesis|dissertation)\b",
+            notes_blob,
+        )
+    )
+    if not looks_academic:
+        return True, ""
+
+    stable_profile_domains = ("openreview.net", "orcid.org", "semanticscholar.org", "dblp.org", "scholar.google")
+    has_stable_profile = any(domain in notes_blob for domain in stable_profile_domains)
+    if not has_stable_profile:
+        for receipt in state.get("tool_receipts", []):
+            if receipt.ok and receipt.tool_name in {"semantic_scholar_search", "orcid_search", "dblp_author_search"}:
+                has_stable_profile = True
+                break
+
+    has_institutional_email = False
+    for email in _extract_emails_from_state(state):
+        _, _, domain = email.rpartition("@")
+        lowered_domain = domain.lower()
+        if lowered_domain.endswith(".edu") or lowered_domain.startswith("ac.") or ".edu." in lowered_domain or "ac." in lowered_domain:
+            has_institutional_email = True
+            break
+
+    has_official_pdf = False
+    for text in _state_text_corpus(state):
+        for url in _extract_urls(text):
+            if ".pdf" not in url.lower():
+                continue
+            host = _domain_from_url(url) or ""
+            lowered = host.lower()
+            if lowered == "escholarship.org" or lowered.endswith(".edu") or ".edu." in lowered:
+                has_official_pdf = True
+                break
+        if has_official_pdf:
+            break
+
+    has_arxiv_pdf_attempt = any(
+        receipt.ok and receipt.tool_name == "arxiv_search_and_download" for receipt in state.get("tool_receipts", [])
+    )
+
+    missing: List[str] = []
+    if not has_stable_profile:
+        missing.append("stable academic profile ID (OpenReview/ORCID/Semantic Scholar/DBLP/Scholar)")
+    if not (has_institutional_email or has_official_pdf or has_arxiv_pdf_attempt):
+        missing.append("institutional email pivot or official PDF anchor (or arXiv PDF attempt)")
+
+    if missing:
+        return False, "Hard-anchor gating (academic): missing " + " and ".join(missing) + "."
+    return True, ""
 
 
 def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
@@ -2256,9 +2718,9 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
                 ledger["identity"] = True
             if any(key in fact for key in ("aliases", "alias_variants", "handles", "usernames", "matchedProfiles")):
                 ledger["aliases"] = True
-            if any(key in fact for key in ("emails", "phones", "contactSignals", "profileUrls", "patterns")):
+            if any(key in fact for key in ("emails", "phones", "contactSignals", "patterns")):
                 ledger["contacts"] = True
-            if any(key in fact for key in ("relatedPeople", "coauthors", "organizations", "staff", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses")):
+            if any(key in fact for key in ("relatedPeople", "coauthors", "organizations", "staff", "officers", "roles", "directorships", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses")):
                 ledger["relationships"] = True
             if "organizations" in fact and isinstance(fact.get("organizations"), list) and fact.get("organizations"):
                 ledger["technical_org_affiliations"] = True
@@ -2280,7 +2742,9 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
         ledger["relationships"] = True
     if any(token in notes_blob for token in ("publication", "research", "history", "worked at", "joined", "former", "education", "university")):
         ledger["history"] = True
-        if any(token in notes_blob for token in ("orcid", "semantic scholar", "dblp", "google scholar", "arxiv", "pubmed")):
+        # Only promote "academic_profile" when we see stable academic identifiers (URLs/IDs),
+        # not just the presence of generic keywords like "arxiv".
+        if re.search(r"(orcid\.org/|openreview\.net/|semanticscholar\.org/|dblp\.org/|scholar\.google\.)", notes_blob):
             ledger["academic_profile"] = True
     if any(token in notes_blob for token in ("github profile", "github username", "repository", "repositories", "code identity")):
         ledger["code_presence"] = True
@@ -2374,8 +2838,8 @@ def _receipt_has_relationship_signal(receipt: ToolReceipt) -> bool:
     for fact in receipt.key_facts:
         if not isinstance(fact, dict):
             continue
-        if any(key in fact for key in ("relatedPeople", "coauthors", "organizations", "staff", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses")):
-            value = next((fact.get(key) for key in ("relatedPeople", "coauthors", "organizations", "staff", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses") if key in fact), None)
+        if any(key in fact for key in ("relatedPeople", "coauthors", "organizations", "staff", "officers", "roles", "directorships", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses")):
+            value = next((fact.get(key) for key in ("relatedPeople", "coauthors", "organizations", "staff", "officers", "roles", "directorships", "overlaps", "sharedDomains", "sharedOrganizations", "sharedAddresses") if key in fact), None)
             if isinstance(value, list) and value:
                 return True
     return False
@@ -2394,6 +2858,249 @@ def _receipt_reports_no_arxiv_results(receipt: ToolReceipt) -> bool:
 def _receipt_reports_no_relationships(receipt: ToolReceipt) -> bool:
     summary = receipt.summary.lower()
     return "no collaborators" in summary or "did not reveal any collaborators" in summary or "no coauthor" in summary
+
+
+def _extract_urls_from_value(value: Any) -> List[str]:
+    urls: List[str] = []
+    if isinstance(value, str):
+        urls.extend(_extract_urls(value))
+    elif isinstance(value, list):
+        for item in value:
+            urls.extend(_extract_urls_from_value(item))
+    elif isinstance(value, dict):
+        for item in value.values():
+            urls.extend(_extract_urls_from_value(item))
+    return _dedupe(urls)
+
+
+def _receipt_source_urls(receipt: ToolReceipt) -> List[str]:
+    urls: List[str] = []
+    for fact in receipt.key_facts:
+        if isinstance(fact, dict):
+            urls.extend(_extract_urls_from_value(fact))
+    for hint in receipt.next_hints:
+        if isinstance(hint, str) and hint.startswith(("http://", "https://")):
+            urls.append(hint)
+    normalized: List[str] = []
+    for url in urls:
+        cleaned = _normalize_crawl_url(url)
+        if cleaned:
+            normalized.append(cleaned)
+    return _dedupe(normalized)
+
+
+def _url_host_matches(host: str, domains: set[str]) -> bool:
+    return any(_domain_matches(host, domain) for domain in domains)
+
+
+def _source_follow_up_score(url: str) -> int:
+    host = (_domain_from_url(url) or "").lower()
+    parsed = urlparse(url)
+    path = (parsed.path or "").lower()
+    if not host:
+        return -100
+    if host == "web.archive.org":
+        return -100
+
+    score = 10
+    if _url_host_matches(host, LOW_SIGNAL_SOURCE_HOSTS):
+        score -= 60
+    else:
+        score += 20
+
+    if _url_host_matches(host, HIGH_SIGNAL_SOURCE_HOSTS):
+        score += 90
+
+    if path.endswith(".pdf"):
+        score += 80
+
+    if host.endswith(".edu") or ".edu." in host or host.endswith(".gov") or host.startswith("ac.") or ".ac." in host:
+        score += 70
+
+    if path in {"", "/"}:
+        score += 25
+
+    if any(path == hint or path.startswith(f"{hint}/") for hint in OFFICIAL_PAGE_PATH_HINTS):
+        score += 40
+
+    return score
+
+
+def _focus_terms(primary_person_targets: List[str]) -> List[str]:
+    terms: List[str] = []
+    for target in primary_person_targets:
+        for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9'.-]*", str(target or "")):
+            normalized = token.strip("._-'").casefold()
+            if len(normalized) < 3:
+                continue
+            if normalized in PERSON_CANDIDATE_STOPWORDS:
+                continue
+            terms.append(normalized)
+    return _dedupe(terms)
+
+
+def _is_officialish_host(host: str) -> bool:
+    normalized = _normalize_host(host)
+    return (
+        normalized.endswith(".edu")
+        or ".edu." in normalized
+        or normalized.endswith(".gov")
+        or normalized.startswith("ac.")
+        or ".ac." in normalized
+    )
+
+
+def _url_contains_focus_term(url: str, focus_terms: List[str]) -> bool:
+    if not focus_terms:
+        return False
+    lowered = url.casefold()
+    return any(term in lowered for term in focus_terms)
+
+
+def _path_has_official_hint(path: str) -> bool:
+    lowered = path.casefold()
+    return any(lowered == hint or lowered.startswith(f"{hint}/") for hint in OFFICIAL_PAGE_PATH_HINTS)
+
+
+def _should_follow_source_url(url: str, primary_person_targets: List[str]) -> bool:
+    host = _normalize_host(_domain_from_url(url) or "")
+    if not host:
+        return False
+    if _url_host_matches(host, SOURCE_FOLLOW_UP_BLOCKLIST_HOSTS):
+        return False
+
+    parsed = urlparse(url)
+    path = (parsed.path or "").strip()
+    lowered_path = path.casefold()
+
+    if lowered_path.endswith(".pdf"):
+        return True
+    if _url_host_matches(host, HIGH_SIGNAL_SOURCE_HOSTS):
+        return True
+
+    focus_terms = _focus_terms(primary_person_targets)
+    if _url_contains_focus_term(url, focus_terms):
+        return True
+
+    if _is_officialish_host(host):
+        if _path_has_official_hint(lowered_path):
+            return True
+        if path and path not in {"", "/"}:
+            return True
+
+    return False
+
+
+def _derive_source_follow_up_tasks(
+    *,
+    run_id: str,
+    receipts: List[ToolReceipt],
+    primary_person_targets: List[str],
+    iteration: int,
+    dedupe_store: Dict[str, int],
+):
+    dedupe_store = prune_dedupe_store(dedupe_store, iteration)
+    tasks: List[Any] = []
+    notes: List[str] = []
+    primary_name = primary_person_targets[:1][0] if primary_person_targets else ""
+
+    source_receipts = {
+        "tavily_research",
+        "tavily_person_search",
+        "google_serp_person_search",
+        "person_search",
+        "orcid_search",
+        "semantic_scholar_search",
+        "dblp_author_search",
+        "pubmed_author_search",
+        "conference_profile_search",
+        "grant_search_person",
+        "open_corporates_search",
+        "company_filing_search",
+        "company_officer_search",
+        "sec_person_search",
+        "director_disclosure_search",
+        "domain_whois_search",
+    }
+
+    ranked_candidates: List[tuple[int, str, Dict[str, Any], int, str]] = []
+    for receipt in receipts:
+        if not receipt.ok or receipt.tool_name not in source_receipts:
+            continue
+        for url in _receipt_source_urls(receipt):
+            if not _should_follow_source_url(url, primary_person_targets):
+                continue
+            score = _source_follow_up_score(url)
+            if score < 50:
+                continue
+            lowered = url.lower()
+            if _domain_matches(_domain_from_url(url) or "", "arxiv.org") and ("/abs/" in lowered or "/pdf/" in lowered):
+                payload: Dict[str, Any] = {"runId": run_id}
+                if lowered.endswith(".pdf") or "/pdf/" in lowered:
+                    payload["pdf_url"] = url
+                else:
+                    payload["paper_url"] = url
+                if primary_name:
+                    payload["author_hint"] = primary_name
+                ranked_candidates.append(
+                    (
+                        score + 20,
+                        "arxiv_paper_ingest",
+                        payload,
+                        PRIORITY_HIGH,
+                        f"Source expansion: ingest cited arXiv paper for full PDF/coauthor/affiliation extraction: {url}",
+                    )
+                )
+                continue
+            priority = PRIORITY_HIGH if score >= 100 else PRIORITY_MEDIUM
+            ranked_candidates.append(
+                (
+                    score,
+                    "fetch_url",
+                    {"runId": run_id, "url": url},
+                    priority,
+                    f"Source expansion: fetch cited official/company/institutional source for direct evidence and same-host crawl expansion: {url}",
+                )
+            )
+
+    ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+    selected_candidates: List[tuple[int, str, Dict[str, Any], int, str]] = []
+    seen_hosts: set[str] = set()
+    for candidate in ranked_candidates:
+        _, tool_name, payload, _, _ = candidate
+        candidate_url = ""
+        if tool_name == "fetch_url":
+            candidate_url = str(payload.get("url") or "")
+        elif tool_name == "arxiv_paper_ingest":
+            candidate_url = str(payload.get("pdf_url") or payload.get("paper_url") or "")
+        host = _normalize_host(_domain_from_url(candidate_url) or "")
+        if host and host in seen_hosts:
+            continue
+        if host:
+            seen_hosts.add(host)
+        selected_candidates.append(candidate)
+        if len(selected_candidates) >= SOURCE_FOLLOW_UP_MAX_TASKS:
+            break
+
+    for _, tool_name, payload, priority, reason in selected_candidates:
+        before = len(tasks)
+        add_task_if_new(
+            tasks,
+            dedupe_store,
+            iteration,
+            tool_name=tool_name,
+            payload=payload,
+            priority=priority,
+            reason=reason,
+        )
+        if len(tasks) > before:
+            notes.append(reason)
+
+    if tasks:
+        return tasks, dedupe_store, [
+            "High-signal cited sources remain unfetched or unexpanded; continuing source-level follow-up before Stage 2."
+        ]
+    return tasks, dedupe_store, notes
 
 
 def _derive_consistency_follow_up_tasks(
@@ -2547,20 +3254,32 @@ def _derive_related_entity_expansion_follow_up_tasks(
     run_id: str,
     receipts: List[ToolReceipt],
     candidates: List[Dict[str, Any]],
+    primary_person_targets: List[str],
     iteration: int,
     dedupe_store: Dict[str, int],
 ):
     dedupe_store = prune_dedupe_store(dedupe_store, iteration)
     tasks = []
     notes: List[str] = []
+    primary_name = primary_person_targets[:1][0] if primary_person_targets else ""
     for candidate in candidates:
         entity_name = str(candidate.get("entity_name") or "").strip()
         entity_type = str(candidate.get("entity_type") or "").strip()
         if not entity_name or not entity_type:
             continue
+        relationship_types = {str(item).strip() for item in candidate.get("relationship_types", []) if str(item).strip()}
         if _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
             continue
         if entity_type == "person":
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="tavily_person_search",
+                payload={"runId": run_id, "target_name": entity_name, "query": _tavily_github_query(entity_name), "max_results": 5},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: discover GitHub account/profile evidence for related person {entity_name} before repo-native code identity resolution.",
+            )
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -2588,6 +3307,26 @@ def _derive_related_entity_expansion_follow_up_tasks(
                 priority=PRIORITY_HIGH,
                 reason=f"Depth expansion: resolve technical/public profile context for related person {entity_name}.",
             )
+            if relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH", "ADVISED_BY", "COLLABORATED_WITH", "MENTORED_BY"}:
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="semantic_scholar_search",
+                    payload={"runId": run_id, "person_name": entity_name, "max_results": 8},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: collect publication, topic, and affiliation history for scholarly related person {entity_name}.",
+                )
+            if relationship_types & {"FOUNDED", "OFFICER_OF", "DIRECTOR_OF"}:
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="company_officer_search",
+                    payload={"runId": run_id, "person_name": entity_name, "max_results": 8},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: resolve broader company-role history for management-related person {entity_name}.",
+                )
         elif entity_type == "organization":
             add_task_if_new(
                 tasks,
@@ -2627,6 +3366,15 @@ def _derive_related_entity_expansion_follow_up_tasks(
                     priority=PRIORITY_HIGH,
                     reason=f"Depth expansion: extract public team/contact pages for related organization {entity_name}.",
                 )
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="org_staff_page_search",
+                    payload={"runId": run_id, "org_url": f"https://{domain}", "org_name": entity_name},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: extract staff, management, and researcher names from related organization {entity_name}.",
+                )
             elif candidate.get("urls"):
                 url = str(candidate["urls"][0]).strip()
                 add_task_if_new(
@@ -2637,6 +3385,36 @@ def _derive_related_entity_expansion_follow_up_tasks(
                     payload={"runId": run_id, "site_url": url},
                     priority=PRIORITY_HIGH,
                     reason=f"Depth expansion: extract public profile/contact coverage for related organization {entity_name}.",
+                )
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="org_staff_page_search",
+                    payload={"runId": run_id, "org_url": url, "org_name": entity_name},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: extract staff, management, and researcher names from related organization {entity_name}.",
+                )
+        elif entity_type == "topic":
+            topic_query = f"{primary_name} {entity_name}".strip() if primary_name else f"{entity_name} researchers organizations companies"
+            add_task_if_new(
+                tasks,
+                dedupe_store,
+                iteration,
+                tool_name="tavily_research",
+                payload={"runId": run_id, "input": topic_query, "timeout_seconds": 180},
+                priority=PRIORITY_HIGH,
+                reason=f"Depth expansion: investigate how topic {entity_name} connects back to people, organizations, and publications in scope.",
+            )
+            if primary_name:
+                add_task_if_new(
+                    tasks,
+                    dedupe_store,
+                    iteration,
+                    tool_name="arxiv_search_and_download",
+                    payload={"runId": run_id, "author": primary_name, "topic": entity_name, "max_results": 6},
+                    priority=PRIORITY_HIGH,
+                    reason=f"Depth expansion: download target-adjacent papers for topic {entity_name} to extract coauthors, affiliations, and technical detail.",
                 )
         relationship_blob = ", ".join(candidate.get("relationship_types", []))
         notes.append(
@@ -2656,6 +3434,8 @@ def _related_entity_has_depth_investigation(receipts: List[ToolReceipt], entity_
         "orcid_search",
         "semantic_scholar_search",
         "dblp_author_search",
+        "company_officer_search",
+        "sec_person_search",
     }
     deep_org_tools = {
         "tavily_research",
@@ -2666,14 +3446,56 @@ def _related_entity_has_depth_investigation(receipts: List[ToolReceipt], entity_
         "org_staff_page_search",
         "wayback_fetch_url",
     }
-    target_tools = deep_person_tools if entity_type == "person" else deep_org_tools
+    deep_topic_tools = {
+        "tavily_research",
+        "arxiv_search_and_download",
+        "arxiv_paper_ingest",
+    }
+    strong_person_tools = {
+        "person_search",
+        "github_identity_search",
+        "gitlab_identity_search",
+        "orcid_search",
+        "semantic_scholar_search",
+        "dblp_author_search",
+        "company_officer_search",
+        "sec_person_search",
+    }
+    strong_org_tools = {
+        "domain_whois_search",
+        "contact_page_extractor",
+        "org_staff_page_search",
+        "wayback_fetch_url",
+    }
+    supporting_org_tools = {
+        "open_corporates_search",
+        "domain_whois_search",
+        "contact_page_extractor",
+        "org_staff_page_search",
+        "wayback_fetch_url",
+    }
+    strong_topic_tools = {
+        "arxiv_search_and_download",
+        "arxiv_paper_ingest",
+    }
+    if entity_type == "person":
+        target_tools = deep_person_tools
+    elif entity_type == "organization":
+        target_tools = deep_org_tools
+    else:
+        target_tools = deep_topic_tools
     expected = entity_name.casefold()
+    matched_tools: set[str] = set()
     for receipt in receipts:
         if not receipt.ok or receipt.tool_name not in target_tools:
             continue
         if _receipt_targets_name(receipt, expected):
-            return True
-    return False
+            matched_tools.add(receipt.tool_name)
+    if entity_type == "person":
+        return bool(matched_tools & strong_person_tools) or len(matched_tools) >= 2
+    if entity_type == "organization":
+        return bool(matched_tools & strong_org_tools) or len(matched_tools & supporting_org_tools) >= 2
+    return bool(matched_tools & strong_topic_tools) or len(matched_tools) >= 2
 
 
 def _receipt_targets_name(receipt: ToolReceipt, expected_casefold: str) -> bool:
@@ -2954,6 +3776,104 @@ def _dedupe_tool_plan(plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
             continue
         deduped[existing_index] = _merge_tool_plan_items(deduped[existing_index], item)
     return deduped
+
+
+def _queued_task_priorities(state: PlannerState) -> Dict[str, int]:
+    priorities: Dict[str, int] = {}
+    for task in state.get("queued_tasks", []):
+        tool_name = task.get("tool_name")
+        payload = task.get("payload")
+        if not isinstance(tool_name, str) or not isinstance(payload, dict):
+            continue
+        signature = tool_argument_signature(tool_name, payload)
+        value = int(task.get("priority", 0) or 0)
+        priorities[signature] = max(priorities.get(signature, 0), value)
+    return priorities
+
+
+def _plan_item_priority(state: PlannerState, item: ToolPlanItem) -> int:
+    # Prefer coverage-led, high-signal "hard anchor" tools over low-signal baselines.
+    ledger = state.get("coverage_ledger") or empty_coverage_ledger()
+    gaps = {key: not bool(ledger.get(key, False)) for key in ledger}
+
+    notes_blob = " ".join(_state_text_corpus(state)).lower()
+    has_primary_person_targets = bool(_extract_primary_person_targets(state))
+    looks_academic = bool(
+        re.search(
+            r"\b(arxiv|openreview|semanticscholar|semantic scholar|dblp|orcid|paper|preprint|publication|phd|university|thesis|dissertation)\b",
+            notes_blob,
+        )
+    )
+
+    tool_name = item.tool
+    base = {
+        # Academic anchors (boosted only when the target looks academic/researcher-like).
+        "arxiv_search_and_download": 60,
+        "semantic_scholar_search": 58,
+        "orcid_search": 55,
+        "dblp_author_search": 54,
+        "conference_profile_search": 50,
+        # Broad discovery
+        "tavily_research": 90,
+        "tavily_person_search": 88,
+        "person_search": 75,
+        "google_serp_person_search": 70,
+        # Primary profiles / identity anchors
+        "linkedin_download_html_ocr": 72,
+        "github_identity_search": 70,
+        "institution_directory_search": 68,
+        # Relationships (often missing in early runs)
+        "coauthor_graph_search": 66,
+        # Archives (useful, but not a substitute for academic anchors)
+        "wayback_fetch_url": 55,
+        "wayback_domain_timeline_search": 50,
+        # Low-signal baselines that can crowd out anchor collection
+        "sanctions_watchlist_search": 25,
+        "osint_amass_domain": 20,
+        "osint_sublist3r_domain": 18,
+        "osint_whatweb_target": 18,
+        "x_get_user_posts_api": 18,
+        "reddit_user_search": 16,
+        "medium_author_search": 16,
+        "osint_maigret_username": 15,
+    }.get(tool_name, 40)
+
+    if tool_name == "tavily_person_search":
+        query = str((item.arguments or {}).get("query") or "").strip().lower()
+        if "github.com" in query:
+            base += 8
+
+    signature = tool_argument_signature(tool_name, item.arguments or {})
+    queued_priority = _queued_task_priorities(state).get(signature)
+    if queued_priority is not None:
+        # Deterministic follow-ups already have an external priority signal; keep them near the top.
+        base += 150 + int(queued_priority)
+
+    if has_primary_person_targets:
+        if tool_name in {"osint_amass_domain", "osint_sublist3r_domain", "osint_whatweb_target"}:
+            base -= 10
+
+    if looks_academic:
+        if tool_name in {"arxiv_search_and_download", "semantic_scholar_search", "orcid_search", "dblp_author_search"}:
+            base += 70
+    if gaps.get("aliases", False) and tool_name in {"alias_variant_generator"}:
+        base += 25
+    if gaps.get("contacts", False) and tool_name in {"arxiv_search_and_download", "institution_directory_search", "contact_page_extractor"}:
+        base += 15
+    if gaps.get("relationships", False) and tool_name in {"coauthor_graph_search", "org_staff_page_search", "shared_contact_pivot_search"}:
+        base += 15
+    if gaps.get("history", False) and tool_name in {"tavily_research", "person_search"}:
+        base += 10
+
+    return base
+
+
+def _prioritize_tool_plan(state: PlannerState, plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
+    if len(plan) <= 1:
+        return plan
+    indexed = list(enumerate(plan))
+    indexed.sort(key=lambda item: (-_plan_item_priority(state, item[1]), item[0]))
+    return [item for _, item in indexed]
 
 
 def _tool_plan_dedupe_key(tool_name: str, arguments: Dict[str, Any]) -> str:

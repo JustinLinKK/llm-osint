@@ -83,6 +83,46 @@ type GraphEdge = {
   properties?: Record<string, unknown>;
 };
 
+type GraphPayload = {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  graphRoot?: {
+    nodeId: string;
+    display?: string | null;
+    recommendedLayout?: string;
+    recommendedEgoDepth?: number;
+  } | null;
+};
+
+type GraphGroupName =
+  | "Contacts"
+  | "Education"
+  | "Work"
+  | "Languages"
+  | "Organizations"
+  | "People"
+  | "Research"
+  | "Technical"
+  | "Timeline"
+  | "Documents"
+  | "Risk"
+  | "Other";
+
+const GRAPH_GROUP_ORDER: GraphGroupName[] = [
+  "Contacts",
+  "Education",
+  "Work",
+  "Languages",
+  "Organizations",
+  "People",
+  "Research",
+  "Technical",
+  "Timeline",
+  "Documents",
+  "Risk",
+  "Other"
+];
+
 type ReportPayload = {
   reportId: string;
   runId: string;
@@ -258,6 +298,12 @@ function graphNodeType(node: GraphNode): string {
   return node.labels[0] || "Entity";
 }
 
+function graphNodeAttributes(node: GraphNode): string[] {
+  const raw = node.properties?.attributes;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((value) => String(value ?? "").trim()).filter(Boolean);
+}
+
 function stableGraphColor(label: string): string {
   const key = label.trim().toLowerCase();
   if (!key) return "#9ca3af";
@@ -276,6 +322,77 @@ function uniqueSorted(values: Iterable<string>): string[] {
   return Array.from(new Set(Array.from(values).map((value) => value.trim()).filter(Boolean))).sort((a, b) =>
     a.localeCompare(b)
   );
+}
+
+function classifyGraphGroup(node: GraphNode, rootNodeId: string): GraphGroupName {
+  if (node.id === rootNodeId) return "Other";
+  const type = graphNodeType(node);
+  const blob = [node.display, ...graphNodeAttributes(node)].join(" | ").toLowerCase();
+
+  if (["ContactPoint", "Email", "Phone", "Handle", "Website", "Domain", "ImageObject", "Location"].includes(type)) {
+    return "Contacts";
+  }
+  if (type === "EducationalCredential") return "Education";
+  if (["Experience", "Role", "Occupation"].includes(type)) return "Work";
+  if (type === "Language") return "Languages";
+  if (type === "Affiliation") {
+    return /university|college|school|degree|student|phd|education|credential/.test(blob) ? "Education" : "Organizations";
+  }
+  if (["Organization", "Institution", "OrganizationProfile"].includes(type)) {
+    if (/university|college|school|degree|student|phd|education|credential/.test(blob)) return "Education";
+    return "Organizations";
+  }
+  if (type === "Person") return "People";
+  if (["Publication", "Conference", "Award", "Grant", "Patent"].includes(type)) return "Research";
+  if (["Repository", "Project", "Topic"].includes(type)) return "Technical";
+  if (type === "TimelineEvent") return "Timeline";
+  if (type === "Document") return "Documents";
+  if (/risk|lawsuit|court|conflict|uncertain|sanction/.test(blob)) return "Risk";
+  return "Other";
+}
+
+function groupedPresetPositions(
+  rootNodeId: string,
+  visibleNodeIds: string[],
+  groupMembers: Map<GraphGroupName, string[]>
+): Map<string, { x: number; y: number }> {
+  const positions = new Map<string, { x: number; y: number }>();
+  positions.set(rootNodeId, { x: 0, y: 0 });
+
+  const activeGroups = GRAPH_GROUP_ORDER.filter((group) => (groupMembers.get(group)?.length ?? 0) > 0);
+  if (!activeGroups.length) return positions;
+
+  const groupRadius = Math.max(230, 170 + activeGroups.length * 22);
+  const memberBaseRadius = groupRadius + 170;
+  const sectorSpan = (2 * Math.PI) / Math.max(activeGroups.length, 1);
+
+  for (const [groupIndex, group] of activeGroups.entries()) {
+    const groupNodeId = `__group__:${group}`;
+    const centerAngle = -Math.PI / 2 + sectorSpan * groupIndex;
+    positions.set(groupNodeId, {
+      x: Math.cos(centerAngle) * groupRadius,
+      y: Math.sin(centerAngle) * groupRadius
+    });
+
+    const members = (groupMembers.get(group) ?? []).filter((nodeId) => visibleNodeIds.includes(nodeId));
+    const sectorWidth = Math.min(sectorSpan * 0.76, Math.PI / 2.6);
+    const perRing = 6;
+    for (const [memberIndex, nodeId] of members.entries()) {
+      const ring = Math.floor(memberIndex / perRing);
+      const indexInRing = memberIndex % perRing;
+      const remaining = members.length - ring * perRing;
+      const countInRing = Math.min(perRing, remaining);
+      const ratio = countInRing <= 1 ? 0.5 : indexInRing / (countInRing - 1);
+      const angle = centerAngle - sectorWidth / 2 + sectorWidth * ratio;
+      const radius = memberBaseRadius + ring * 120;
+      positions.set(nodeId, {
+        x: Math.cos(angle) * radius,
+        y: Math.sin(angle) * radius
+      });
+    }
+  }
+
+  return positions;
 }
 
 function buildAdjacency(edges: GraphEdge[]): Map<string, Set<string>> {
@@ -336,6 +453,35 @@ function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<
       }
     },
     {
+      selector: "node[isRoot = 1]",
+      style: {
+        "border-width": 3,
+        "border-color": "#0f172a",
+        "font-size": 12,
+        "font-weight": 700,
+        width: 72,
+        height: 72,
+        "z-index": 2
+      }
+    },
+    {
+      selector: "node[isGroup = 1]",
+      style: {
+        shape: "round-rectangle",
+        "background-opacity": 0.22,
+        "border-width": 2.2,
+        "border-color": "#334155",
+        "font-size": 13,
+        "font-weight": 700,
+        width: 110,
+        height: 42,
+        color: "#0f172a",
+        "text-valign": "center",
+        "text-halign": "center",
+        "z-index": 1
+      }
+    },
+    {
       selector: "edge",
       style: {
         "curve-style": "bezier",
@@ -344,6 +490,23 @@ function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<
         "target-arrow-shape": "triangle",
         "arrow-scale": 0.8,
         width: 1.4
+      }
+    },
+    {
+      selector: "edge[isGroupEdge = 1]",
+      style: {
+        "line-style": "dashed",
+        "target-arrow-shape": "none",
+        "line-color": "#64748b",
+        width: 2,
+        opacity: 0.6
+      }
+    },
+    {
+      selector: "edge[isRootSpoke = 1]",
+      style: {
+        opacity: 0.38,
+        width: 1
       }
     }
   ];
@@ -405,7 +568,7 @@ export default function App() {
   const [selectedGraphNodeTypes, setSelectedGraphNodeTypes] = useState<string[]>([]);
   const [selectedGraphRelTypes, setSelectedGraphRelTypes] = useState<string[]>([]);
   const [graphMinDegree, setGraphMinDegree] = useState(0);
-  const [graphNodeLimit, setGraphNodeLimit] = useState(25);
+  const [graphNodeLimit, setGraphNodeLimit] = useState(60);
   const [graphEgoNode, setGraphEgoNode] = useState("");
   const [graphEgoDepth, setGraphEgoDepth] = useState(1);
   const [graphLayoutName, setGraphLayoutName] = useState("cose");
@@ -454,7 +617,7 @@ export default function App() {
     setSelectedGraphNodeTypes([]);
     setSelectedGraphRelTypes([]);
     setGraphMinDegree(0);
-    setGraphNodeLimit(25);
+    setGraphNodeLimit(60);
     setGraphEgoNode("");
     setGraphEgoDepth(1);
     setGraphLayoutName("cose");
@@ -464,7 +627,7 @@ export default function App() {
 
   useEffect(() => {
     setGraphNodeLimit((current) => {
-      const nextDefault = Math.min(250, graphLimitMax);
+      const nextDefault = Math.min(80, graphLimitMax);
       if (current < graphLimitMin) return nextDefault;
       if (current > graphLimitMax) return graphLimitMax;
       return current;
@@ -538,22 +701,66 @@ export default function App() {
       connectedNodes.add(edge.target);
     }
     const finalNodeIds = new Set([...limitedNodes, ...connectedNodes]);
+    const hasGraphRoot = Boolean(graphEgoNode && finalNodeIds.has(graphEgoNode));
+    const rootNodeId = hasGraphRoot ? graphEgoNode : "";
+    const groupedMode = graphLayoutName === "grouped" && hasGraphRoot;
+    const sortedNodeIds = Array.from(finalNodeIds).sort((left, right) =>
+      (graphNodeMap.get(left)?.display ?? left).localeCompare(graphNodeMap.get(right)?.display ?? right)
+    );
 
-    const elements: ElementDefinition[] = Array.from(finalNodeIds)
-      .sort((left, right) => (graphNodeMap.get(left)?.display ?? left).localeCompare(graphNodeMap.get(right)?.display ?? right))
-      .map((nodeId) => {
+    const groupMembers = new Map<GraphGroupName, string[]>();
+    if (groupedMode && rootNodeId) {
+      for (const nodeId of sortedNodeIds) {
+        if (nodeId === rootNodeId) continue;
         const node = graphNodeMap.get(nodeId);
-        const nodeType = node ? graphNodeType(node) : "Entity";
-        return {
+        if (!node) continue;
+        const group = classifyGraphGroup(node, rootNodeId);
+        const members = groupMembers.get(group) ?? [];
+        members.push(nodeId);
+        groupMembers.set(group, members);
+      }
+    }
+
+    const activeGroups = GRAPH_GROUP_ORDER.filter((group) => (groupMembers.get(group)?.length ?? 0) > 0);
+    const groupedPositions =
+      groupedMode && rootNodeId ? groupedPresetPositions(rootNodeId, sortedNodeIds, groupMembers) : new Map<string, { x: number; y: number }>();
+
+    const elements: ElementDefinition[] = sortedNodeIds.map((nodeId) => {
+      const node = graphNodeMap.get(nodeId);
+      const nodeType = node ? graphNodeType(node) : "Entity";
+      const data = {
+        id: nodeId,
+        label: node?.display ?? nodeId,
+        type: nodeType,
+        degree: graphDegreeByNode.get(nodeId) ?? 0,
+        color: stableGraphColor(nodeType),
+        isRoot: rootNodeId && nodeId === rootNodeId ? 1 : 0,
+        isGroup: 0,
+        groupName: groupedMode && node ? classifyGraphGroup(node, rootNodeId) : ""
+      };
+      const position = groupedPositions.get(nodeId);
+      return position ? { data, position } : { data };
+    });
+
+    if (groupedMode) {
+      for (const group of activeGroups) {
+        const groupNodeId = `__group__:${group}`;
+        const position = groupedPositions.get(groupNodeId);
+        elements.push({
           data: {
-            id: nodeId,
-            label: node?.display ?? nodeId,
-            type: nodeType,
-            degree: graphDegreeByNode.get(nodeId) ?? 0,
-            color: stableGraphColor(nodeType)
-          }
-        };
-      });
+            id: groupNodeId,
+            label: group,
+            type: "Group",
+            degree: (groupMembers.get(group)?.length ?? 0) + 1,
+            color: stableGraphColor(group),
+            isRoot: 0,
+            isGroup: 1,
+            groupName: group
+          },
+          ...(position ? { position } : {})
+        });
+      }
+    }
 
     for (const edge of filteredEdges) {
       elements.push({
@@ -562,26 +769,72 @@ export default function App() {
           source: edge.source,
           target: edge.target,
           label: edge.display ?? graphRelType(edge),
-          rel_type: graphRelType(edge)
+          rel_type: graphRelType(edge),
+          isGroupEdge: 0,
+          isRootSpoke: rootNodeId && (edge.source === rootNodeId || edge.target === rootNodeId) ? 1 : 0
         }
       });
     }
 
-    const layout: Record<string, unknown> = { name: graphLayoutName || "cose", animate: false };
-    if (graphLayoutName === "breadthfirst" && graphEgoNode && finalNodeIds.has(graphEgoNode)) {
-      layout.roots = `#${graphEgoNode}`;
+    if (groupedMode && rootNodeId) {
+      for (const group of activeGroups) {
+        const groupNodeId = `__group__:${group}`;
+        elements.push({
+          data: {
+            id: `__group_edge__:${rootNodeId}:${group}`,
+            source: rootNodeId,
+            target: groupNodeId,
+            label: group,
+            rel_type: "GROUPS",
+            isGroupEdge: 1,
+            isRootSpoke: 0
+          }
+        });
+      }
     }
 
-    let warning = "";
-    if (!finalNodeIds.size) warning = "No nodes match current filters.";
-    else if (candidateNodes.size > graphNodeLimit) warning = `Filtered node set truncated by node limit: ${graphNodeLimit}.`;
+    const layout: Record<string, unknown> = {
+      name:
+        groupedMode && rootNodeId
+          ? "preset"
+          : graphLayoutName === "radial"
+            ? hasGraphRoot
+              ? "breadthfirst"
+              : "concentric"
+            : graphLayoutName || "cose",
+      animate: false,
+      fit: true,
+      padding: 40
+    };
+    if (groupedMode && rootNodeId) {
+      layout.padding = 72;
+    } else if (graphLayoutName === "radial" && hasGraphRoot) {
+      layout.roots = `#${graphEgoNode}`;
+      layout.circle = true;
+      layout.directed = true;
+      layout.avoidOverlap = true;
+      layout.avoidOverlapPadding = 18;
+      layout.spacingFactor = finalNodeIds.size > 40 ? 1.15 : 1.35;
+      layout.padding = 56;
+    } else if (graphLayoutName === "breadthfirst" && hasGraphRoot) {
+      layout.roots = `#${graphEgoNode}`;
+      layout.directed = true;
+      layout.spacingFactor = 1.1;
+    }
+
+    const warnings: string[] = [];
+    if (!finalNodeIds.size) warnings.push("No nodes match current filters.");
+    else if (candidateNodes.size > graphNodeLimit) warnings.push(`Filtered node set truncated by node limit: ${graphNodeLimit}.`);
+    if (graphLayoutName === "grouped" && !hasGraphRoot) warnings.push("Grouped layout requires a root/ego node.");
 
     return {
       elements,
       layout,
       stylesheet: makeGraphStylesheet(showGraphEdgeLabels, graphMaxDegree),
-      stats: `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`,
-      warning
+      stats: groupedMode
+        ? `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges with ${activeGroups.length} visual groups (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`
+        : `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`,
+      warning: warnings.join(" ")
     };
   }, [
     graphAdjacency,
@@ -787,10 +1040,15 @@ export default function App() {
           `${API_BASE}/runs/${selectedRunId}/graph?nodeLimit=200&nodeOffset=0&edgeLimit=300&edgeOffset=0`
         );
         if (!res.ok) throw new Error("Failed to load graph");
-        const payload = (await res.json()) as { nodes: GraphNode[]; edges: GraphEdge[] };
+        const payload = (await res.json()) as GraphPayload;
         if (!disposed) {
           setGraphNodes(payload.nodes ?? []);
           setGraphEdges(payload.edges ?? []);
+          if (payload.graphRoot?.nodeId) {
+            setGraphEgoNode(payload.graphRoot.nodeId);
+            setGraphEgoDepth(payload.graphRoot.recommendedEgoDepth ?? 2);
+            setGraphLayoutName(payload.graphRoot.recommendedLayout ?? "radial");
+          }
         }
       } catch (error) {
         if (!disposed) setErrorMessage(error instanceof Error ? error.message : "Failed to load graph");
@@ -1459,9 +1717,11 @@ export default function App() {
                                     onChange={(event) => setGraphLayoutName(event.target.value)}
                                     className="w-full rounded-lg border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-cyan-50"
                                   >
+                                    <option value="grouped">Grouped Root</option>
+                                    <option value="radial">Radial Root</option>
                                     <option value="cose">COSE (force-directed)</option>
                                     <option value="concentric">Concentric</option>
-                                    <option value="breadthfirst">Breadthfirst</option>
+                                    <option value="breadthfirst">Breadthfirst Tree</option>
                                     <option value="circle">Circle</option>
                                     <option value="grid">Grid</option>
                                   </select>
@@ -1510,6 +1770,18 @@ export default function App() {
                                       cy.on("tap", "node", (event: EventObject) => {
                                         const nodeId = event.target.id();
                                         const node = graphNodeMap.get(nodeId);
+                                        if (event.target.data("isGroup") === 1) {
+                                          setGraphSelectionText(
+                                            formatSelectionPayload({
+                                              element: "group",
+                                              id: nodeId,
+                                              label: event.target.data("label"),
+                                              groupName: event.target.data("groupName"),
+                                              memberCount: Math.max(0, Number(event.target.data("degree") || 0) - 1)
+                                            })
+                                          );
+                                          return;
+                                        }
                                         setGraphSelectionText(
                                           formatSelectionPayload({
                                             element: "node",
@@ -1524,6 +1796,20 @@ export default function App() {
                                       cy.on("tap", "edge", (event: EventObject) => {
                                         const edgeId = event.target.id();
                                         const edge = sanitizedGraphEdges.find((item) => item.id === edgeId);
+                                        if (event.target.data("isGroupEdge") === 1 || !edge) {
+                                          setGraphSelectionText(
+                                            formatSelectionPayload({
+                                              element: "edge",
+                                              id: edgeId,
+                                              source: event.target.source().id(),
+                                              target: event.target.target().id(),
+                                              relType: event.target.data("rel_type"),
+                                              label: event.target.data("label"),
+                                              synthetic: true
+                                            })
+                                          );
+                                          return;
+                                        }
                                         setGraphSelectionText(
                                           formatSelectionPayload({
                                             element: "edge",

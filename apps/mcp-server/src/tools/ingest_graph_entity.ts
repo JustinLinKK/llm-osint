@@ -66,6 +66,7 @@ type GraphEntityInput = {
   canonical_name?: string;
   alt_names?: string[];
   attributes?: string[];
+  merge_keys?: string[];
   osint_bucket?: string;
   source_tools?: string[];
   evidence?: EvidenceInput;
@@ -90,6 +91,7 @@ type GraphEntityRecord = {
   alt_names: string[];
   alt_names_normalized: string[];
   attributes: string[];
+  merge_keys: string[];
   osint_bucket: string;
   filter_terms: string[];
   source_tools: string[];
@@ -189,6 +191,347 @@ function uniqueStrings(values: Array<unknown>): string[] {
   return output;
 }
 
+function isUrlLike(value: string): boolean {
+  return /^https?:\/\//i.test(String(value ?? "").trim());
+}
+
+function isLikelyDomain(value: string): boolean {
+  return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/i.test(String(value ?? "").trim());
+}
+
+function looksLikePersonName(value: string): boolean {
+  const text = String(value ?? "").trim();
+  if (!text || isUrlLike(text) || isLikelyDomain(text)) return false;
+  if (/[@/:]|github|linkedin|researchgate|duckduckgo/i.test(text)) return false;
+  const normalized = normalizeName(text);
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 5) return false;
+  if (tokens.some((token) => token.length === 1)) return false;
+  return tokens.every((token) => /^[a-z][a-z'-]*$/.test(token));
+}
+
+function looksLikeOrganizationName(value: string): boolean {
+  const normalized = normalizeName(String(value ?? ""));
+  if (!normalized || isUrlLike(value) || isLikelyDomain(value)) return false;
+  return /\b(university|college|institute|school|company|corporation|corp|lab|laboratory|agency|startup|committee|group)\b/.test(normalized);
+}
+
+function extractAttributeValues(attributes: string[], prefixes: string[]): string[] {
+  const allowed = new Set(prefixes.map((value) => value.trim().toLowerCase()).filter(Boolean));
+  const values: string[] = [];
+  for (const attribute of attributes) {
+    if (typeof attribute !== "string") continue;
+    const separatorIndex = attribute.indexOf(":");
+    if (separatorIndex < 0) continue;
+    const key = attribute.slice(0, separatorIndex).trim().toLowerCase();
+    if (!allowed.has(key)) continue;
+    const value = attribute.slice(separatorIndex + 1).trim();
+    if (value) values.push(value);
+  }
+  return uniqueStrings(values);
+}
+
+function graphAutoAliases(entityType: string, values: string[]): string[] {
+  const aliases: string[] = [];
+  const family = entityType.toLowerCase();
+  const conservativeFamilies = new Set(["contactpoint", "educationalcredential", "experience", "affiliation", "timelineevent", "occupation", "imageobject", "organizationprofile", "language"]);
+  const stopwords = new Set(["the", "of", "at", "for", "and", "in", "on", "to"]);
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (!text) continue;
+    const withoutParens = text.replace(/\s*\([^)]*\)\s*/g, " ").replace(/\s+/g, " ").trim();
+    if (!conservativeFamilies.has(family) && withoutParens && normalizeName(withoutParens) !== normalizeName(text)) {
+      aliases.push(withoutParens);
+    }
+    if (!conservativeFamilies.has(family) && /\sat\s/i.test(text)) {
+      aliases.push(text.replace(/\bat\b/gi, " ").replace(/\s+/g, " ").trim());
+    }
+    const match = text.match(/\(([^)]+)\)/);
+    if (!conservativeFamilies.has(family) && match && /^[A-Za-z0-9._-]{2,16}$/.test(match[1].trim())) {
+      aliases.push(match[1].trim());
+    }
+    if (["institution", "organization", "conference", "project"].includes(family)) {
+      const acronym = (withoutParens || text)
+        .match(/[A-Za-z0-9]+/g)
+        ?.filter((word) => !stopwords.has(word.toLowerCase()))
+        .map((word) => word[0]?.toUpperCase() ?? "")
+        .join("") ?? "";
+      if (acronym.length >= 2 && acronym.length <= 12) aliases.push(acronym);
+    }
+  }
+  return uniqueStrings(aliases);
+}
+
+function graphEntityFamily(entityType: string): string {
+  const normalized = entityType.toLowerCase();
+  if (normalized === "institution" || normalized === "organization") return "org";
+  if (normalized === "conference") return "conference";
+  if (normalized === "publication" || normalized === "document") return "publication";
+  if (normalized === "repository") return "repository";
+  if (normalized === "language") return "language";
+  if (normalized === "website" || normalized === "domain" || normalized === "email" || normalized === "handle" || normalized === "phone") return "digital";
+  if (normalized === "contactpoint") return "contact";
+  if (normalized === "educationalcredential") return "credential";
+  if (normalized === "organizationprofile") return "orgprofile";
+  if (["experience", "affiliation", "timelineevent", "occupation"].includes(normalized)) return normalized;
+  if (normalized === "imageobject") return "image";
+  if (["topic", "project", "award", "grant", "patent", "role"].includes(normalized)) return normalized;
+  return normalized || "unknown";
+}
+
+function canonicalizeEntityType(entityType: string, canonicalName = "", attributes: string[] = []): string {
+  const normalizedType = normalizeName(entityType);
+  const joined = normalizeName([entityType, canonicalName, ...attributes].join(" "));
+  const explicit: Record<string, string> = {
+    article: "Document",
+    conference: "Conference",
+    contactpoint: "ContactPoint",
+    contact_point: "ContactPoint",
+    document: "Document",
+    domain: "Domain",
+    educationalcredential: "EducationalCredential",
+    educational_credential: "EducationalCredential",
+    "educational institution": "Institution",
+    educational_institution: "Institution",
+    email: "Email",
+    experience: "Experience",
+    affiliation: "Affiliation",
+    grant: "Grant",
+    handle: "Handle",
+    imageobject: "ImageObject",
+    image_object: "ImageObject",
+    institution: "Institution",
+    ip: "IP",
+    location: "Location",
+    occupation: "Occupation",
+    organization: "Organization",
+    patent: "Patent",
+    person: "Person",
+    phone: "Phone",
+    profile: "Website",
+    project: "Project",
+    publication: "Publication",
+    repository: "Repository",
+    role: "Role",
+    language: "Language",
+    snippet: "Snippet",
+    timelineevent: "TimelineEvent",
+    timeline_event: "TimelineEvent",
+    topic: "Topic",
+    organizationprofile: "OrganizationProfile",
+    organization_profile: "OrganizationProfile",
+    website: "Website",
+  };
+  if (explicit[normalizedType]) return explicit[normalizedType];
+  if (/contact point|contact_type|contact surface/.test(joined)) return "ContactPoint";
+  if (/educational credential|credential|degree|bachelor of|master of|doctor of philosophy|phd/.test(joined)) return "EducationalCredential";
+  if (/experience|employment|work history|tenure/.test(joined)) return "Experience";
+  if (/affiliation|member of|membership|relation/.test(joined)) return "Affiliation";
+  if (/timeline event|milestone|start_date|end_date|tenure_start|tenure_end|event_type/.test(joined)) return "TimelineEvent";
+  if (/occupation|job family|profession/.test(joined)) return "Occupation";
+  if (/image object|profile image|avatar|headshot/.test(joined)) return "ImageObject";
+  if (/organization profile|org profile|company overview|institution overview|school overview|lab overview|subject org/.test(joined)) return "OrganizationProfile";
+  if (/topic kind language|language kind|programming language|spoken language/.test(joined)) return "Language";
+  if (/orcid|researcher|author|person|advisor|coauthor|employee|founder|director/.test(joined)) return "Person";
+  if (/university|college|institute|school|department|lab|laboratory/.test(joined)) return "Institution";
+  if (/company|organization|corp|llc|committee|agency|firm|startup/.test(joined)) return "Organization";
+  if (/conference|workshop|symposium|venue/.test(joined)) return "Conference";
+  if (/repository|repo/.test(joined)) return "Repository";
+  if (/project|framework|initiative|program/.test(joined)) return "Project";
+  if (/programming language|spoken language/.test(joined)) return "Language";
+  if (/topic|theme|keyword|method/.test(joined)) return "Topic";
+  if (/award|prize|fellowship|honor/.test(joined)) return "Award";
+  if (/grant|award id|nsf|nih/.test(joined)) return "Grant";
+  if (/patent|application number|inventor/.test(joined)) return "Patent";
+  if (/role|position|title|officer|director/.test(joined)) return "Role";
+  if (/paper|publication|preprint|journal|article/.test(joined)) return "Publication";
+  if (isUrlLike(canonicalName)) {
+    try {
+      const parsed = new URL(canonicalName);
+      const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (["github.com", "gitlab.com", "bitbucket.org"].includes(host) && parts.length >= 2) return "Repository";
+    } catch {
+      // Ignore malformed URL values.
+    }
+    if (/\.pdf$/i.test(canonicalName) || /thesis|dissertation|cv|resume|pdf/.test(joined)) return "Document";
+    return "Website";
+  }
+  if (isLikelyDomain(canonicalName)) return "Domain";
+  if (/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(canonicalName)) return "Email";
+  if (/^\+?[0-9][0-9().\-\s]{6,}[0-9]$/.test(canonicalName)) return "Phone";
+  if (canonicalName.startsWith("@") || /username|handle/.test(joined)) return "Handle";
+  if (/city|country|location|address|state|region/.test(joined)) return "Location";
+  return entityType.trim() || "Unknown";
+}
+
+function entityTypeRank(entityType: string): number {
+  const normalized = canonicalizeEntityType(entityType).toLowerCase();
+  const rank: Record<string, number> = {
+    person: 120,
+    institution: 112,
+    organization: 108,
+    contactpoint: 104,
+    experience: 103,
+    educationalcredential: 102,
+    role: 102,
+    publication: 98,
+    conference: 92,
+    language: 91,
+    project: 88,
+    topic: 84,
+    organizationprofile: 83,
+    repository: 80,
+    award: 76,
+    grant: 74,
+    patent: 72,
+    affiliation: 70,
+    timelineevent: 68,
+    occupation: 66,
+    location: 52,
+    website: 40,
+    document: 38,
+    domain: 32,
+    handle: 30,
+    email: 30,
+    phone: 30,
+    imageobject: 28,
+    ip: 28,
+    snippet: 12,
+    unknown: 0,
+  };
+  return rank[normalized] ?? 10;
+}
+
+function chooseEntityType(values: Array<unknown>): string {
+  const counts = new Map<string, number>();
+  for (const value of values) {
+    const text = String(value ?? "").trim();
+    if (!text) continue;
+    const canonical = canonicalizeEntityType(text);
+    counts.set(canonical, (counts.get(canonical) ?? 0) + 1);
+  }
+  if (!counts.size) return "Unknown";
+  return [...counts.entries()]
+    .sort((left, right) => {
+      if (right[1] !== left[1]) return right[1] - left[1];
+      return entityTypeRank(right[0]) - entityTypeRank(left[0]);
+    })[0]?.[0] ?? "Unknown";
+}
+
+function graphNameSignature(value: string): string {
+  return normalizeName(value.replace(/\s*\([^)]*\)\s*/g, " ")).replace(/\b(?:the|of|at|for|and|in|on|to)\b/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function graphRepositoryKey(values: string[], attributes: string[]): string {
+  const candidates = [...values, ...extractAttributeValues(attributes, ["url", "id"])];
+  for (const candidate of candidates) {
+    const text = String(candidate ?? "").trim();
+    if (!text) continue;
+    if (/^https?:\/\//i.test(text)) {
+      try {
+        const parsed = new URL(text);
+        const parts = parsed.pathname.split("/").filter(Boolean);
+        if (parts.length >= 2) return `${parts[0].toLowerCase()}/${parts[1].toLowerCase()}`;
+      } catch {
+        // Ignore malformed URLs.
+      }
+    }
+    if (text.includes("/") && !/\s/.test(text)) {
+      const [owner, ...rest] = text.split("/");
+      if (owner && rest.length) return `${owner.toLowerCase()}/${rest.join("/").toLowerCase()}`;
+    }
+  }
+  return "";
+}
+
+function deriveMergeKeys(
+  entityType: string,
+  canonicalName: string,
+  altNames: string[],
+  attributes: string[],
+  provided: string[] = []
+): string[] {
+  const family = graphEntityFamily(entityType);
+  const names = uniqueStrings([canonicalName, ...altNames, ...graphAutoAliases(entityType, [canonicalName, ...altNames])]);
+  const keys = [...provided];
+  const allowHostMergeKey = family === "org" || family === "conference";
+  for (const name of names) {
+    const normalized = normalizeName(name);
+    if (normalized) keys.push(`name:${family}:${normalized}`);
+    const signature = graphNameSignature(name);
+    if (signature && signature !== normalized && ["org", "conference", "topic", "project", "language"].includes(family)) {
+      keys.push(`sig:${family}:${signature}`);
+    }
+  }
+  for (const value of [
+    canonicalName,
+    ...altNames,
+    ...extractAttributeValues(attributes, ["url", "domain", "email", "handle", "username", "id", "doi", "arxiv_id"]),
+  ]) {
+    const text = String(value ?? "").trim();
+    if (!text) continue;
+    const lowered = text.toLowerCase();
+    if (/^https?:\/\//i.test(lowered)) {
+      keys.push(family === "digital" ? `url:${lowered.replace(/\/+$/, "")}` : `url:${family}:${lowered.replace(/\/+$/, "")}`);
+      try {
+        const host = new URL(text).hostname.toLowerCase().replace(/^www\./, "");
+        if (host && allowHostMergeKey) keys.push(`host:${family}:${host}`);
+      } catch {
+        // Ignore malformed URLs.
+      }
+      continue;
+    }
+    if (/^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$/.test(lowered)) {
+      if (family === "digital") keys.push(`domain:${lowered}`);
+      else if (allowHostMergeKey) keys.push(`host:${family}:${lowered}`);
+      continue;
+    }
+    if (/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(lowered)) {
+      keys.push(`email:${lowered}`);
+      continue;
+    }
+    if (text.startsWith("@") || (family === "digital" && !/\s/.test(text) && text.length <= 32)) {
+      keys.push(`handle:${lowered.replace(/^@/, "")}`);
+      continue;
+    }
+    if (family === "publication" && lowered.length <= 64 && (lowered.includes("/") || lowered.startsWith("10."))) {
+      keys.push(`pubid:${lowered}`);
+    }
+  }
+  for (const value of extractAttributeValues(attributes, ["company_number", "cik", "grant_id", "patent_id", "filing_id"])) {
+    const normalized = String(value ?? "").trim().toLowerCase();
+    if (normalized) keys.push(`id:${family}:${normalized}`);
+  }
+  if (["contact", "credential", "experience", "affiliation", "timelineevent", "occupation", "orgprofile"].includes(family)) {
+    const subjectValues = extractAttributeValues(attributes, ["subject"]);
+    const orgValues = extractAttributeValues(attributes, ["organization", "institution", "employer", "company", "subject_org"]);
+    const facetValues = extractAttributeValues(attributes, ["role", "occupation", "degree", "field", "relation", "contact_type", "event_type", "industry", "focus"]);
+    const dateValues = extractAttributeValues(attributes, ["date", "year", "start_date", "end_date", "tenure_start", "tenure_end"]);
+    const directValues = extractAttributeValues(attributes, ["value", "email", "phone", "handle", "username"]);
+    for (const value of directValues) {
+      const normalized = String(value ?? "").trim().toLowerCase();
+      if (normalized) keys.push(`value:${family}:${normalized}`);
+    }
+    const composite = [
+      graphNameSignature(canonicalName),
+      subjectValues[0] ? normalizeName(subjectValues[0]) : "",
+      orgValues[0] ? normalizeName(orgValues[0]) : "",
+      facetValues[0] ? normalizeName(facetValues[0]) : "",
+      dateValues[0] ? normalizeName(dateValues[0]) : "",
+      directValues[0] ? String(directValues[0]).trim().toLowerCase() : "",
+    ]
+      .filter(Boolean)
+      .join("|");
+    if (composite) keys.push(`composite:${family}:${composite}`);
+  }
+  if (family === "repository") {
+    const repoKey = graphRepositoryKey(names, attributes);
+    if (repoKey) keys.push(`repo:${repoKey}`);
+  }
+  return uniqueStrings(keys);
+}
+
 function chooseCanonicalName(values: Array<unknown>): string {
   const candidates = uniqueStrings(values);
   if (!candidates.length) return "unknown";
@@ -196,6 +539,129 @@ function chooseCanonicalName(values: Array<unknown>): string {
     if (b.length !== a.length) return b.length - a.length;
     return a.localeCompare(b);
   })[0];
+}
+
+function scoreEntityNameCandidate(entityType: string, value: string): number {
+  const text = String(value ?? "").trim();
+  if (!text) return Number.NEGATIVE_INFINITY;
+  const normalized = normalizeName(text);
+  const family = graphEntityFamily(canonicalizeEntityType(entityType, text));
+  const preferredType = canonicalizeEntityType(entityType);
+  const preferredNormalized = normalizeName(preferredType);
+  const url = isUrlLike(text);
+  const domain = isLikelyDomain(text);
+  const tokens = normalized.split(" ").filter(Boolean);
+  let score = 0;
+
+  if (/snippet:|duckduckgo|github_identity_search|gitlab_identity_search/i.test(text)) score -= 280;
+  if (!url && !domain) score += 50;
+  if (url) score -= family === "digital" || family === "repository" ? 0 : 220;
+  if (domain) score -= family === "digital" ? 0 : 140;
+  score -= Math.max(0, text.length - 40);
+
+  if (family === "person") {
+    if (looksLikePersonName(text)) score += 260;
+    if (/^\p{Lu}[\p{L}'-]+(?:\s+\p{Lu}[\p{L}'-]+){1,4}$/u.test(text)) score += 80;
+    if (/[@/:]|\d/.test(text)) score -= 160;
+    if (tokens.length >= 2 && tokens.length <= 4) score += 40;
+  } else if (family === "org") {
+    if (looksLikeOrganizationName(text)) score += 220;
+    if (tokens.length >= 2) score += 25;
+    if (/^\(?[A-Z0-9]{2,10}\)?$/.test(text)) score -= 50;
+  } else if (family === "publication") {
+    if (!url && tokens.length >= 4) score += 180;
+    if (!url && text.length >= 20) score += 40;
+  } else if (family === "digital") {
+    if (url) score += 200;
+    if (domain) score += 160;
+    if (/^\+?[0-9][0-9().\-\s]{6,}[0-9]$/.test(text)) score += 140;
+    if (preferredNormalized === "website" && !url && !domain) {
+      score += 240;
+      if (/profile|website|site|homepage|official|page/.test(normalized)) score += 60;
+    }
+  } else if (family === "repository") {
+    if (/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(text)) score += 220;
+    if (url) score += 120;
+  } else if (family === "contact") {
+    if (/^\+?[0-9][0-9().\-\s]{6,}[0-9]$/.test(text) || text.startsWith("@") || text.includes("@") || url) score += 200;
+    if (normalized.includes("contact") || normalized.includes("surface")) score += 120;
+  } else if (family === "credential") {
+    if (/phd|doctor|master|bachelor|degree|credential/.test(normalized)) score += 200;
+    if (/ from /i.test(text) || / at /i.test(text)) score += 80;
+  } else if (family === "experience") {
+    if (/ at /i.test(text)) score += 180;
+    if (/engineer|student|scientist|founder|director|research/.test(normalized)) score += 80;
+  } else if (family === "affiliation") {
+    if (/ with /i.test(text) || / at /i.test(text)) score += 180;
+  } else if (family === "timelineevent") {
+    if (/started|joined|graduated|published|founded|appointed/.test(normalized)) score += 160;
+    if (/\b(19|20)\d{2}\b/.test(text)) score += 80;
+  } else if (family === "occupation") {
+    if (tokens.length >= 1 && tokens.length <= 4) score += 120;
+  } else if (family === "image") {
+    if (url) score += 180;
+    if (preferredNormalized === "imageobject" && !url && tokens.length >= 2) score += 220;
+  }
+
+  return score;
+}
+
+function chooseEntityCanonicalName(entityType: string, values: Array<unknown>): string {
+  const candidates = uniqueStrings(values);
+  if (!candidates.length) return "unknown";
+  let best = candidates[0];
+  let bestScore = scoreEntityNameCandidate(entityType, best);
+  for (const candidate of candidates.slice(1)) {
+    const score = scoreEntityNameCandidate(entityType, candidate);
+    if (score > bestScore) {
+      best = candidate;
+      bestScore = score;
+      continue;
+    }
+    if (score === bestScore && candidate.length < best.length) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function entityFamiliesCompatible(leftType: string, rightType: string): boolean {
+  const leftFamily = graphEntityFamily(canonicalizeEntityType(leftType));
+  const rightFamily = graphEntityFamily(canonicalizeEntityType(rightType));
+  if (leftFamily === rightFamily) return true;
+  const pair = [leftFamily, rightFamily].sort().join("|");
+  return pair === "digital|repository";
+}
+
+function canonicalizeRelationType(relType: string): string {
+  const normalized = normalizeName(relType).replace(/\s+/g, "_").toUpperCase();
+  const mapping: Record<string, string> = {
+    AFFILIATION: "AFFILIATED_WITH",
+    AFFILIATED_WITH: "AFFILIATED_WITH",
+    ALIAS_VARIANT: "RELATED_TO",
+    ABOUT: "ABOUT",
+    AUTHORSHIP: "PUBLISHED",
+    CANDIDATE_MATCH: "RELATED_TO",
+    COLLABORATION: "COAUTHORED_WITH",
+    CONFERENCE: "PUBLISHED_IN",
+    EDUCATION: "STUDIED_AT",
+    HAS_AFFILIATION: "HAS_AFFILIATION",
+    HAS_CONTACT_POINT: "HAS_CONTACT_POINT",
+    HAS_CREDENTIAL: "HAS_CREDENTIAL",
+    HAS_EXPERIENCE: "HAS_EXPERIENCE",
+    HAS_IMAGE: "HAS_IMAGE",
+    HAS_ORGANIZATION_PROFILE: "HAS_ORGANIZATION_PROFILE",
+    HAS_OCCUPATION: "HAS_OCCUPATION",
+    HAS_PHONE: "HAS_PHONE",
+    HAS_ROLE: "HAS_ROLE",
+    HAS_TIMELINE_EVENT: "HAS_TIMELINE_EVENT",
+    ISSUED_BY: "ISSUED_BY",
+    KNOWS_LANGUAGE: "KNOWS_LANGUAGE",
+    PROFILE: "HAS_PROFILE",
+    PUBLICATION: "PUBLISHED",
+    RESIDENCE: "LOCATED_IN",
+  };
+  return mapping[normalized] ?? (normalized || "RELATED_TO");
 }
 
 function ensureStringArray(value: unknown): string[] {
@@ -211,8 +677,11 @@ function stableId(prefix: string, ...parts: string[]): string {
 function deriveOsintBucket(entityType: string, names: string[], attributes: string[]): string {
   const joined = normalizeName([entityType, ...names, ...attributes].join(" "));
   if (/(person|author|researcher|employee|director|founder|officer|student)/.test(joined)) return "person";
+  if (/(experience|credential|affiliation|occupation|timeline event|timelineevent|contact point|contactpoint)/.test(joined)) return "person";
+  if (/(organization profile|org profile|subject org)/.test(joined)) return "organization";
   if (/(organization|company|institution|agency|university|lab|firm|committee)/.test(joined)) return "organization";
-  if (/(domain|website|hostname|repository|repo|account|username|handle|email|phone)/.test(joined)) return "digital_asset";
+  if (/(language kind|programming language|spoken language)/.test(joined)) return "language";
+  if (/(domain|website|hostname|repository|repo|account|username|handle|email|phone|imageobject|image object)/.test(joined)) return "digital_asset";
   if (/(location|city|country|address|region|state)/.test(joined)) return "location";
   if (/(article|paper|publication|grant|patent|conference|report)/.test(joined)) return "publication";
   if (/(snippet|evidence|document|archive)/.test(joined)) return "evidence";
@@ -246,7 +715,7 @@ function buildEvidenceProps(input?: EvidenceInput | EvidenceObjectRef): Record<s
   return props;
 }
 
-function selectPrimaryName(properties: Record<string, unknown>, fallback?: string): string {
+function selectPrimaryName(properties: Record<string, unknown>, fallback?: string, entityType = "Unknown"): string {
   const candidates = [
     properties.canonical_name,
     properties.name,
@@ -259,7 +728,11 @@ function selectPrimaryName(properties: Record<string, unknown>, fallback?: strin
     properties.username,
     fallback,
   ];
-  return chooseCanonicalName(candidates);
+  return chooseEntityCanonicalName(entityType, candidates);
+}
+
+function attributeTitleCandidates(attributes: string[]): string[] {
+  return extractAttributeValues(attributes, ["title", "label", "page_title", "site_title", "display_title", "semantic_title"]);
 }
 
 function propertyAttributes(properties: Record<string, unknown>): string[] {
@@ -279,11 +752,14 @@ function propertyAttributes(properties: Record<string, unknown>): string[] {
 }
 
 function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
-  const names = uniqueStrings([input.canonical_name, ...(input.alt_names ?? [])]);
-  const canonicalName = chooseCanonicalName(names);
-  const altNames = names.filter((name) => normalizeName(name) !== normalizeName(canonicalName));
+  const inputNames = uniqueStrings([input.canonical_name, ...(input.alt_names ?? [])]);
+  const rawEntityType = String(input.type ?? "Unknown").trim() || "Unknown";
   const attributes = ensureStringArray(input.attributes);
-  const entityType = String(input.type ?? "Unknown").trim() || "Unknown";
+  const entityType = canonicalizeEntityType(rawEntityType, inputNames[0] ?? "", attributes);
+  const names = uniqueStrings([...inputNames, ...attributeTitleCandidates(attributes), ...graphAutoAliases(entityType, inputNames)]);
+  const canonicalName = chooseEntityCanonicalName(entityType, names);
+  const altNames = names.filter((name) => normalizeName(name) !== normalizeName(canonicalName));
+  const mergeKeys = deriveMergeKeys(entityType, canonicalName, altNames, attributes, ensureStringArray(input.merge_keys));
   const bucket = String(input.osint_bucket ?? deriveOsintBucket(entityType, names, attributes)).trim() || "unknown";
   const createdAt = utcNow();
   const updatedAt = createdAt;
@@ -298,6 +774,7 @@ function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
     alt_names: altNames,
     alt_names_normalized: altNames.map((item) => normalizeName(item)),
     attributes,
+    merge_keys: mergeKeys,
     osint_bucket: bucket,
     filter_terms: deriveFilterTerms(entityType, canonicalName, altNames, attributes, bucket),
     source_tools: ensureStringArray(input.source_tools),
@@ -313,7 +790,7 @@ function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
 }
 
 function normalizeGraphRelation(input: GraphRelationInput): GraphRelationRecord {
-  const relType = String(input.rel_type ?? "RELATED_TO").trim() || "RELATED_TO";
+  const relType = canonicalizeRelationType(String(input.rel_type ?? "RELATED_TO").trim() || "RELATED_TO");
   const canonicalName = String(input.canonical_name ?? relType).trim() || relType;
   const altNames = ensureStringArray(input.alt_names);
   const evidenceProps = buildEvidenceProps(input.evidenceRef);
@@ -341,16 +818,78 @@ function normalizeGraphRelation(input: GraphRelationInput): GraphRelationRecord 
 }
 
 function buildEntityEmbeddingText(entity: GraphEntityRecord): string {
-  return uniqueStrings([entity.canonical_name, ...entity.alt_names]).join(" | ");
+  return uniqueStrings([entity.type, entity.canonical_name, ...entity.alt_names, ...entity.attributes.slice(0, 8)]).join(" | ");
+}
+
+function selectAttributeSnippets(attributes: string[], prefixes: string[], maxItems = 4): string[] {
+  const allowed = new Set(prefixes.map((value) => value.trim().toLowerCase()).filter(Boolean));
+  const preferred: string[] = [];
+  const remainder: string[] = [];
+  for (const attribute of attributes) {
+    if (typeof attribute !== "string") continue;
+    const trimmed = attribute.trim();
+    if (!trimmed) continue;
+    const separatorIndex = trimmed.indexOf(":");
+    const key = separatorIndex >= 0 ? trimmed.slice(0, separatorIndex).trim().toLowerCase() : "";
+    if (key && allowed.has(key)) preferred.push(trimmed);
+    else remainder.push(trimmed);
+  }
+  return uniqueStrings([...preferred, ...remainder]).slice(0, maxItems);
+}
+
+function buildRelationEndpointEmbeddingText(label: string, entity: GraphEntityRecord | undefined, fallbackId: string): string[] {
+  if (!entity) return [`${label}_id: ${fallbackId}`];
+  const attributeSnippets = selectAttributeSnippets(
+    entity.attributes,
+    [
+      "role",
+      "organization",
+      "institution",
+      "company",
+      "subject",
+      "relation",
+      "field",
+      "topic",
+      "industry",
+      "focus",
+      "research_area",
+      "research_areas",
+      "language",
+      "platform",
+      "venue",
+      "year",
+      "start_date",
+      "end_date",
+      "company_number",
+      "jurisdiction",
+      "cik",
+      "url",
+      "email",
+      "phone",
+    ],
+    4
+  );
+  const aliasSummary = entity.alt_names.slice(0, 2).join("; ");
+  return uniqueStrings([
+    `${label}_type: ${entity.type}`,
+    `${label}_name: ${entity.canonical_name}`,
+    aliasSummary ? `${label}_aliases: ${aliasSummary}` : "",
+    ...attributeSnippets.map((attribute) => `${label}_${attribute}`),
+  ]);
 }
 
 function buildRelationEmbeddingText(relation: GraphRelationRecord, nodeLookup: Map<string, GraphEntityRecord>): string {
   const src = nodeLookup.get(relation.src_id);
   const dst = nodeLookup.get(relation.dst_id);
-  const srcName = src?.canonical_name ?? relation.src_id;
-  const dstName = dst?.canonical_name ?? relation.dst_id;
-  const names = uniqueStrings([relation.canonical_name, ...relation.alt_names]).join(" | ");
-  return `${srcName} | ${relation.rel_type} | ${names} | ${dstName}`.trim();
+  const relationNames = uniqueStrings([relation.canonical_name, ...relation.alt_names]);
+  return uniqueStrings([
+    ...buildRelationEndpointEmbeddingText("source", src, relation.src_id),
+    `relation_type: ${relation.rel_type}`,
+    relation.canonical_name && relation.canonical_name !== relation.rel_type ? `relation_name: ${relation.canonical_name}` : "",
+    relationNames.length > 1 ? `relation_aliases: ${relationNames.slice(0, 3).join("; ")}` : "",
+    relation.source_tool ? `source_tool: ${relation.source_tool}` : "",
+    ...buildRelationEndpointEmbeddingText("target", dst, relation.dst_id),
+  ]).join(" | ");
 }
 
 async function ensureEntityEmbeddings(entities: GraphEntityRecord[]) {
@@ -448,7 +987,7 @@ function embeddingBandScore(left: number[], right: number[]): number {
 
 function normalizeLegacyEntity(input: LegacyBatchEntityInput): GraphEntityRecord {
   const properties = input.properties ?? {};
-  const canonicalName = selectPrimaryName(properties, input.entityId);
+  const canonicalName = selectPrimaryName(properties, input.entityId, input.entityType);
   const altNames = uniqueStrings([
     properties.username,
     properties.handle,
@@ -467,7 +1006,7 @@ function normalizeLegacyEntity(input: LegacyBatchEntityInput): GraphEntityRecord
 }
 
 function normalizeLegacyRelationTarget(targetType: string, targetId: string | undefined, targetProperties: Record<string, unknown>, evidence?: EvidenceObjectRef): GraphEntityRecord {
-  const canonicalName = selectPrimaryName(targetProperties, targetId);
+  const canonicalName = selectPrimaryName(targetProperties, targetId, targetType);
   return normalizeGraphEntity({
     node_id: targetId,
     type: targetType,
@@ -479,6 +1018,12 @@ function normalizeLegacyRelationTarget(targetType: string, targetId: string | un
 }
 
 function scoreEntityCandidate(existing: Record<string, unknown>, incoming: GraphEntityRecord): number {
+  const existingType = canonicalizeEntityType(String(existing.type ?? ""), String(existing.canonical_name ?? ""), ensureStringArray(existing.attributes));
+  const incomingType = canonicalizeEntityType(incoming.type, incoming.canonical_name, incoming.attributes);
+  if (existing.node_id !== incoming.node_id && !entityFamiliesCompatible(existingType, incomingType)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
   let score = 0;
   if (existing.node_id === incoming.node_id) score += 1000;
   if (existing.canonical_name_normalized === incoming.canonical_name_normalized) score += 400;
@@ -489,12 +1034,18 @@ function scoreEntityCandidate(existing: Record<string, unknown>, incoming: Graph
   for (const name of [incoming.canonical_name_normalized, ...incoming.alt_names_normalized]) {
     if (existingNames.has(name)) score += 75;
   }
-  const existingTerms = new Set<string>((existing.filter_terms as string[] | undefined) ?? []);
-  for (const term of incoming.filter_terms.slice(0, 8)) {
-    if (existingTerms.has(term)) score += 20;
+  const existingMergeKeys = new Set<string>(((existing.merge_keys as string[] | undefined) ?? []).map((item) => String(item)));
+  for (const key of incoming.merge_keys) {
+    if (existingMergeKeys.has(key)) score += 180;
+  }
+  if (entityFamiliesCompatible(existingType, incomingType)) {
+    const existingTerms = new Set<string>((existing.filter_terms as string[] | undefined) ?? []);
+    for (const term of incoming.filter_terms.slice(0, 8)) {
+      if (existingTerms.has(term)) score += 20;
+    }
   }
   if (existing.osint_bucket === incoming.osint_bucket) score += 25;
-  if (existing.type === incoming.type) score += 10;
+  if (existingType === incomingType) score += 20;
   score += embeddingBandScore(toNumericArray(existing.embedding), incoming.embedding);
   return score;
 }
@@ -512,7 +1063,13 @@ function scoreRelationCandidate(existing: Record<string, unknown>, incoming: Gra
 
 function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: GraphEntityRecord): GraphEntityRecord {
   if (!existing) return incoming;
-  const canonicalName = chooseCanonicalName([existing.canonical_name, incoming.canonical_name, ...(existing.alt_names as string[] ?? []), ...incoming.alt_names]);
+  const entityType = chooseEntityType([existing.type, incoming.type]);
+  const canonicalName = chooseEntityCanonicalName(entityType, [
+    existing.canonical_name,
+    incoming.canonical_name,
+    ...(existing.alt_names as string[] ?? []),
+    ...incoming.alt_names,
+  ]);
   const altNames = uniqueStrings([
     ...(existing.alt_names as string[] ?? []),
     ...(incoming.alt_names ?? []),
@@ -520,14 +1077,22 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
     incoming.canonical_name,
   ]).filter((name) => normalizeName(name) !== normalizeName(canonicalName));
   const attributes = uniqueStrings([...(existing.attributes as string[] ?? []), ...incoming.attributes]);
-  const entityType = chooseCanonicalName([existing.type, incoming.type]);
   const bucket = String(existing.osint_bucket ?? incoming.osint_bucket);
+  const mergeKeys = deriveMergeKeys(
+    entityType,
+    canonicalName,
+    altNames,
+    attributes,
+    uniqueStrings([...(existing.merge_keys as string[] ?? []), ...incoming.merge_keys])
+  );
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
   const mergedEmbeddingText = buildEntityEmbeddingText({
     ...incoming,
     canonical_name: canonicalName,
     alt_names: altNames,
+    type: entityType,
+    attributes,
   });
   return {
     node_id: String(existing.node_id ?? incoming.node_id),
@@ -537,6 +1102,7 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
     alt_names: altNames,
     alt_names_normalized: altNames.map((item) => normalizeName(item)),
     attributes,
+    merge_keys: mergeKeys,
     osint_bucket: bucket,
     filter_terms: deriveFilterTerms(entityType, canonicalName, altNames, attributes, bucket),
     source_tools: uniqueStrings([...(existing.source_tools as string[] ?? []), ...incoming.source_tools]),
@@ -562,7 +1128,7 @@ function mergeRelationRecords(existing: Record<string, unknown> | null, incoming
   const altNames = uniqueStrings([...(existing.alt_names as string[] ?? []), ...incoming.alt_names]).filter(
     (name) => normalizeName(name) !== normalizeName(canonicalName)
   );
-  const relType = chooseCanonicalName([existing.rel_type, incoming.rel_type]);
+  const relType = canonicalizeRelationType(chooseCanonicalName([existing.rel_type, incoming.rel_type]));
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
   return {
@@ -598,13 +1164,15 @@ async function findExistingEntity(
      WHERE n.node_id = $nodeId
         OR n.canonical_name_normalized = $canonical
         OR any(name IN coalesce(n.alt_names_normalized, []) WHERE name IN $names)
+        OR any(key IN coalesce(n.merge_keys, []) WHERE key IN $mergeKeys)
         OR any(term IN coalesce(n.filter_terms, []) WHERE term IN $terms)
      RETURN properties(n) AS props
-     LIMIT 50`,
+     LIMIT 100`,
     {
       nodeId: incoming.node_id,
       canonical: incoming.canonical_name_normalized,
       names: [incoming.canonical_name_normalized, ...incoming.alt_names_normalized],
+      mergeKeys: incoming.merge_keys.slice(0, 24),
       terms: incoming.filter_terms.slice(0, 16),
     }
   );

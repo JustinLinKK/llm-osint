@@ -10,7 +10,7 @@ from langgraph.graph import END, StateGraph
 from env import load_env
 from logger import get_logger
 from mcp_client import McpClientProtocol, RoutedMcpClient
-from openrouter_llm import OpenRouterLLM, invoke_complete_json
+from openrouter_llm import OpenRouterLLM, get_openrouter_timeout, invoke_complete_json
 from report_helpers import (
     assemble_evidence_appendix,
     assemble_final_report,
@@ -67,9 +67,42 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _stage2_final_timeout() -> float:
+    return get_openrouter_timeout(
+        "OPENROUTER_REPORT_TIMEOUT_SECONDS",
+        get_openrouter_timeout(
+            "OPENROUTER_PLANNER_TIMEOUT_SECONDS",
+            get_openrouter_timeout("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+        ),
+    )
+
+
+def _stage2_worker_timeout() -> float:
+    return get_openrouter_timeout(
+        "OPENROUTER_REPORT_WORKER_TIMEOUT_SECONDS",
+        get_openrouter_timeout(
+            "OPENROUTER_WORKER_TIMEOUT_SECONDS",
+            get_openrouter_timeout("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+        ),
+    )
+
+
 # Keep graph assembly in one place so node ordering and route transitions are easy to audit.
-def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None = None) -> StateGraph:
+def build_report_graph(
+    mcp_client: McpClientProtocol,
+    llm3: OpenRouterLLM | None = None,
+    *,
+    section_llm: OpenRouterLLM | None = None,
+    final_llm: OpenRouterLLM | None = None,
+) -> StateGraph:
     graph = StateGraph(ReportState)
+    if section_llm is None and final_llm is None:
+        section_llm = llm3
+        final_llm = llm3
+    elif section_llm is None:
+        section_llm = final_llm
+    elif final_llm is None:
+        final_llm = section_llm
     # Run-local caches prevent repeated DB round-trips across sections/refinement rounds.
     entity_signal_cache: Dict[str, tuple[List[str], List[str], List[str]]] = {}
     vector_query_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -125,7 +158,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         emit_stage(state, "build_outline_node", "started")
         fallback_outline = default_outline(state.get("report_type", "person"), state.get("primary_entities", []))
         fallback_outline = _normalize_outline(fallback_outline, max_outline_sections)
-        if llm3 is None:
+        if final_llm is None:
             emit_stage(state, "build_outline_node", "completed", outline_count=len(fallback_outline), reason="llm_unavailable")
             return {"outline": fallback_outline}
 
@@ -141,6 +174,8 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                         "title": "string",
                         "objective": "string",
                         "required": "boolean",
+                        "section_group": "string",
+                        "graph_chain": ["string"],
                         "entity_ids": ["string"],
                         "query_hints": ["string"],
                     }
@@ -149,11 +184,11 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         }
         try:
             parsed = invoke_complete_json(
-                llm3,
+                final_llm,
                 REPORT_OUTLINE_SYSTEM_PROMPT,
                 payload,
                 temperature=0.2,
-                timeout=45,
+                timeout=_stage2_final_timeout(),
                 run_id=state["run_id"],
                 operation="stage2.outline",
             )
@@ -195,7 +230,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         evidence: List[EvidenceRefModel],
     ) -> List[ClaimModel]:
         emit_stage(state, "extract_claims_node", "started", section_id=task.section_id)
-        if llm3 is None or not evidence:
+        if section_llm is None or not evidence:
             claims = fallback_claims(task, evidence)
             emit_stage(
                 state,
@@ -203,7 +238,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                 "completed",
                 section_id=task.section_id,
                 claim_count=len(claims),
-                reason=("llm_unavailable" if llm3 is None else "no_evidence"),
+                reason=("llm_unavailable" if section_llm is None else "no_evidence"),
             )
             return claims
 
@@ -225,11 +260,11 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         }
         try:
             parsed = invoke_complete_json(
-                llm3,
+                section_llm,
                 REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
                 payload,
                 temperature=0.1,
-                timeout=45,
+                timeout=_stage2_worker_timeout(),
                 run_id=state["run_id"],
                 operation="stage2.claim_extract",
                 metadata={"sectionId": task.section_id},
@@ -328,7 +363,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         )
 
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
-        queries = dedupe_str_list(build_section_queries(hydrated_task, llm3, run_id=state["run_id"]))[:max_vector_queries]
+        queries = dedupe_str_list(build_section_queries(hydrated_task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
         graph_hits = graph_multi_entity_query(mcp_client, hydrated_task.entity_ids)
         for query in queries:
@@ -356,7 +391,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         section_draft = SectionDraftModel(
             section_id=hydrated_task.section_id,
             title=hydrated_task.title,
-            content=draft_section_content(state["run_id"], hydrated_task, verified_claims, evidence, llm3),
+            content=draft_section_content(state["run_id"], hydrated_task, verified_claims, evidence, section_llm),
             citation_keys=[item.citation_key for item in evidence],
         )
         emit_stage(
@@ -430,6 +465,8 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                         title="Timeline normalization",
                         objective="Normalize dates/events into one consistent timeline with unknowns marked.",
                         required=False,
+                        section_group="Timeline",
+                        graph_chain=["Person", "TimelineEvent", "Experience/Affiliation/Credential", "Organization/Publication"],
                         entity_ids=state.get("primary_entities", []),
                         query_hints=["timeline", "date normalization"],
                     )
@@ -443,6 +480,8 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                         title="Conflict resolution",
                         objective="List conflicting claims and unresolved uncertainties with citations.",
                         required=False,
+                        section_group="Risk",
+                        graph_chain=["Primary Subject", "Conflicting Branch", "Evidence", "Uncertainty"],
                         entity_ids=state.get("primary_entities", []),
                         query_hints=["conflict", "contradiction", "disagreement"],
                     )
@@ -587,7 +626,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             return dict(state)
 
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
-        queries = dedupe_str_list(build_section_queries(task, llm3, run_id=state["run_id"]))[:max_vector_queries]
+        queries = dedupe_str_list(build_section_queries(task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
         graph_hits = graph_multi_entity_query(mcp_client, task.entity_ids)
         for query in queries:
@@ -627,7 +666,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
 
         emit_stage(state, "extract_claims_node", "started", section_id=task.section_id)
         evidence = state.get("section_evidence_buffer", [])
-        if llm3 is None or not evidence:
+        if section_llm is None or not evidence:
             claims = fallback_claims(task, evidence)
             emit_stage(
                 state,
@@ -635,7 +674,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
                 "completed",
                 section_id=task.section_id,
                 claim_count=len(claims),
-                reason=("llm_unavailable" if llm3 is None else "no_evidence"),
+                reason=("llm_unavailable" if section_llm is None else "no_evidence"),
             )
             return {"section_claims_buffer": claims}
 
@@ -657,11 +696,11 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         }
         try:
             parsed = invoke_complete_json(
-                llm3,
+                section_llm,
                 REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
                 payload,
                 temperature=0.1,
-                timeout=45,
+                timeout=_stage2_worker_timeout(),
                 run_id=state["run_id"],
                 operation="stage2.claim_refine",
                 metadata={"sectionId": task.section_id},
@@ -743,7 +782,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         section_draft = SectionDraftModel(
             section_id=task.section_id,
             title=task.title,
-            content=draft_section_content(state["run_id"], task, claims, evidence, llm3),
+            content=draft_section_content(state["run_id"], task, claims, evidence, section_llm),
             citation_keys=[item.citation_key for item in evidence],
         )
         pending = list(state.get("pending_section_tasks", []))
@@ -852,7 +891,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
         reflections: List[SectionReflectionModel] = []
         quality_ok_from_llm = False
 
-        if llm3 is not None:
+        if final_llm is not None:
             payload = {
                 "report_type": state.get("report_type", "person"),
                 "outline": [item.model_dump() for item in outline],
@@ -875,11 +914,11 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             }
             try:
                 parsed = invoke_complete_json(
-                    llm3,
+                    final_llm,
                     REPORT_SECTION_REFLECTION_SYSTEM_PROMPT,
                     payload,
                     temperature=0.1,
-                    timeout=45,
+                    timeout=_stage2_final_timeout(),
                     run_id=state["run_id"],
                     operation="stage2.final_reflection",
                 )
@@ -938,7 +977,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
             if reflection_by_section.get(task.section_id) is not None
         ]
         has_targets = any(item.status != "ok" for item in normalized_reflections if item is not None)
-        quality_ok = (quality_ok_from_llm if llm3 is not None else True) and not has_targets
+        quality_ok = (quality_ok_from_llm if final_llm is not None else True) and not has_targets
         emit_stage(
             state,
             "final_reflection_node",
@@ -1107,7 +1146,7 @@ def build_report_graph(mcp_client: McpClientProtocol, llm3: OpenRouterLLM | None
 
     def finalize_report_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "finalize_report_node", "started")
-        final_report = assemble_final_report(state, llm3)
+        final_report = assemble_final_report(state, final_llm)
         appendix = assemble_evidence_appendix(state.get("evidence_refs", []))
         try:
             persist_report_snapshot(
@@ -1219,15 +1258,26 @@ def run_report_subgraph(
     load_env()
     emit_run_event(run_id, "STAGE2_STARTED", {"component": "report_subgraph"})
 
-    llm3: OpenRouterLLM | None = None
+    final_llm: OpenRouterLLM | None = None
+    section_llm: OpenRouterLLM | None = None
     if os.getenv("OPENROUTER_API_KEY"):
-        report_model = os.getenv("OPENROUTER_REPORT_MODEL") or os.getenv("OPENROUTER_MODEL")
-        llm3 = OpenRouterLLM(model=report_model)
+        report_model = (
+            os.getenv("OPENROUTER_REPORT_MODEL")
+            or os.getenv("OPENROUTER_PLANNER_MODEL")
+            or os.getenv("OPENROUTER_MODEL")
+        )
+        report_worker_model = (
+            os.getenv("OPENROUTER_REPORT_WORKER_MODEL")
+            or os.getenv("OPENROUTER_WORKER_MODEL")
+            or report_model
+        )
+        final_llm = OpenRouterLLM(model=report_model)
+        section_llm = OpenRouterLLM(model=report_worker_model)
 
     mcp_client = RoutedMcpClient()
     mcp_client.start()
     try:
-        graph = build_report_graph(mcp_client, llm3)
+        graph = build_report_graph(mcp_client, section_llm=section_llm, final_llm=final_llm)
         checkpointer: Any | None = None
         try:
             from langgraph.checkpoint.memory import MemorySaver  # type: ignore

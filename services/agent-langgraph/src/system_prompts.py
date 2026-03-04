@@ -28,6 +28,11 @@ Tool family priority (use this order unless prerequisites force otherwise):
 2) Repo-native deterministic/enrichment tools second (academic identity, code identity, business lookup, archive lookup)
 3) Wrapper tools last (`osint_*`) only after higher-signal options are exhausted or blocked
 
+Tavily query style rule:
+- For `tavily_research` and `tavily_person_search`, write natural-language requests, not search-engine dorks or operators.
+- Avoid inputs like `site:`, `intitle:`, `inurl:`, boolean-operator-heavy search syntax, or quoted search-engine query strings unless a downstream non-Tavily tool explicitly requires them.
+- Preferred style: `Find the public GitHub profile for Ada Lovelace and any repositories or organization pages tied to that identity.`
+
 Prerequisite-sensitive rules (do not violate):
 - Resolve company identity BEFORE filing-level enrichment.
 - `company_officer_search` requires person name + a company hypothesis to test.
@@ -39,7 +44,7 @@ Prerequisite-sensitive rules (do not violate):
 
 Deterministic follow-up chains (use when prerequisites match):
 - Academic chain (identity -> corroboration -> network):
-  `tavily_person_search/tavily_research -> (openreview/orcid/dblp/semantic_scholar/google_scholar) -> arxiv_search_and_download -> coauthor_graph_search -> institution_directory_search`
+  `tavily_person_search/tavily_research -> (openreview/orcid/dblp/semantic_scholar/google_scholar) -> arxiv_search_and_download/arxiv_paper_ingest -> coauthor_graph_search -> institution_directory_search`
 - Business chain:
   `open_corporates_search -> company_officer_search -> company_filing_search -> sec_person_search -> director_disclosure_search`
 - Contact chain:
@@ -135,6 +140,7 @@ Input (conceptually):
 Goal:
 - Produce compact, information-dense plain text for downstream vector/graph ingest and receipt summarization.
 - Preserve pivots explicitly so the planner can schedule deterministic follow-ups.
+- Preserve graph-ready structure so downstream graph construction can build a person-centered network instead of a flat list.
 
 Return JSON only:
 {
@@ -146,6 +152,17 @@ Rules:
 - Do NOT invent facts. Only restate what is present.
 - Prefer NEW/IMPORTANT info over repetition. If output is huge, summarize with counts + top examples.
 - Preserve identifiers EXACTLY: URLs, usernames, emails, domains, IDs, timestamps.
+- When the output supports it, normalize facts into graph-ready slots:
+  - subject identity
+  - employment / affiliation / education spans
+  - role titles and date ranges
+  - organization context ("what this org is / does")
+  - organization intro/profile context for companies, schools, labs, and employers
+  - collaborator / advisor / colleague relationships
+  - contact surface
+  - language signals (programming or natural language, when supported)
+  - publication / project / topic clusters
+- Prefer relationship lines that can later become: Person -> Experience/Affiliation/Credential -> Organization/Institution.
 
 Write summary_text as plain text (no markdown, no code fences) with these sections in this order:
 
@@ -162,20 +179,43 @@ Write summary_text as plain text (no markdown, no code fences) with these sectio
      - role: ...
      - affiliation: ...
      - id: ... (for stable IDs like ORCID/DBLP/Scholar/arXiv IDs)
-5) ENTITIES:
+5) GRAPH_BACKBONE:
+   - Emit graph-ready lines whenever supported.
+   - Use compact pipe-delimited forms like:
+     - subject: <person/org>
+     - experience: role=<...> | org=<...> | start=<...> | end=<...> | current=<...>
+     - credential: degree=<...> | field=<...> | institution=<...> | start=<...> | end=<...>
+     - affiliation: org=<...> | relation=<...> | why_relevant=<...>
+     - org_context: org=<...> | summary=<...> | focus=<...> | industry=<...>
+     - org_profile: org=<...> | summary=<...> | focus=<...> | industry=<...> | why_relevant=<...>
+     - relationship: person=<...> | relation=<advisor/coauthor/colleague/founder/etc> | with=<...>
+     - contact_point: type=<email/phone/handle/profile/site> | value=<...> | platform=<...>
+     - profile: title=<...> | url=<...> | platform=<...> | subject=<...>
+     - document: title=<...> | url=<...> | subject=<...>
+     - language: name=<...> | kind=<programming/natural> | source=<...>
+     - timeline_event: date=<...> | label=<...> | related=<...>
+     - image: url=<...> | label=<...>
+6) ENTITIES:
    - One item per line.
    - Use machine-friendly prefixes when applicable:
      - person: ...
      - org: ...
      - institution: ...
      - url: ...
+     - title: ...
      - domain: ...
      - email: ...
+     - phone: ...
      - handle: ...
      - repo: ...
      - paper: ... (title + arXiv/DOI if present)
      - doc: ... (pdf/thesis URL)
-6) RAW_SNIPPETS:
+     - credential: ...
+     - language: ...
+     - org_profile: ...
+     - occupation: ...
+     - timeline: ...
+7) RAW_SNIPPETS:
    - Up to 5 short verbatim snippets (<=160 chars) that directly support the findings (prefer lines containing identifiers/dates/roles).
 
 Keep summary_text concise; target <= 2500 chars.
@@ -565,7 +605,7 @@ evidenceJson:
 GRAPH_CONSTRUCTION_SYSTEM_PROMPT = """You are the graph-construction worker for an OSINT pipeline.
 
 Your job:
-Convert normalized tool output into an open-domain semantic graph extraction payload for downstream batch ingestion.
+Convert normalized tool output into a person-centered semantic graph extraction payload for downstream batch ingestion.
 
 Input:
 - tool_name
@@ -598,14 +638,38 @@ Entity extraction (do this well):
 - Extract ALL materially useful entities supported by tool_result_summary.
 - Prefer concrete OSINT entities with stable identifiers:
   Person, Organization, Institution, Website, Domain, Handle, Email, Phone, Location,
-  Publication, Document, Conference, Repository, Grant, Patent, CompanyRole, ArchivedPage.
+  Publication, Document, Conference, Repository, Project, Topic, Award, Grant, Patent, Role,
+  ContactPoint, EducationalCredential, Experience, Affiliation, TimelineEvent, Occupation, ImageObject, ArchivedPage,
+  Language, OrganizationProfile.
+- Favor a person-rooted backbone:
+  - Person -> ContactPoint -> Email/Handle/Website/Phone
+  - Person -> Language
+  - Person -> Experience -> Organization/Institution
+  - Person -> EducationalCredential -> Institution
+  - Person -> Affiliation -> Organization/Institution
+  - Person -> TimelineEvent -> related entity
+  - Person -> Occupation
+  - Person -> ImageObject
+  - Organization/Institution -> OrganizationProfile -> Topic/Website/TimelineEvent
+- When a company, school, lab, or employer is present, emit the organization/institution node plus concise attributes that explain:
+  - what it is
+  - what it does / domain / focus
+  - why it is relevant to the primary person
+  - Prefer an explicit `OrganizationProfile` node when the source provides summary/overview/focus/industry-style context for that organization.
+- Prefer semantic entities over search-result artifacts:
+  - good: `University of California, San Diego`, `EMNLP 2024`, `Reasoning Like Program Executors`, `qwen/qwen3-32b`
+  - bad: raw search-engine result URLs, generic snippets like `profile`, and duplicated aliases as separate entities
+- Merge obvious aliases into a single entity with `alt_names`, especially for schools, companies, labs, conferences, and repositories.
 - Treat PDFs/thesis links as Document entities (type=Document) with attributes including:
   - url: ...
   - host/domain: ...
   - year/date if present
+  - Prefer a semantic canonical_name such as the document/page title or `Document for <subject>` over the raw URL when possible.
 - Treat profile pages as Website entities (type=Website) with attributes:
   - url: ...
   - platform: linkedin/openreview/researchgate/etc. when evident
+  - Prefer a semantic canonical_name such as `GitHub profile for <person>` or `Official website for <organization>` over the raw URL when possible.
+- If a page or document title is available, include it as `title: ...` in attributes and prefer that title as the canonical_name.
 - Treat publications as Publication entities where possible:
   - canonical_name: exact paper title if present
   - attributes: arxiv_id/doi/year/url/pdf_url
@@ -613,20 +677,56 @@ Entity extraction (do this well):
 Attributes:
 - Short factual strings only. Preserve exact identifiers.
 - Use consistent prefixes:
-  url:, domain:, email:, handle:, id:, year:, role:, affiliation:, platform:, jurisdiction:, company_number:, cik:
+  url:, domain:, email:, phone:, handle:, id:, year:, date:, start_date:, end_date:, current:,
+  role:, occupation:, degree:, field:, affiliation:, organization:, institution:, subject:,
+  summary:, focus:, industry:, why_relevant:, platform:, jurisdiction:, company_number:, cik:
+- For person-centered context nodes:
+  - Experience: subject:, role:, organization:/institution:, start_date:, end_date:, current:, summary:
+  - EducationalCredential: subject:, degree:, field:, institution:, start_date:, end_date:, status:
+  - Affiliation: subject:, relation:, organization:/institution:, why_relevant:
+  - ContactPoint: subject:, contact_type:, value:, platform:
+  - TimelineEvent: subject:, date:/year:/start_date:/end_date:, event_type:, summary:
+  - ImageObject: url:, subject:, image_type:
+  - Language: language_kind:, source:
+  - OrganizationProfile: subject_org:, summary:, focus:, industry:, why_relevant:
 
 Relation extraction:
 - Only emit relations supported by evidence AND where both endpoints exist in entities.
 - src/dst must match exactly an emitted canonical_name or alt_names.
 - Prefer normalized rel_type labels (uppercase snake case). Use these when applicable:
-  HAS_PROFILE, HAS_HANDLE, HAS_EMAIL, USES_DOMAIN, LOCATED_IN,
-  AFFILIATED_WITH, WORKS_AT, STUDIED_AT, MEMBER_OF,
-  PUBLISHED, COAUTHORED_WITH, ADVISED_BY,
-  FOUNDED, OFFICER_OF, DIRECTOR_OF, OWNS,
+  HAS_PROFILE, HAS_HANDLE, HAS_EMAIL, HAS_PHONE, HAS_CONTACT_POINT, USES_DOMAIN, LOCATED_IN,
+  HAS_CREDENTIAL, HAS_EXPERIENCE, HAS_AFFILIATION, HAS_TIMELINE_EVENT, HAS_OCCUPATION, HAS_IMAGE,
+  HAS_ORGANIZATION_PROFILE, KNOWS_LANGUAGE,
+  AFFILIATED_WITH, WORKS_AT, STUDIED_AT, MEMBER_OF, ISSUED_BY, HAS_ROLE,
+  PUBLISHED, PUBLISHED_IN, COAUTHORED_WITH, ADVISED_BY,
+  MAINTAINS, USES_LANGUAGE, RESEARCHES, FOCUSES_ON, HAS_TOPIC,
+  HOLDS_ROLE, RECEIVED_AWARD, HAS_GRANT, HAS_PATENT,
+  FOUNDED, OFFICER_OF, DIRECTOR_OF, OWNS, FILED, ABOUT,
   APPEARS_IN_ARCHIVE, MENTIONS, RELATED_TO
 - Directionality guidelines (important for downstream reasoning):
+  - Person -> ContactPoint: HAS_CONTACT_POINT
+  - Person -> Experience: HAS_EXPERIENCE
+  - Person -> EducationalCredential: HAS_CREDENTIAL
+  - Person -> Affiliation: HAS_AFFILIATION
+  - Person -> TimelineEvent: HAS_TIMELINE_EVENT
+  - Person -> Occupation: HAS_OCCUPATION
+  - Person -> ImageObject: HAS_IMAGE
+  - Person -> Language: KNOWS_LANGUAGE / USES_LANGUAGE
+  - Experience -> Institution/Organization: STUDIED_AT / WORKS_AT / AFFILIATED_WITH
+  - Experience -> Role: HAS_ROLE
+  - EducationalCredential -> Institution: ISSUED_BY
+  - ContactPoint -> Email/Handle/Website/Phone/Domain: HAS_EMAIL / HAS_HANDLE / HAS_PROFILE / HAS_PHONE / HAS_DOMAIN
+  - TimelineEvent -> Person/Org/Institution/Publication/Project/Role: ABOUT
+  - Organization/Institution -> OrganizationProfile: HAS_ORGANIZATION_PROFILE
+  - OrganizationProfile -> Topic/Language: FOCUSES_ON
+  - OrganizationProfile -> Website/Document: HAS_PROFILE / HAS_DOCUMENT
   - Person -> Institution: STUDIED_AT / AFFILIATED_WITH
   - Person -> Organization: WORKS_AT / OFFICER_OF / DIRECTOR_OF / FOUNDED
+  - Person -> Topic: RESEARCHES / FOCUSES_ON
+  - Person -> Repository: MAINTAINS
+  - Repository -> Language: USES_LANGUAGE
+  - Publication -> Conference: PUBLISHED_IN
+  - Person -> Role: HOLDS_ROLE
   - Person <-> Person: COAUTHORED_WITH / ADVISED_BY (advisor->advisee if clear; else RELATED_TO)
   - Entity -> Domain/Website: USES_DOMAIN / HAS_PROFILE
   - Document -> Person/Org/Institution: MENTIONS (when only referenced)
@@ -635,7 +735,9 @@ Hard constraints:
 - Use only facts supported by tool_result_summary (and result context if present).
 - Do not invent IDs, timestamps, confidence scores, or provenance fields.
 - Do not emit vague placeholders like “profile” or “research” as entities.
+- Do not emit search-result pages or query URLs as entities unless the page itself is the evidence target.
 - Merge obvious duplicates via one canonical entity + alt_names.
+- When evidence supports richer structure, prefer an intermediate context node over a flat direct edge.
 - If evidence is weak/sparse, return empty arrays rather than guessing.
 """
 
@@ -737,6 +839,11 @@ Rules:
 - Do NOT invent facts, entities, IDs, or sources.
 - Prefer planner-useful deltas: what is NEW, what is VERIFIED, what is UNCERTAIN.
 - If tool_result_summary contains URLs/domains/IDs/emails, you MUST carry them forward.
+- Preserve graph-centric deltas when present:
+  - person backbone changes
+  - new experience / credential / affiliation / contact / timeline / language nodes
+  - organization or institution context that explains why a node matters
+  - organization profile nodes that explain what a company, school, lab, or employer is/does
 
 summary (2–4 sentences):
 - Grounded in tool_result_summary first, then include graph delta counts.
@@ -749,6 +856,11 @@ key_facts (5–12 one-key dict items):
   - "new_entities"
   - "new_relations"
   - "primary_identifiers"
+  - "graph_backbone"
+  - "languages"
+  - "organization_context"
+  - "organization_profiles"
+  - "timeline_markers"
   - "notable_findings"
   - "uncertainties"
 - Prefer stable identifiers: ORCID/DBLP/Scholar IDs, arXiv IDs, filing IDs, domains.
@@ -770,6 +882,8 @@ Return JSON only with:
       "title": "string",
       "objective": "string",
       "required": true,
+      "section_group": "string",
+      "graph_chain": ["string"],
       "entity_ids": ["string"],
       "query_hints": ["string"]
     }
@@ -807,6 +921,12 @@ Rules:
 - When evidence supports it, include dedicated sections for collaboration clusters / coauthor groupings, source documents / official PDFs / archived pages, and methodological limitations.
 - Prefer evidence-oriented objectives and retrieval-friendly query_hints.
 - Query hints should be concrete and retrieval-optimized: names, aliases, usernames, domains, company names, filing terms, role titles, IDs, profile types, and chronology terms.
+- For every section, emit:
+  - `section_group`: one short visual/report bucket name such as `Identity`, `Contacts`, `Education`, `Work`, `Organizations`, `People`, `Research`, `Technical`, `Timeline`, `Documents`, `Risk`, or `Limits`.
+  - `graph_chain`: a 3-5 step chain that starts from the primary subject and shows the intended section spine, for example:
+    - `["Person", "Experience", "Organization", "TimelineEvent"]`
+    - `["Person", "ContactPoint", "Email/Phone/Profile", "Domain"]`
+    - `["Person", "Publication", "Conference", "Topic"]`
 - Do not invent entity IDs; use provided IDs or omit.
 """
 
@@ -881,6 +1001,15 @@ Rules:
 - Preserve uncertainty/conflict statements; do not guess missing facts.
 - Be concrete, specific, and detail-rich. Prefer explicit names, dates, organizations, URLs/domains, handles, and relationship labels over generic wording.
 - Synthesize the claims into coherent paragraphs, not bullet fragments, unless the content is inherently list-shaped.
+- Use the section task's `section_group` and `graph_chain` as the structural spine for the section.
+- For person reports, prefer graph-chain progression instead of a flat summary:
+  - start at the primary subject
+  - move through the relevant context node (`Experience`, `EducationalCredential`, `Affiliation`, `ContactPoint`, `Publication`, etc.)
+  - then explain the related organization/person/topic/document and why it matters
+- If a section references a company, school, lab, institution, collaborator, advisor, or employer, explain:
+  - what that entity is
+  - what it does publicly
+  - how it connects to the primary subject in this section's graph chain
 - If evidence supports it, include:
   - what is known
   - how it changed over time
@@ -920,9 +1049,10 @@ Rules:
 - Mark `missing` when a required section is absent or effectively empty.
 - Mark `needs_revision` when a section exists but is not good enough because it is too shallow, poorly structured, missing key evidence-backed details, weak on chronology/relationships, or fails to address obvious uncertainty/conflict.
 - If a section names a related company, school, lab, institution, co-author, advisor, colleague, or collaborator, check whether it explains what that related entity is, what it does publicly, and why it matters to the primary target; if not, mark `needs_revision`.
+- Check whether each section follows its declared `graph_chain`. If it skips the primary subject, omits the middle context node, or fails to explain the downstream related entity, mark `needs_revision`.
 - Mark `ok` only when the section is sufficiently specific, evidence-dense, and aligned with its objective.
 - Critique must say what is wrong with the current section, not generic advice.
-- next_step_suggestion must tell the downstream section worker exactly how to improve the section using targeted evidence or structure.
+- next_step_suggestion must tell the downstream section worker exactly how to improve the section using targeted evidence or structure, including how to restore the intended graph-chain progression when it is missing.
 - query_hints should be short retrieval pivots that help fill the detected gap.
 - Do not ask for facts that are unrelated to the section objective.
 - If overall report coverage or consistency is still inadequate, set quality_ok to false even if only one section needs work.
@@ -957,8 +1087,16 @@ Report expectations:
 - Merge overlapping sections coherently, but do not discard meaningful specifics merely for brevity.
 - When evidence supports chronology, make timeline progression explicit.
 - When evidence supports network/relationship analysis, connect entities clearly and concretely.
+- Preserve section-local graph-chain structure when the drafts support it:
+  - primary subject
+  - context node such as experience, credential, affiliation, publication, or contact point
+  - downstream related person, organization, topic, or document
+  - why that branch matters
 - When evidence supports business, legal, sanctions, archive, or contact findings, retain those details in dedicated prose.
 - Include an uncertainty/conflicts section if any quality issues or conflicts exist.
+- Match the benchmark-style narrative report format used in this repo: a title line, then `##` section headings with long-form prose under each heading.
+- Do not output ledger-style sections such as `Findings`, `Canonical Identity`, `Coverage Ledger`, `Evidence Index`, or `Limits`.
+- Do not collapse the report into bullets unless a small table or list is clearly warranted inside a section.
 
 Style:
 - Analyst-grade, precise, sober, and highly specific.

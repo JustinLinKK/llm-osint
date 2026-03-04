@@ -332,6 +332,7 @@ function registerGraphSearchEntities(server: McpServer) {
               OR toLower(coalesce(n.email, '')) CONTAINS toLower($query)
               OR toLower(coalesce(n.canonical_name, '')) CONTAINS toLower($query)
               OR any(v IN coalesce(n.alt_names, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
+              OR any(v IN coalesce(n.merge_keys, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
               OR any(v IN coalesce(n.attributes, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
               OR any(v IN coalesce(n.filter_terms, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
            RETURN labels(n) as labels, properties(n) as props

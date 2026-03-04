@@ -252,6 +252,12 @@ function researchIntegrationToolPreset(): PythonToolConfig[] {
       timeoutMs: PYTHON_TIMEOUT_HEAVY_MS,
     },
     {
+      name: "arxiv_paper_ingest",
+      description: "Fetch one arXiv paper, download its PDF, and extract topics/coauthors/contact signals",
+      scriptPath: wrapperPath,
+      timeoutMs: PYTHON_TIMEOUT_HEAVY_MS,
+    },
+    {
       name: "github_identity_search",
       description: "Resolve a GitHub identity and compact public repository/profile signals",
       scriptPath: wrapperPath,
@@ -834,6 +840,47 @@ function inferResearchArtifacts(toolName: string, output: unknown): ResearchArti
     }
   }
 
+  if (toolName === "arxiv_paper_ingest") {
+    const metadataPath = payload.metadata_path;
+    if (typeof metadataPath === "string" && metadataPath.trim()) {
+      addResearchArtifact(artifacts, { sourcePath: metadataPath });
+    }
+    const paperTextPath = payload.paper_text_path;
+    if (typeof paperTextPath === "string" && paperTextPath.trim()) {
+      addResearchArtifact(artifacts, {
+        sourcePath: paperTextPath,
+        sourceType: "text",
+        contentType: "text/plain",
+      });
+    }
+    const paper = payload.paper;
+    if (paper && typeof paper === "object" && !Array.isArray(paper)) {
+      const paperRecord = paper as Record<string, unknown>;
+      const pdfFile = paperRecord.pdf_file;
+      if (typeof pdfFile === "string" && pdfFile.trim()) {
+        addResearchArtifact(artifacts, {
+          sourcePath: pdfFile,
+          sourceUrl: typeof paperRecord.pdf_url === "string" ? paperRecord.pdf_url : null,
+          title: typeof paperRecord.title === "string" ? paperRecord.title : null,
+          sourceType: "pdf",
+          contentType: "application/pdf",
+        });
+      }
+      const extractedTextFile = paperRecord.paper_text_path;
+      if (typeof extractedTextFile === "string" && extractedTextFile.trim()) {
+        addResearchArtifact(artifacts, {
+          sourcePath: extractedTextFile,
+          sourceUrl: typeof paperRecord.abs_url === "string"
+            ? paperRecord.abs_url
+            : (typeof paperRecord.id_url === "string" ? paperRecord.id_url : null),
+          title: typeof paperRecord.title === "string" ? `${paperRecord.title} extracted text` : null,
+          sourceType: "text",
+          contentType: "text/plain",
+        });
+      }
+    }
+  }
+
   if (toolName === "person_search") {
     for (const result of asObjectArray(payload.results)) {
       const htmlPath = result.html_path;
@@ -993,6 +1040,21 @@ function minimalEvidenceRef(stored: StoredResult): Record<string, unknown> {
   };
 }
 
+function compactArtifactDocuments(rawArtifacts: StoredFileArtifact[]): Record<string, unknown>[] {
+  return rawArtifacts.map((artifact) => ({
+    documentId: artifact.documentId,
+    title: artifact.title,
+    sourceUrl: artifact.sourceUrl,
+    bucket: artifact.bucket,
+    objectKey: artifact.objectKey,
+    versionId: artifact.versionId,
+    etag: artifact.etag,
+    sizeBytes: artifact.sizeBytes,
+    contentType: artifact.contentType,
+    sha256: artifact.sha256,
+  }));
+}
+
 function resolveResponseMode(input: Record<string, unknown>): ResponseMode {
   const requestedMode = typeof input.response_mode === "string" ? input.response_mode.trim().toLowerCase() : "";
   if (requestedMode === "full" || requestedMode === "compact") {
@@ -1129,6 +1191,67 @@ function compactResearchOutput(toolName: string, output: unknown, stored: Stored
         pdf_url: typeof item.pdf_url === "string" ? item.pdf_url : "",
         extracted_text: trimText(item.extracted_text, 700),
       }));
+    compact.evidence = minimalEvidenceRef(stored);
+    return compact;
+  }
+
+  if (toolName === "arxiv_paper_ingest") {
+    const compact: Record<string, unknown> = {};
+    const paper = isObjectRecord(output.paper) ? output.paper : {};
+
+    if (typeof paper.arxiv_id === "string") compact.arxiv_id = paper.arxiv_id;
+    if (typeof paper.title === "string") compact.title = trimText(paper.title, 260);
+    if (typeof paper.published === "string") compact.published = paper.published;
+    if (typeof paper.pdf_url === "string") compact.pdf_url = paper.pdf_url;
+    if (Array.isArray(output.topics)) {
+      compact.topics = output.topics.filter((value): value is string => typeof value === "string").slice(0, 12);
+    }
+    if (Array.isArray(output.emails)) {
+      compact.emails = output.emails.filter((value): value is string => typeof value === "string").slice(0, 12);
+    }
+
+    const authorContacts = Array.isArray(output.author_contacts) ? output.author_contacts : [];
+    compact.author_contacts = authorContacts
+      .filter(isObjectRecord)
+      .slice(0, 12)
+      .map((item) => ({
+        name: trimText(item.name, 140),
+        email: typeof item.email === "string" ? item.email : null,
+        match_confidence: typeof item.match_confidence === "number" ? item.match_confidence : null,
+      }));
+
+    const coauthors = Array.isArray(output.coauthors) ? output.coauthors : [];
+    compact.coauthors = coauthors
+      .filter(isObjectRecord)
+      .slice(0, 12)
+      .map((item) => ({
+        name: trimText(item.name, 140),
+        email: typeof item.email === "string" ? item.email : null,
+        match_confidence: typeof item.match_confidence === "number" ? item.match_confidence : null,
+      }));
+
+    const extractedEntry = {
+      arxiv_id: typeof paper.arxiv_id === "string" ? paper.arxiv_id : "",
+      title: trimText(paper.title, 260),
+      published: typeof paper.published === "string" ? paper.published : "",
+      authors: Array.isArray(paper.authors)
+        ? paper.authors.filter((value): value is string => typeof value === "string").slice(0, 16)
+        : [],
+      affiliations: Array.isArray(paper.affiliations)
+        ? paper.affiliations.filter((value): value is string => typeof value === "string").slice(0, 12)
+        : [],
+      pdf_url: typeof paper.pdf_url === "string" ? paper.pdf_url : "",
+      topics: Array.isArray(paper.topics)
+        ? paper.topics.filter((value): value is string => typeof value === "string").slice(0, 12)
+        : [],
+      emails: Array.isArray(paper.emails)
+        ? paper.emails.filter((value): value is string => typeof value === "string").slice(0, 12)
+        : [],
+      extracted_text: trimText(paper.summary || paper.text_excerpt, 700),
+    };
+    compact.paper = extractedEntry;
+    compact.papers = [extractedEntry];
+    compact.extracted_entries = [extractedEntry];
     compact.evidence = minimalEvidenceRef(stored);
     return compact;
   }
@@ -1301,6 +1424,7 @@ export function registerPythonTools(server: McpServer) {
           const output = result.result ?? {};
           const rawArtifacts = await storeResearchArtifacts(runId, tool.name, output);
           const stored = await storePythonResult(runId, tool.name, output);
+          const artifactDocuments = compactArtifactDocuments(rawArtifacts);
 
           const responseMode = resolveResponseMode(input);
 
@@ -1312,10 +1436,14 @@ export function registerPythonTools(server: McpServer) {
           }
           if (rawArtifacts.length > 0) {
             fullResponsePayload.rawArtifacts = rawArtifacts;
+            fullResponsePayload.artifactDocuments = artifactDocuments;
           }
           const responsePayload = responseMode === "full"
             ? fullResponsePayload
             : compactResearchOutput(tool.name, output, stored);
+          if (artifactDocuments.length > 0) {
+            responsePayload.artifactDocuments = artifactDocuments;
+          }
 
           await logToolCall(runId, tool.name, input, responsePayload, "ok");
           await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: tool.name, ok: true });

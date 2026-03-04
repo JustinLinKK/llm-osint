@@ -34,7 +34,10 @@ function getEmbeddingApiKey() {
   return cfg.embeddings.apiKey;
 }
 
-export async function embedTexts(texts: string[], timeoutMs = 60000): Promise<number[][]> {
+export async function embedTexts(
+  texts: string[],
+  timeoutMs = cfg.embeddings.timeoutMs
+): Promise<number[][]> {
   const response = await fetch(getEmbeddingApiUrl(), {
     method: "POST",
     signal: AbortSignal.timeout(timeoutMs),
@@ -58,7 +61,10 @@ export async function embedTexts(texts: string[], timeoutMs = 60000): Promise<nu
   return embeddings as number[][];
 }
 
-export async function embedQueryText(query: string, timeoutMs = 15000): Promise<number[]> {
+export async function embedQueryText(
+  query: string,
+  timeoutMs = cfg.embeddings.queryTimeoutMs
+): Promise<number[]> {
   const embeddings = await embedTexts([query], timeoutMs);
   if (!embeddings[0]) {
     throw new Error("Embedding response missing vector");

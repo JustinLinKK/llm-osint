@@ -258,6 +258,10 @@ def _normalize_optional_str_list(value: Any) -> list[str] | None:
     return normalized or None
 
 
+def _normalize_tavily_instructions(input_data: dict[str, Any]) -> str:
+    return str(input_data.get("instructions") or input_data.get("instruction") or "").strip()
+
+
 def _build_tavily_search_payload(
     *,
     query: str,
@@ -926,7 +930,7 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     max_depth = int(input_data.get("max_depth", 2))
     max_breadth = int(input_data.get("max_breadth", 20))
     limit = int(input_data.get("limit", 20))
-    instruction = str(input_data.get("instruction") or "").strip()
+    instructions = _normalize_tavily_instructions(input_data)
     select_paths = input_data.get("select_paths")
     exclude_paths = input_data.get("exclude_paths")
     format_value = str(input_data.get("format") or "markdown").strip().lower() or "markdown"
@@ -947,8 +951,8 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "limit": max(1, limit),
         "format": format_value,
     }
-    if instruction:
-        payload["instruction"] = instruction
+    if instructions:
+        payload["instructions"] = instructions
     if isinstance(select_paths, list) and select_paths:
         payload["select_paths"] = [item for item in select_paths if isinstance(item, str) and item.strip()]
     if isinstance(exclude_paths, list) and exclude_paths:
@@ -1017,7 +1021,7 @@ def _tool_map_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     max_depth = int(input_data.get("max_depth", 2))
     max_breadth = int(input_data.get("max_breadth", 50))
     limit = int(input_data.get("limit", 100))
-    instruction = str(input_data.get("instruction") or "").strip()
+    instructions = _normalize_tavily_instructions(input_data)
     select_paths = input_data.get("select_paths")
     exclude_paths = input_data.get("exclude_paths")
 
@@ -1036,8 +1040,8 @@ def _tool_map_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "max_breadth": max(1, max_breadth),
         "limit": max(1, limit),
     }
-    if instruction:
-        payload["instruction"] = instruction
+    if instructions:
+        payload["instructions"] = instructions
     if isinstance(select_paths, list) and select_paths:
         payload["select_paths"] = [item for item in select_paths if isinstance(item, str) and item.strip()]
     if isinstance(exclude_paths, list) and exclude_paths:
@@ -1304,6 +1308,126 @@ def _tool_arxiv_search_and_download(input_data: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def _tool_arxiv_paper_ingest(input_data: dict[str, Any]) -> dict[str, Any]:
+    arxiv_id = str(input_data.get("arxiv_id") or "").strip()
+    paper_url = str(input_data.get("paper_url") or input_data.get("url") or "").strip()
+    pdf_url = str(input_data.get("pdf_url") or "").strip()
+    if not (arxiv_id or paper_url or pdf_url):
+        raise RuntimeError("Missing required input: arxiv_id, paper_url/url, or pdf_url")
+
+    timeout_seconds = int(input_data.get("timeout_seconds", 1200))
+    metadata_file = str(input_data.get("metadata_file") or "metadata.json")
+    text_file = str(input_data.get("text_file") or "paper_text.txt")
+
+    out_input = input_data.get("output_dir")
+    temp_output = False
+    if out_input:
+        output_dir = Path(str(out_input)).expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        temp_output = True
+        output_dir = Path(tempfile.mkdtemp(prefix="arxiv_paper_"))
+
+    cmd = [
+        sys.executable,
+        str(_INTEGRATION_DIR / "arxiv_paper_ingest.py"),
+        "--output-dir",
+        str(output_dir),
+        "--metadata-file",
+        metadata_file,
+        "--text-file",
+        text_file,
+    ]
+
+    if arxiv_id:
+        cmd.extend(["--arxiv-id", arxiv_id])
+    if paper_url:
+        cmd.extend(["--paper-url", paper_url])
+    if pdf_url:
+        cmd.extend(["--pdf-url", pdf_url])
+
+    author_hint = str(
+        input_data.get("author_hint")
+        or input_data.get("person_name")
+        or input_data.get("author")
+        or input_data.get("name")
+        or ""
+    ).strip()
+    topic_hint = str(input_data.get("topic_hint") or input_data.get("topic") or "").strip()
+    if author_hint:
+        cmd.extend(["--author-hint", author_hint])
+    if topic_hint:
+        cmd.extend(["--topic-hint", topic_hint])
+
+    mapping: dict[str, str] = {
+        "base_url": "--base-url",
+        "timeout": "--timeout",
+        "user_agent": "--user-agent",
+        "max_retries": "--max-retries",
+        "retry_backoff": "--retry-backoff",
+        "max_pages": "--max-pages",
+        "max_text_chars": "--max-text-chars",
+    }
+    for key, flag in mapping.items():
+        if key in input_data and input_data[key] is not None:
+            cmd.extend([flag, str(input_data[key])])
+
+    if bool(input_data.get("overwrite", False)):
+        cmd.append("--overwrite")
+
+    stdout, stderr = _run_cmd(cmd, timeout_seconds=timeout_seconds)
+
+    metadata_path = output_dir / metadata_file
+    metadata: dict[str, Any] = {}
+    if metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    paper = metadata.get("paper") if isinstance(metadata, dict) and isinstance(metadata.get("paper"), dict) else {}
+    pdf_file = str(paper.get("pdf_file") or "").strip()
+    paper_text_path = str(paper.get("paper_text_path") or "").strip()
+    raw_files = [
+        str(path)
+        for path in [metadata_path, Path(pdf_file) if pdf_file else None, Path(paper_text_path) if paper_text_path else None]
+        if path and Path(path).exists()
+    ]
+
+    extracted_entry = {
+        "arxiv_id": paper.get("arxiv_id"),
+        "title": _clean_text(paper.get("title"), max_len=250),
+        "published": paper.get("published"),
+        "authors": paper.get("authors"),
+        "affiliations": paper.get("affiliations"),
+        "pdf_url": paper.get("pdf_url"),
+        "topics": paper.get("topics"),
+        "emails": paper.get("emails"),
+        "extracted_text": _clean_text(paper.get("summary") or paper.get("text_excerpt"), max_len=700),
+    }
+
+    result = {
+        "output_dir": str(output_dir),
+        "metadata_path": str(metadata_path),
+        "paper_text_path": paper_text_path,
+        "pdf_file": pdf_file,
+        "pdf_files": [pdf_file] if pdf_file else [],
+        "raw_files": raw_files,
+        "metadata": metadata,
+        "paper": paper,
+        "papers": [paper] if paper else [],
+        "topics": paper.get("topics") if isinstance(paper.get("topics"), list) else [],
+        "emails": paper.get("emails") if isinstance(paper.get("emails"), list) else [],
+        "author_contacts": paper.get("author_contacts") if isinstance(paper.get("author_contacts"), list) else [],
+        "coauthors": paper.get("coauthors") if isinstance(paper.get("coauthors"), list) else [],
+        "extracted_entries": [extracted_entry] if paper else [],
+        "stdout": stdout[:3000],
+        "stderr": stderr[:3000],
+    }
+
+    if temp_output:
+        result["note"] = "Output was written to a temporary directory. Pass output_dir to persist files."
+
+    return result
+
+
 def _run_academic_tool(module_name: str, input_data: dict[str, Any]) -> dict[str, Any]:
     module = __import__(f"academic.{module_name}", fromlist=["run"])
     handler = getattr(module, "run", None)
@@ -1426,6 +1550,7 @@ def main() -> None:
         "linkedin_download_html_ocr": _tool_linkedin_download_html_ocr,
         "google_serp_person_search": _tool_google_serp_person_search,
         "arxiv_search_and_download": _tool_arxiv_search_and_download,
+        "arxiv_paper_ingest": _tool_arxiv_paper_ingest,
         "github_identity_search": lambda input_data: _run_technical_tool("github_identity_search", input_data),
         "gitlab_identity_search": lambda input_data: _run_technical_tool("gitlab_identity_search", input_data),
         "personal_site_search": lambda input_data: _run_technical_tool("personal_site_search", input_data),
