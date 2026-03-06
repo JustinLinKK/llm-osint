@@ -24,6 +24,12 @@ class ReceiptStub:
     vector_upserts: Dict[str, Any] = field(default_factory=dict)
     graph_upserts: Dict[str, Any] = field(default_factory=dict)
     next_hints: List[str] = field(default_factory=list)
+    next_urls: List[str] = field(default_factory=list)
+    next_people: List[str] = field(default_factory=list)
+    next_orgs: List[str] = field(default_factory=list)
+    next_topics: List[str] = field(default_factory=list)
+    next_handles: List[str] = field(default_factory=list)
+    next_queries: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1379,3 +1385,103 @@ def test_planner_review_receipts_defers_unanchored_secondary_people_in_simple_sc
         for item in updated["queued_tasks"]
     )
     assert any("simple scholar mode" in item.lower() for item in updated["noteboard_sections"]["depth_candidates"])
+
+
+def test_related_entity_follow_up_tasks_use_natural_language_tavily_queries(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    tasks, _dedupe_store, _notes = planner_graph._derive_related_entity_expansion_follow_up_tasks(
+        run_id="run-1",
+        receipts=[],
+        candidates=[
+            {
+                "entity_name": "Frederick Pi",
+                "entity_type": "person",
+                "expandable": True,
+                "relationship_types": ["COAUTHORED_WITH"],
+                "supporting_tools": ["semantic_scholar_search"],
+                "domains": [],
+                "urls": ["https://example.edu/people/frederick-pi"],
+                "anchor_types": ["url"],
+            },
+            {
+                "entity_name": "Scientific Reports",
+                "entity_type": "topic",
+                "expandable": True,
+                "relationship_types": [],
+                "supporting_tools": ["tavily_research"],
+                "domains": [],
+                "urls": [],
+            },
+            {
+                "entity_name": "OpenAI",
+                "entity_type": "organization",
+                "expandable": True,
+                "relationship_types": [],
+                "supporting_tools": ["company_officer_search"],
+                "domains": [],
+                "urls": [],
+            },
+        ],
+        primary_person_targets=["Frederick Xinyu Pi"],
+        iteration=1,
+        dedupe_store={},
+        allow_related_person_depth=True,
+        allow_related_topic_depth=True,
+    )
+
+    tavily_inputs = [
+        item.payload["input"]
+        for item in tasks
+        if getattr(item, "tool_name", "") == "tavily_research" and isinstance(getattr(item, "payload", None), dict)
+    ]
+
+    assert "Find public information about Frederick Pi, including biography, affiliations, publications, employment history, and online presence." in tavily_inputs
+    assert any(text.startswith("Find how the topic or publication 'Scientific Reports' connects to Frederick Xinyu Pi") for text in tavily_inputs)
+    assert "Find public information about the organization OpenAI, including profile, activities, staff, and official websites." in tavily_inputs
+
+
+def test_validate_llm_plan_items_drops_unanchored_person_like_tavily_research(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    plan = [
+        planner_graph.ToolPlanItem(
+            tool="tavily_research",
+            arguments={"runId": "run-1", "input": "Scientific Reports", "timeout_seconds": 180},
+            rationale="Expand related-person coverage for discovered person: Scientific Reports",
+        )
+    ]
+
+    filtered, notes = planner_graph._validate_llm_plan_items(
+        state={"run_id": "run-1", "tool_receipts": []},
+        llm=None,
+        plan=plan,
+        primary_person_targets=["Xinyu Pi"],
+    )
+
+    assert filtered == []
+    assert any("Scientific Reports" in note for note in notes)
+
+
+def test_final_plan_rationale_prefers_final_tool_plan(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    rationale = planner_graph._final_plan_rationale(
+        [
+            planner_graph.ToolPlanItem(
+                tool="github_identity_search",
+                arguments={"runId": "run-1", "person_name": "Xinyu Pi"},
+                rationale="Resolve public code identity anchors for Xinyu Pi.",
+            ),
+            planner_graph.ToolPlanItem(
+                tool="extract_webpage",
+                arguments={"runId": "run-1", "url": "https://example.edu/profile", "query": "Extract profile evidence."},
+                rationale="Extract official profile evidence from example.edu.",
+            ),
+        ],
+        "stale llm rationale",
+    )
+
+    assert "Resolve public code identity anchors for Xinyu Pi" in rationale
+    assert "Extract official profile evidence from example.edu" in rationale
+    assert "stale llm rationale" not in rationale

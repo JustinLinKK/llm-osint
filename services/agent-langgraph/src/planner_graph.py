@@ -1485,6 +1485,14 @@ def build_planner_graph(
                 llm_plan = _normalize_llm_tool_plan(
                     result.get("plan", []), state["run_id"], catalog_tool_names, person_targets
                 )
+                llm_plan, llm_plan_notes = _validate_llm_plan_items(
+                    state=state,
+                    llm=llm,
+                    plan=llm_plan,
+                    primary_person_targets=person_targets,
+                )
+                if llm_plan_notes:
+                    rationale = "\n".join([*llm_plan_notes, rationale]).strip()
                 llm_urls = [url for url in result.get(
                     "urls", []) if isinstance(url, str)]
                 seed_urls = _dedupe(seed_urls + llm_urls)
@@ -1658,7 +1666,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_research",
-                            arguments={"runId": state["run_id"], "input": target_name, "timeout_seconds": 240},
+                            arguments={"runId": state["run_id"], "input": _tavily_person_research_query(target_name), "timeout_seconds": 240},
                             rationale=f"Use Tavily research as the high-depth public-web entry point for a cited synthesis of biography, affiliations, relationships, and public footprint for: {target_name}",
                         )
                     )
@@ -1666,7 +1674,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
+                            arguments={"runId": state["run_id"], "target_name": target_name, "query": _tavily_person_search_query(target_name), "max_results": 10},
                             rationale=f"Use Tavily search as the broad discovery layer for biography, history, contact, and relationship clues for: {target_name}",
                         )
                     )
@@ -1772,7 +1780,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_research",
-                            arguments={"runId": state["run_id"], "input": target_name, "timeout_seconds": 180},
+                            arguments={"runId": state["run_id"], "input": _tavily_person_research_query(target_name), "timeout_seconds": 180},
                             rationale=f"Expand related-person coverage with cited Tavily research for discovered person: {target_name}",
                         )
                     )
@@ -1780,7 +1788,7 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
+                            arguments={"runId": state["run_id"], "target_name": target_name, "query": _tavily_person_search_query(target_name), "max_results": 10},
                             rationale=f"Expand related-person coverage using Tavily search for discovered person: {target_name}",
                         )
                     )
@@ -2001,6 +2009,7 @@ def build_planner_graph(
                     "stage1_max_tools_per_iteration": STAGE1_MAX_TOOLS_PER_ITERATION,
                 },
             )
+        rationale = _final_plan_rationale(plan, rationale)
         current_fetch_urls = _fetch_urls_from_plan(plan)
 
         logger.info("Planner tool plan created", extra={"count": len(plan)})
@@ -2129,7 +2138,7 @@ def build_planner_graph(
                     source_host = _domain_from_url(source_url)
                     if source_host:
                         allowed_hosts.append(source_host)
-            for hint in receipt.next_hints:
+            for hint in _receipt_next_values(receipt, "next_urls"):
                 discovered = _normalize_crawl_url(hint)
                 if discovered:
                     discovered_urls.append(discovered)
@@ -2432,6 +2441,7 @@ def build_planner_graph(
             iteration=state.get("iteration", 0),
             dedupe_store=depth_task_dedupe,
             allow_related_person_depth=allow_related_person_depth,
+            allow_related_topic_depth=allow_related_person_depth,
         )
         if depth_follow_up_tasks:
             queued_tasks.extend(
@@ -2790,6 +2800,49 @@ def _tavily_github_query(target: str) -> str:
     return f"Find the public GitHub profile, account, or repositories associated with {normalized}.".strip()
 
 
+def _tavily_person_research_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return (
+            "Find public information about the target, including biography, affiliations, publications, "
+            "employment history, and online presence."
+        )
+    return (
+        f"Find public information about {normalized}, including biography, affiliations, publications, "
+        "employment history, and online presence."
+    )
+
+
+def _tavily_person_search_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return "Find public profiles, biographies, affiliations, and contact-relevant web results for the target."
+    return f"Find public profiles, biographies, affiliations, and contact-relevant web results for {normalized}."
+
+
+def _tavily_org_research_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return "Find public information about the organization, including profile, activities, staff, and official websites."
+    return f"Find public information about the organization {normalized}, including profile, activities, staff, and official websites."
+
+
+def _tavily_topic_research_query(topic: str, primary_name: str = "") -> str:
+    normalized_topic = " ".join(str(topic or "").split()).strip()
+    normalized_primary = " ".join(str(primary_name or "").split()).strip()
+    if normalized_topic and normalized_primary:
+        return (
+            f"Find how the topic or publication '{normalized_topic}' connects to {normalized_primary}, "
+            "including related papers, coauthors, organizations, and official sources."
+        )
+    if normalized_topic:
+        return (
+            f"Find how the topic or publication '{normalized_topic}' connects to researchers, organizations, "
+            "papers, and official sources."
+        )
+    return "Find how the topic connects to researchers, organizations, papers, and official sources."
+
+
 def _tavily_extract_query(target: str) -> str:
     normalized = " ".join(str(target or "").split()).strip()
     if not normalized:
@@ -2922,6 +2975,21 @@ def _extract_ipv4_from_state(state: PlannerState) -> List[str]:
 
 def _extract_person_targets_from_state(state: PlannerState) -> List[str]:
     return _dedupe(_extract_primary_person_targets(state) + _extract_related_person_targets_from_receipts(state))
+
+
+def _receipt_next_values(receipt: ToolReceipt, field_name: str) -> List[str]:
+    values = getattr(receipt, field_name, None)
+    if isinstance(values, list):
+        normalized = [str(item).strip() for item in values if str(item).strip()]
+        if normalized:
+            return _dedupe(normalized)
+    if field_name == "next_urls":
+        legacy_hints = getattr(receipt, "next_hints", [])
+        if isinstance(legacy_hints, list):
+            urls = [str(item).strip() for item in legacy_hints if isinstance(item, str) and str(item).strip().startswith(("http://", "https://"))]
+            if urls:
+                return _dedupe(urls)
+    return []
 
 
 def _extract_primary_person_targets(state: PlannerState) -> List[str]:
@@ -3665,6 +3733,141 @@ def _adjudicate_related_entity_candidates(
                 f"Entity adjudication deferred secondary-person expansion for {merged.get('entity_name')}: {merged.get('adjudication_reason') or 'insufficient anchor evidence'}."
             )
     return final_candidates, _dedupe(notes)
+
+
+def _primary_target_aliases(primary_person_targets: List[str]) -> set[str]:
+    aliases: set[str] = set()
+    for target in primary_person_targets:
+        cleaned = str(target or "").strip()
+        if not cleaned:
+            continue
+        aliases.add(cleaned.casefold())
+        for alias in extract_person_targets(cleaned):
+            if isinstance(alias, str) and alias.strip():
+                aliases.add(alias.strip().casefold())
+    return aliases
+
+
+def _parse_tavily_person_research_target(query: str) -> str | None:
+    text = " ".join(str(query or "").split()).strip()
+    if not text:
+        return None
+    prefix = "find public information about "
+    suffix = ", including biography, affiliations, publications, employment history, and online presence."
+    lowered = text.casefold()
+    if lowered.startswith(prefix) and lowered.endswith(suffix):
+        candidate = text[len(prefix): -len(suffix)]
+        return " ".join(candidate.split()).strip(" '\"") or None
+    return None
+
+
+def _looks_like_non_person_tavily_query(query: str) -> bool:
+    lowered = " ".join(str(query or "").split()).strip().casefold()
+    if not lowered:
+        return False
+    return (
+        "topic or publication" in lowered
+        or "connects to researchers" in lowered
+        or "connects to " in lowered and "coauthors" in lowered
+        or "organization " in lowered
+        or "official websites" in lowered
+    )
+
+
+def _llm_plan_related_person_target(item: ToolPlanItem) -> str | None:
+    arguments = item.arguments or {}
+    if item.tool == "tavily_research":
+        input_text = str(arguments.get("input") or "").strip()
+        if not input_text or _looks_like_non_person_tavily_query(input_text):
+            return None
+        parsed = _parse_tavily_person_research_target(input_text)
+        if parsed:
+            return parsed
+        return normalize_person_candidate(input_text)
+    if item.tool in {"tavily_person_search", "person_search"}:
+        for key in ("target_name", "name"):
+            candidate = normalize_person_candidate(str(arguments.get(key) or "").strip())
+            if candidate:
+                return candidate
+        return normalize_person_candidate(str(arguments.get("query") or "").strip())
+    if item.tool in {
+        "github_identity_search",
+        "gitlab_identity_search",
+        "semantic_scholar_search",
+        "orcid_search",
+        "dblp_author_search",
+        "company_officer_search",
+        "sec_person_search",
+    }:
+        return normalize_person_candidate(str(arguments.get("person_name") or "").strip())
+    return None
+
+
+def _validate_llm_plan_items(
+    *,
+    state: PlannerState,
+    llm: OpenRouterLLM | None,
+    plan: List[ToolPlanItem],
+    primary_person_targets: List[str],
+) -> tuple[List[ToolPlanItem], List[str]]:
+    if not plan:
+        return [], []
+    alias_set = _primary_target_aliases(primary_person_targets)
+    candidate_rows: List[Dict[str, Any]] = []
+    candidate_map: Dict[str, Dict[str, Any]] = {}
+    for item in plan:
+        candidate_name = _llm_plan_related_person_target(item)
+        if not candidate_name or candidate_name.casefold() in alias_set:
+            continue
+        key = candidate_name.casefold()
+        if key in candidate_map:
+            continue
+        supporting_tool = item.tool if item.tool in NOISY_WEB_RELATED_PERSON_TOOLS else "tavily_research"
+        candidate = {
+            "entity_name": candidate_name,
+            "entity_type": "person",
+            "relationship_types": [],
+            "supporting_tools": [supporting_tool],
+            "domains": [],
+            "urls": [],
+            "mention_count": 1,
+            "score": 1,
+        }
+        candidate_rows.append(candidate)
+        candidate_map[key] = candidate
+    if not candidate_rows:
+        return plan, []
+    adjudicated_candidates, notes = _adjudicate_related_entity_candidates(
+        llm=llm,
+        run_id=state["run_id"],
+        receipts=list(state.get("tool_receipts", [])),
+        primary_person_targets=primary_person_targets,
+        candidates=candidate_rows,
+    )
+    adjudicated_map = {
+        str(item.get("entity_name") or "").strip().casefold(): item
+        for item in adjudicated_candidates
+        if str(item.get("entity_name") or "").strip()
+    }
+    filtered_plan: List[ToolPlanItem] = []
+    dropped_notes: List[str] = []
+    for item in plan:
+        candidate_name = _llm_plan_related_person_target(item)
+        if not candidate_name or candidate_name.casefold() in alias_set:
+            filtered_plan.append(item)
+            continue
+        adjudicated = adjudicated_map.get(candidate_name.casefold())
+        if not adjudicated:
+            filtered_plan.append(item)
+            continue
+        anchored = bool(adjudicated.get("anchor_types")) or _candidate_has_structured_person_support(adjudicated) or adjudicated.get("adjudication_source") == "llm"
+        if adjudicated.get("entity_type") == "person" and adjudicated.get("expandable", False) and anchored:
+            filtered_plan.append(item)
+            continue
+        dropped_notes.append(
+            f"Dropped LLM-planned {item.tool} pivot for {candidate_name}: {adjudicated.get('adjudication_reason') or 'insufficient anchor evidence'}."
+        )
+    return filtered_plan, _dedupe(notes + dropped_notes)
 
 
 def _rank_related_entity_candidates(
@@ -5171,7 +5374,7 @@ def _receipt_source_urls(receipt: ToolReceipt) -> List[str]:
     for fact in receipt.key_facts:
         if isinstance(fact, dict):
             urls.extend(_extract_urls_from_value(fact))
-    for hint in receipt.next_hints:
+    for hint in _receipt_next_values(receipt, "next_urls"):
         if isinstance(hint, str) and hint.startswith(("http://", "https://")):
             urls.append(hint)
     normalized: List[str] = []
@@ -5559,6 +5762,7 @@ def _derive_related_entity_expansion_follow_up_tasks(
     iteration: int,
     dedupe_store: Dict[str, int],
     allow_related_person_depth: bool,
+    allow_related_topic_depth: bool,
 ):
     dedupe_store = prune_dedupe_store(dedupe_store, iteration)
     tasks = []
@@ -5570,6 +5774,7 @@ def _derive_related_entity_expansion_follow_up_tasks(
         if not entity_name or not entity_type:
             continue
         relationship_types = {str(item).strip() for item in candidate.get("relationship_types", []) if str(item).strip()}
+        supporting_tools = {str(item).strip() for item in candidate.get("supporting_tools", []) if str(item).strip()}
         if _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
             continue
         if entity_type == "person":
@@ -5601,7 +5806,7 @@ def _derive_related_entity_expansion_follow_up_tasks(
                 dedupe_store,
                 iteration,
                 tool_name="tavily_research",
-                payload={"runId": run_id, "input": entity_name, "timeout_seconds": 180},
+                payload={"runId": run_id, "input": _tavily_person_research_query(entity_name), "timeout_seconds": 180},
                 priority=PRIORITY_HIGH,
                 reason=f"Depth expansion: investigate secondary person {entity_name} beyond mention-level coverage.",
             )
@@ -5649,7 +5854,7 @@ def _derive_related_entity_expansion_follow_up_tasks(
                 dedupe_store,
                 iteration,
                 tool_name="tavily_research",
-                payload={"runId": run_id, "input": f"{entity_name} organization profile public activities", "timeout_seconds": 180},
+                payload={"runId": run_id, "input": _tavily_org_research_query(entity_name), "timeout_seconds": 180},
                 priority=PRIORITY_HIGH,
                 reason=f"Depth expansion: investigate what related organization {entity_name} does and its public footprint.",
             )
@@ -5712,7 +5917,13 @@ def _derive_related_entity_expansion_follow_up_tasks(
                     reason=f"Depth expansion: extract staff, management, and researcher names from related organization {entity_name}.",
                 )
         elif entity_type == "topic":
-            topic_query = f"{primary_name} {entity_name}".strip() if primary_name else f"{entity_name} researchers organizations companies"
+            noisy_support_only = bool(supporting_tools) and supporting_tools.issubset(NOISY_WEB_RELATED_PERSON_TOOLS)
+            if not allow_related_topic_depth and noisy_support_only and not candidate.get("anchor_types"):
+                notes.append(
+                    f"Skipped secondary-topic depth for {entity_name}: simple scholar mode requires anchored evidence for Tavily-derived topic fanout."
+                )
+                continue
+            topic_query = _tavily_topic_research_query(entity_name, primary_name)
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -6050,6 +6261,20 @@ def _prefer_research_tool_sources(plan: List[ToolPlanItem]) -> List[ToolPlanItem
     indexed_plan = list(enumerate(plan))
     indexed_plan.sort(key=lambda item: (_tool_source_preference_rank(item[1].tool), item[0]))
     return [item for _, item in indexed_plan]
+
+
+def _final_plan_rationale(plan: List[ToolPlanItem], fallback: str = "") -> str:
+    if not plan:
+        return fallback.strip()
+    lines: List[str] = []
+    for item in plan[: min(6, len(plan))]:
+        rationale = str(item.rationale or "").strip()
+        if rationale:
+            lines.append(rationale)
+        else:
+            lines.append(f"Run {item.tool}.")
+    text = "\n".join(_dedupe(lines)).strip()
+    return text or fallback.strip()
 
 
 def _planner_completed_tool_calls(state: PlannerState, limit: int = 25) -> List[Dict[str, Any]]:

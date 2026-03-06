@@ -855,7 +855,15 @@ Return JSON only:
 {
   "summary": "string",
   "key_facts": [{"k": "v"}],
-  "next_hints": ["string"]
+  "next_hints": ["string"],
+  "next_pivots": {
+    "next_urls": ["string"],
+    "next_people": ["string"],
+    "next_orgs": ["string"],
+    "next_topics": ["string"],
+    "next_handles": ["string"],
+    "next_queries": ["string"]
+  }
 }
 
 Rules:
@@ -892,6 +900,15 @@ next_hints (3–8 items):
 - Actionable follow-ups using deterministic pivots, not generic advice.
 - If the output contains high-value URLs (profiles/PDFs/directories), include them explicitly as next_hints items.
 - Prefer hints that close obvious gaps: corroboration, timeline anchors, coauthor network expansion, contact surface completion, archive coverage.
+
+next_pivots:
+- Prefer typed pivots over free-text.
+- `next_urls`: profile URLs, PDFs, directories, archived pages.
+- `next_people`: only exact person names with profile or relationship evidence.
+- `next_orgs`: normalized institutions, employers, labs, or companies.
+- `next_topics`: normalized research areas or technical topics, not arbitrary paper-title fragments.
+- `next_handles`: usernames or social/code handles.
+- `next_queries`: only natural-language follow-up queries when no stable pivot exists.
 """
 
 

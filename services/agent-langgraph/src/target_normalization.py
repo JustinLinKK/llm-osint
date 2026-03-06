@@ -19,6 +19,8 @@ PERSON_HINT_REGEX = re.compile(
 
 PERSON_CANDIDATE_STOPWORDS = {
     "please",
+    "map",
+    "mapping",
     "investigate",
     "investigation",
     "profile",
@@ -50,6 +52,8 @@ PERSON_CANDIDATE_STOPWORDS = {
 PERSON_CANDIDATE_BREAKWORDS = {
     "and",
     "or",
+    "of",
+    "the",
     "with",
     "for",
     "about",
@@ -159,6 +163,8 @@ PERSON_CANDIDATE_REJECT_TOKENS = {
     "linkedin",
     "repository",
     "repositories",
+    "map",
+    "mapping",
 }
 
 PERSON_CANDIDATE_REJECT_PHRASES = (
@@ -337,9 +343,13 @@ def extract_person_targets(text: str) -> List[str]:
         if normalized:
             candidates.append(normalized)
 
-    direct = normalize_person_candidate(scrubbed)
-    if direct:
-        candidates.append(direct)
+    # Only treat the full string as a candidate when the source text is already short.
+    # Longer prompt-style strings ("Map the public profile of ...") are better handled
+    # by the targeted regex passes above.
+    if len(scrubbed.split()) <= 8:
+        direct = normalize_person_candidate(scrubbed)
+        if direct:
+            candidates.append(direct)
 
     return _dedupe(candidates)
 
@@ -351,6 +361,51 @@ def sanitize_search_tool_arguments(
 ) -> Dict[str, Any]:
     normalized = dict(arguments)
     fallback = next((item for item in (fallback_person_targets or []) if isinstance(item, str) and item.strip()), None)
+
+    def normalized_text(value: Any) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    def looks_like_natural_language_query(value: str) -> bool:
+        text = normalized_text(value)
+        if not text:
+            return False
+        lowered = text.casefold()
+        if text.startswith(("http://", "https://")):
+            return False
+        if len(text.split()) >= 6:
+            return True
+        return lowered.startswith(
+            (
+                "find ",
+                "search ",
+                "who is ",
+                "look up ",
+                "look for ",
+                "research ",
+                "identify ",
+                "discover ",
+                "check ",
+                "show ",
+            )
+        )
+
+    def tavily_research_query(target: str) -> str:
+        cleaned = normalized_text(target)
+        if not cleaned:
+            return (
+                "Find public information about the target, including biography, affiliations, publications, "
+                "employment history, and online presence."
+            )
+        return (
+            f"Find public information about {cleaned}, including biography, affiliations, publications, "
+            "employment history, and online presence."
+        )
+
+    def tavily_person_query(target: str) -> str:
+        cleaned = normalized_text(target)
+        if not cleaned:
+            return "Find public profiles, biographies, affiliations, and contact-relevant web results for the target."
+        return f"Find public profiles, biographies, affiliations, and contact-relevant web results for {cleaned}."
 
     def coerce_target(*keys: str) -> str | None:
         for key in keys:
@@ -375,15 +430,27 @@ def sanitize_search_tool_arguments(
             if "query" in normalized:
                 normalized["query"] = target
 
+    if tool_name == "tavily_research":
+        explicit_input = normalized_text(normalized.get("input"))
+        target = coerce_target("input", "query", "target_name", "name")
+        if target:
+            normalized["input"] = tavily_research_query(target)
+        elif explicit_input and not looks_like_natural_language_query(explicit_input):
+            normalized["input"] = tavily_research_query(explicit_input)
+
     if tool_name == "tavily_person_search":
         target = coerce_target("target_name", "query", "name")
         if target:
             normalized["target_name"] = target
             explicit_query = normalized.get("query")
             if isinstance(explicit_query, str) and explicit_query.strip():
-                normalized["query"] = explicit_query.strip()
+                normalized["query"] = (
+                    explicit_query.strip()
+                    if looks_like_natural_language_query(explicit_query)
+                    else tavily_person_query(target)
+                )
             else:
-                normalized["query"] = target
+                normalized["query"] = tavily_person_query(target)
             if "name" in normalized:
                 normalized["name"] = target
 

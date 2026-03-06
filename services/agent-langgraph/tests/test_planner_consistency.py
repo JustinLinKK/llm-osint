@@ -22,6 +22,12 @@ class ReceiptStub:
     vector_upserts: Dict[str, Any] = field(default_factory=dict)
     graph_upserts: Dict[str, Any] = field(default_factory=dict)
     next_hints: List[str] = field(default_factory=list)
+    next_urls: List[str] = field(default_factory=list)
+    next_people: List[str] = field(default_factory=list)
+    next_orgs: List[str] = field(default_factory=list)
+    next_topics: List[str] = field(default_factory=list)
+    next_handles: List[str] = field(default_factory=list)
+    next_queries: List[str] = field(default_factory=list)
 
 
 def _load_planner_graph_module(monkeypatch):

@@ -36,6 +36,14 @@ def test_extract_person_targets_drops_leading_breakwords() -> None:
     ]
 
 
+def test_extract_person_targets_ignores_prompt_leadin_and_keeps_real_name() -> None:
+    assert extract_person_targets(
+        "Map the public profile of Frederick Xinyu Pi, including academic career, affiliations, collaborators, publications, code presence, and public online profiles."
+    ) == [
+        "Frederick Xinyu Pi"
+    ]
+
+
 def test_sanitize_search_tool_arguments_uses_fallback_when_query_is_not_a_person() -> None:
     normalized = sanitize_search_tool_arguments(
         "tavily_person_search",
@@ -48,3 +56,52 @@ def test_sanitize_search_tool_arguments_uses_fallback_when_query_is_not_a_person
 
     assert normalized["target_name"] == "Ada Lovelace"
     assert normalized["query"] == "Find the public GitHub profile or account for Biomedical Engineering Her."
+
+
+def test_sanitize_search_tool_arguments_rewrites_bare_tavily_research_input_as_natural_language() -> None:
+    normalized = sanitize_search_tool_arguments(
+        "tavily_research",
+        {
+            "runId": "run-1",
+            "input": "Frederick Pi",
+        },
+    )
+
+    assert normalized["input"] == (
+        "Find public information about Frederick Pi, including biography, affiliations, publications, "
+        "employment history, and online presence."
+    )
+
+
+def test_sanitize_search_tool_arguments_rewrites_prompt_style_tavily_research_input_to_real_target() -> None:
+    normalized = sanitize_search_tool_arguments(
+        "tavily_research",
+        {
+            "runId": "run-1",
+            "input": (
+                "Map the public profile of Frederick Xinyu Pi, including academic career, affiliations, "
+                "collaborators, publications, code presence, and public online profiles."
+            ),
+        },
+    )
+
+    assert normalized["input"] == (
+        "Find public information about Frederick Xinyu Pi, including biography, affiliations, publications, "
+        "employment history, and online presence."
+    )
+
+
+def test_sanitize_search_tool_arguments_rewrites_bare_tavily_person_query_as_natural_language() -> None:
+    normalized = sanitize_search_tool_arguments(
+        "tavily_person_search",
+        {
+            "runId": "run-1",
+            "target_name": "Frederick Pi",
+            "query": "Frederick Pi",
+        },
+    )
+
+    assert normalized["target_name"] == "Frederick Pi"
+    assert normalized["query"] == (
+        "Find public profiles, biographies, affiliations, and contact-relevant web results for Frederick Pi."
+    )

@@ -4,6 +4,8 @@ import json
 import os
 import re
 import hashlib
+import threading
+import time
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, List, TypedDict
@@ -40,7 +42,7 @@ from system_prompts import (
     WORKER_TOOL_SUMMARY_SYSTEM_PROMPT,
     WORKER_SUMMARIZE_RECEIPT_SYSTEM_PROMPT,
 )
-from target_normalization import extract_person_targets, sanitize_search_tool_arguments
+from target_normalization import extract_person_targets, normalize_person_candidate, sanitize_search_tool_arguments
 from logger import get_logger
 from env import load_env
 
@@ -122,6 +124,95 @@ TOOL_CONFIDENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
     # "ssrn_author_search": {"type": "academic_stub", "confidence": 0.2},
 }
 
+PROFILEISH_PIVOT_HOSTS = {
+    "github.com",
+    "gitlab.com",
+    "linkedin.com",
+    "openreview.net",
+    "orcid.org",
+    "scholar.google.com",
+    "semanticscholar.org",
+    "dblp.org",
+    "academia.edu",
+}
+PROFILEISH_PIVOT_PATH_MARKERS = (
+    "/in/",
+    "/author/",
+    "/authors/",
+    "/profile",
+    "/profiles/",
+    "/people/",
+    "/person/",
+    "/citations",
+    "/users/",
+)
+NEXT_PIVOT_ORG_KEYS = {
+    "organizations",
+    "organization",
+    "affiliations",
+    "institution",
+    "institutions",
+    "employers",
+    "companies",
+    "company",
+    "labs",
+    "lab",
+    "schools",
+    "school",
+    "departments",
+    "sharedOrganizations",
+    "companyName",
+}
+NEXT_PIVOT_TOPIC_KEYS = {
+    "topics",
+    "topic",
+    "research_interests",
+    "research_areas",
+    "field_keywords",
+    "focus",
+    "industry",
+    "skills",
+    "skill_set",
+    "technical_skills",
+    "technicalSkills",
+    "interests",
+    "personal_interests",
+    "personalInterests",
+    "keywords",
+    "keyword",
+    "subjects",
+    "subject",
+    "categories",
+}
+NEXT_PIVOT_PERSON_KEYS = {
+    "relatedPeople",
+    "coauthors",
+    "authors",
+    "advisor",
+    "advisors",
+    "collaborators",
+    "colleagues",
+    "mentors",
+    "labMembers",
+    "officers",
+    "staff",
+}
+NEXT_PIVOT_HANDLE_KEYS = {
+    "relatedHandles",
+    "mentionedHandles",
+    "usernames",
+    "username",
+    "handles",
+    "handle",
+}
+TAVILY_THROTTLED_TOOL_NAMES = {"tavily_research", "tavily_person_search"}
+TAVILY_REQUEST_MIN_GAP_SECONDS = max(0.0, float(os.getenv("TAVILY_REQUEST_MIN_GAP_SECONDS", "15.0") or "15.0"))
+TAVILY_RATE_LIMIT_BACKOFF_SECONDS = max(0.0, float(os.getenv("TAVILY_RATE_LIMIT_BACKOFF_SECONDS", "45.0") or "45.0"))
+TAVILY_MAX_RETRIES = max(0, int(os.getenv("TAVILY_MAX_RETRIES", "2") or "2"))
+_TAVILY_REQUEST_LOCK = threading.Lock()
+_TAVILY_LAST_REQUEST_AT = 0.0
+_TAVILY_NOT_BEFORE_AT = 0.0
+
 
 class ToolReceipt(BaseModel):
     run_id: str
@@ -138,6 +229,12 @@ class ToolReceipt(BaseModel):
     vector_upserts: Dict[str, Any] = Field(default_factory=dict)
     graph_upserts: Dict[str, Any] = Field(default_factory=dict)
     next_hints: List[str] = Field(default_factory=list)
+    next_urls: List[str] = Field(default_factory=list)
+    next_people: List[str] = Field(default_factory=list)
+    next_orgs: List[str] = Field(default_factory=list)
+    next_topics: List[str] = Field(default_factory=list)
+    next_handles: List[str] = Field(default_factory=list)
+    next_queries: List[str] = Field(default_factory=list)
 
 
 class ToolWorkerState(TypedDict):
@@ -159,6 +256,287 @@ class ToolWorkerResult:
     result: Dict[str, Any]
 
 
+def _is_http_url(value: str) -> bool:
+    text = str(value or "").strip()
+    return text.startswith(("http://", "https://"))
+
+
+def _is_profileish_pivot_url(url: str) -> bool:
+    cleaned = _clean_url_candidate(str(url or "").strip())
+    if not cleaned:
+        return False
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (parsed.path or "").lower()
+    return host in PROFILEISH_PIVOT_HOSTS or any(marker in path for marker in PROFILEISH_PIVOT_PATH_MARKERS)
+
+
+def _normalize_receipt_org_candidate(value: Any) -> str | None:
+    candidate = " ".join(str(value or "").strip().split()).strip(" -,:;|")
+    if len(candidate) < 3 or len(candidate) > 120:
+        return None
+    lowered = candidate.casefold()
+    if candidate.startswith(("http://", "https://", "@")) or "@" in candidate:
+        return None
+    if not re.search(
+        r"\b(university|college|school|lab|laboratory|institute|department|center|centre|company|corp|corporation|inc|llc|ltd|group|team|studio)\b",
+        lowered,
+    ) and len(candidate.split()) < 2:
+        return None
+    return candidate
+
+
+def _normalize_receipt_topic_candidate(value: Any) -> str | None:
+    candidate = " ".join(str(value or "").strip().split()).strip(" -,:;|")
+    if len(candidate) < 3 or len(candidate) > 120:
+        return None
+    if candidate.startswith(("http://", "https://", "@")) or "@" in candidate:
+        return None
+    if candidate.count(" ") >= 7:
+        return None
+    if re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9-]*\.)+[A-Za-z]{2,}", candidate):
+        return None
+    return candidate
+
+
+def _normalize_receipt_handle_candidate(value: Any) -> str | None:
+    candidate = " ".join(str(value or "").strip().split()).strip()
+    if not candidate:
+        return None
+    if candidate.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{3,32}", candidate):
+        return candidate
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,31}", candidate):
+        return candidate
+    return None
+
+
+def _looks_like_natural_language_hint(value: str) -> bool:
+    text = " ".join(str(value or "").strip().split())
+    if not text or text.startswith(("http://", "https://", "@")):
+        return False
+    lowered = text.casefold()
+    if len(text.split()) >= 6:
+        return True
+    return lowered.startswith(
+        (
+            "find ",
+            "search ",
+            "who is ",
+            "look up ",
+            "look for ",
+            "research ",
+            "identify ",
+            "discover ",
+            "check ",
+            "show ",
+            "verify ",
+            "cross-reference ",
+            "expand ",
+            "inspect ",
+            "download ",
+            "analyze ",
+        )
+    )
+
+
+def _receipt_person_candidates_from_value(value: Any) -> List[str]:
+    candidates: List[str] = []
+    if isinstance(value, str):
+        normalized = normalize_person_candidate(value)
+        if normalized:
+            candidates.append(normalized)
+    elif isinstance(value, list):
+        for item in value:
+            candidates.extend(_receipt_person_candidates_from_value(item))
+    elif isinstance(value, dict):
+        for key in ("name", "person", "person_name", "author", "advisor", "mentor", "officer"):
+            if key in value:
+                candidates.extend(_receipt_person_candidates_from_value(value.get(key)))
+    return _dedupe_str_list(candidates)
+
+
+def _receipt_profile_support(key_facts: List[Dict[str, Any]], summary: str, hints: List[str]) -> bool:
+    for fact in key_facts:
+        if not isinstance(fact, dict):
+            continue
+        for direct_key in ("profileUrl", "profileUrls", "sourceUrl", "sourceUrls", "externalLinks"):
+            value = fact.get(direct_key)
+            for url in _extract_url_candidates(value):
+                if _is_profileish_pivot_url(url):
+                    return True
+        for url in _extract_url_candidates(fact):
+            if _is_profileish_pivot_url(url):
+                return True
+    for url in _extract_url_candidates(summary):
+        if _is_profileish_pivot_url(url):
+            return True
+    for hint in hints:
+        if _is_profileish_pivot_url(hint):
+            return True
+    return False
+
+
+def _derive_receipt_next_pivots(
+    *,
+    tool_name: str,
+    key_facts: List[Dict[str, Any]],
+    summary: str,
+    next_hints: List[str],
+    llm_next_hints: List[str],
+) -> Dict[str, List[str]]:
+    pivot_buckets: Dict[str, List[str]] = {
+        "next_urls": [],
+        "next_people": [],
+        "next_orgs": [],
+        "next_topics": [],
+        "next_handles": [],
+        "next_queries": [],
+    }
+    all_hints = _dedupe_str_list([str(item) for item in next_hints + llm_next_hints if str(item).strip()])
+    profile_support = _receipt_profile_support(key_facts, summary, all_hints)
+
+    for fact in key_facts:
+        if not isinstance(fact, dict):
+            continue
+        for url in _extract_url_candidates(fact):
+            cleaned = _clean_url_candidate(url)
+            if cleaned:
+                pivot_buckets["next_urls"].append(cleaned)
+        for key, value in fact.items():
+            if key in NEXT_PIVOT_PERSON_KEYS:
+                pivot_buckets["next_people"].extend(_receipt_person_candidates_from_value(value))
+            elif key in NEXT_PIVOT_ORG_KEYS:
+                if isinstance(value, list):
+                    for item in value:
+                        normalized = _normalize_receipt_org_candidate(item)
+                        if normalized:
+                            pivot_buckets["next_orgs"].append(normalized)
+                else:
+                    normalized = _normalize_receipt_org_candidate(value)
+                    if normalized:
+                        pivot_buckets["next_orgs"].append(normalized)
+            elif key in NEXT_PIVOT_TOPIC_KEYS:
+                if isinstance(value, list):
+                    for item in value:
+                        normalized = _normalize_receipt_topic_candidate(item)
+                        if normalized:
+                            pivot_buckets["next_topics"].append(normalized)
+                else:
+                    normalized = _normalize_receipt_topic_candidate(value)
+                    if normalized:
+                        pivot_buckets["next_topics"].append(normalized)
+            elif key in NEXT_PIVOT_HANDLE_KEYS:
+                if isinstance(value, list):
+                    for item in value:
+                        normalized = _normalize_receipt_handle_candidate(item)
+                        if normalized:
+                            pivot_buckets["next_handles"].append(normalized)
+                else:
+                    normalized = _normalize_receipt_handle_candidate(value)
+                    if normalized:
+                        pivot_buckets["next_handles"].append(normalized)
+
+    for hint in all_hints:
+        cleaned_url = _clean_url_candidate(hint) if _is_http_url(hint) else ""
+        if cleaned_url:
+            pivot_buckets["next_urls"].append(cleaned_url)
+            continue
+        handle = _normalize_receipt_handle_candidate(hint)
+        if handle:
+            pivot_buckets["next_handles"].append(handle)
+            continue
+        if tool_name != "tavily_research" and _looks_like_natural_language_hint(hint):
+            pivot_buckets["next_queries"].append(" ".join(hint.split()))
+            continue
+        person_candidate = normalize_person_candidate(hint)
+        if person_candidate and (tool_name != "tavily_research" or profile_support):
+            pivot_buckets["next_people"].append(person_candidate)
+
+    for key in list(pivot_buckets):
+        pivot_buckets[key] = _dedupe_str_list(pivot_buckets[key])
+
+    if tool_name == "tavily_research":
+        pivot_buckets["next_queries"] = []
+    return pivot_buckets
+
+
+def _throttle_tool_request(tool_name: str) -> None:
+    global _TAVILY_LAST_REQUEST_AT
+    if tool_name not in TAVILY_THROTTLED_TOOL_NAMES or TAVILY_REQUEST_MIN_GAP_SECONDS <= 0:
+        return
+    with _TAVILY_REQUEST_LOCK:
+        now = time.monotonic()
+        wait_seconds = TAVILY_REQUEST_MIN_GAP_SECONDS - (now - _TAVILY_LAST_REQUEST_AT)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        _TAVILY_LAST_REQUEST_AT = time.monotonic()
+
+
+def _tool_result_error_text(result: Any) -> str:
+    if result is None:
+        return ""
+    content = getattr(result, "content", None)
+    if isinstance(content, dict):
+        if isinstance(content.get("error"), str):
+            return content["error"]
+        text = content.get("text")
+        if isinstance(text, str):
+            return text
+        try:
+            return json.dumps(content, sort_keys=True)
+        except TypeError:
+            return str(content)
+    return str(content or "")
+
+
+def _is_tavily_rate_limited_result(result: Any) -> bool:
+    error_text = _tool_result_error_text(result).lower()
+    return "429" in error_text or "too many requests" in error_text
+
+
+def _call_tool_with_rate_limit_control(
+    mcp_client: McpClientProtocol,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    run_id: str,
+) -> Any:
+    global _TAVILY_LAST_REQUEST_AT, _TAVILY_NOT_BEFORE_AT
+    if tool_name not in TAVILY_THROTTLED_TOOL_NAMES:
+        return mcp_client.call_tool(tool_name, arguments)
+
+    attempt = 0
+    while True:
+        with _TAVILY_REQUEST_LOCK:
+            now = time.monotonic()
+            not_before_at = max(_TAVILY_LAST_REQUEST_AT + TAVILY_REQUEST_MIN_GAP_SECONDS, _TAVILY_NOT_BEFORE_AT)
+            wait_seconds = not_before_at - now
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            result = mcp_client.call_tool(tool_name, arguments)
+            _TAVILY_LAST_REQUEST_AT = time.monotonic()
+            if not _is_tavily_rate_limited_result(result) or attempt >= TAVILY_MAX_RETRIES:
+                return result
+
+            backoff_seconds = max(
+                TAVILY_REQUEST_MIN_GAP_SECONDS,
+                TAVILY_RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt),
+            )
+            _TAVILY_NOT_BEFORE_AT = max(_TAVILY_NOT_BEFORE_AT, _TAVILY_LAST_REQUEST_AT + backoff_seconds)
+            emit_run_event(
+                run_id,
+                "TOOL_RATE_LIMIT_BACKOFF",
+                {
+                    "tool": tool_name,
+                    "attempt": attempt + 1,
+                    "waitSeconds": round(backoff_seconds, 3),
+                    "error": _tool_result_error_text(result)[:200],
+                },
+            )
+        attempt += 1
+
+
 def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
     graph = StateGraph(ToolWorkerState)
     worker_llm = _build_tool_llm()
@@ -175,7 +553,12 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         arguments = _normalize_tool_arguments(state["tool_name"], state["arguments"])
         emit_run_event(state["run_id"], "TOOL_WORKER_STARTED", {"tool": state["tool_name"]})
         logger.info("Tool worker executing", extra={"tool": state["tool_name"], "run_id": state["run_id"]})
-        result = mcp_client.call_tool(state["tool_name"], arguments)
+        result = _call_tool_with_rate_limit_control(
+            mcp_client,
+            state["tool_name"],
+            arguments,
+            state["run_id"],
+        )
         emit_stage(state, "execute_tool", "completed", ok=result.ok)
         return {"arguments": arguments, "ok": result.ok, "result": result.content}
 
@@ -317,10 +700,15 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         summary = llm_enrichment.get("summary") or summary
         llm_key_facts = llm_enrichment.get("key_facts")
         llm_next_hints = llm_enrichment.get("next_hints")
+        llm_next_pivots = llm_enrichment.get("next_pivots")
         if isinstance(llm_key_facts, list) and llm_key_facts:
             key_facts = _merge_key_fact_lists(key_facts, llm_key_facts)
-        if isinstance(llm_next_hints, list):
-            next_hints = _dedupe_str_list(next_hints + [str(item) for item in llm_next_hints])
+        llm_next_hint_list = [str(item) for item in llm_next_hints if str(item).strip()] if isinstance(llm_next_hints, list) else []
+        if isinstance(llm_next_pivots, dict):
+            for key in ("next_urls", "next_people", "next_orgs", "next_topics", "next_handles", "next_queries"):
+                value = llm_next_pivots.get(key)
+                if isinstance(value, list):
+                    llm_next_hint_list.extend(str(item) for item in value if str(item).strip())
 
         vector_upserts.update(_vector_upsert_from_result(state.get("vector_ingest_result", {})))
         graph_upserts.update(_graph_upsert_from_result(state.get("graph_ingest_result", {})))
@@ -333,6 +721,22 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             vector_upserts["confidenceScore"] = confidence_score
             next_hints.append(f"confidence:{confidence_score:.2f}")
             summary = _append_confidence_line(summary, confidence_score)
+
+        next_pivots = _derive_receipt_next_pivots(
+            tool_name=state["tool_name"],
+            key_facts=key_facts,
+            summary=summary,
+            next_hints=next_hints,
+            llm_next_hints=llm_next_hint_list,
+        )
+        next_hints = _dedupe_str_list(
+            next_pivots["next_urls"]
+            + next_pivots["next_handles"]
+            + next_pivots["next_people"]
+            + next_pivots["next_orgs"]
+            + next_pivots["next_topics"]
+            + next_pivots["next_queries"]
+        )
 
         artifact_ids, document_ids, summary_id = _store_artifacts_and_summary(
             state["run_id"],
@@ -359,6 +763,12 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             vector_upserts=vector_upserts,
             graph_upserts=graph_upserts,
             next_hints=next_hints,
+            next_urls=next_pivots["next_urls"],
+            next_people=next_pivots["next_people"],
+            next_orgs=next_pivots["next_orgs"],
+            next_topics=next_pivots["next_topics"],
+            next_handles=next_pivots["next_handles"],
+            next_queries=next_pivots["next_queries"],
         )
 
         insert_tool_receipt(
@@ -371,6 +781,12 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             vector_upserts=vector_upserts,
             graph_upserts=graph_upserts,
             next_hints=next_hints,
+            next_urls=next_pivots["next_urls"],
+            next_people=next_pivots["next_people"],
+            next_orgs=next_pivots["next_orgs"],
+            next_topics=next_pivots["next_topics"],
+            next_handles=next_pivots["next_handles"],
+            next_queries=next_pivots["next_queries"],
         )
 
         note = _note_from_receipt(receipt)
@@ -4320,6 +4736,14 @@ def _run_receipt_summarize_worker(
             "summary": "string",
             "key_facts": "array<object>",
             "next_hints": "array<string>",
+            "next_pivots": {
+                "next_urls": "array<string>",
+                "next_people": "array<string>",
+                "next_orgs": "array<string>",
+                "next_topics": "array<string>",
+                "next_handles": "array<string>",
+                "next_queries": "array<string>",
+            },
         },
     }
     try:
@@ -4338,6 +4762,7 @@ def _run_receipt_summarize_worker(
     summary = parsed.get("summary")
     key_facts = parsed.get("key_facts")
     next_hints = parsed.get("next_hints")
+    next_pivots = parsed.get("next_pivots")
 
     output: Dict[str, Any] = {}
     if isinstance(summary, str) and summary.strip():
@@ -4346,6 +4771,14 @@ def _run_receipt_summarize_worker(
         output["key_facts"] = [item for item in key_facts if isinstance(item, dict)]
     if isinstance(next_hints, list):
         output["next_hints"] = [str(item) for item in next_hints if str(item).strip()]
+    if isinstance(next_pivots, dict):
+        normalized_pivots: Dict[str, List[str]] = {}
+        for key in ("next_urls", "next_people", "next_orgs", "next_topics", "next_handles", "next_queries"):
+            value = next_pivots.get(key)
+            if isinstance(value, list):
+                normalized_pivots[key] = [str(item) for item in value if str(item).strip()]
+        if normalized_pivots:
+            output["next_pivots"] = normalized_pivots
     return output
 
 

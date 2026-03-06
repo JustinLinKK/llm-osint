@@ -128,6 +128,12 @@ def insert_tool_receipt(
     vector_upserts: Dict[str, Any],
     graph_upserts: Dict[str, Any],
     next_hints: List[str],
+    next_urls: List[str],
+    next_people: List[str],
+    next_orgs: List[str],
+    next_topics: List[str],
+    next_handles: List[str],
+    next_queries: List[str],
 ) -> str:
     dsn = _get_dsn()
     with psycopg.connect(dsn) as conn:
@@ -136,8 +142,12 @@ def insert_tool_receipt(
                 """
                 INSERT INTO tool_call_receipts(
                     run_id, tool_name, ok, arguments, summary_id, artifact_ids,
-                    vector_upserts, graph_upserts, next_hints
-                ) VALUES (%s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb)
+                    vector_upserts, graph_upserts, next_hints, next_urls, next_people,
+                    next_orgs, next_topics, next_handles, next_queries
+                ) VALUES (
+                    %s, %s, %s, %s::jsonb, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb
+                )
                 RETURNING receipt_id
                 """,
                 (
@@ -150,6 +160,12 @@ def insert_tool_receipt(
                     Jsonb(vector_upserts),
                     Jsonb(graph_upserts),
                     Jsonb(next_hints),
+                    Jsonb(next_urls),
+                    Jsonb(next_people),
+                    Jsonb(next_orgs),
+                    Jsonb(next_topics),
+                    Jsonb(next_handles),
+                    Jsonb(next_queries),
                 ),
             )
             row = cur.fetchone()

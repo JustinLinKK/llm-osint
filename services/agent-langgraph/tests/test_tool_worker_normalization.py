@@ -100,6 +100,7 @@ def _load_tool_worker_graph_module(monkeypatch):
 
     target_norm_module = types.ModuleType("target_normalization")
     target_norm_module.extract_person_targets = lambda text: []
+    target_norm_module.normalize_person_candidate = lambda value: str(value or "").strip() or None
     target_norm_module.sanitize_search_tool_arguments = lambda tool, arguments, fallback_person_targets=None: arguments
     monkeypatch.setitem(sys.modules, "target_normalization", target_norm_module)
 
@@ -842,3 +843,106 @@ def test_extract_related_people_from_search_rows_excludes_primary_aliases_from_n
     ]
 
     assert tool_worker_graph._extract_related_people_from_search_rows(rows, "Cookie Consent Frederick Pi") == []
+
+
+def test_derive_receipt_next_pivots_filters_tavily_free_text_fragments(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "normalize_person_candidate",
+        lambda value: "Yan Gao" if str(value or "").strip() == "Yan Gao" else None,
+    )
+    monkeypatch.setattr(tool_worker_graph, "_receipt_profile_support", lambda *args, **kwargs: True)
+
+    pivots = tool_worker_graph._derive_receipt_next_pivots(
+        tool_name="tavily_research",
+        key_facts=[
+            {"sourceUrls": ["https://openreview.net/profile?id=~Xinyu_Pi1"]},
+            {"organizations": ["University of California, San Diego"]},
+            {"topics": ["Bayesian survival analysis"]},
+        ],
+        summary="Tavily research found profile and affiliation evidence for Xinyu Pi.",
+        next_hints=["https://openreview.net/profile?id=~Xinyu_Pi1"],
+        llm_next_hints=["Scientific Reports", "Yan Gao", "Bayesian survival analysis"],
+    )
+
+    assert "https://openreview.net/profile?id=~Xinyu_Pi1" in pivots["next_urls"]
+    assert "University of California, San Diego" in pivots["next_orgs"]
+    assert "Bayesian survival analysis" in pivots["next_topics"]
+    assert "Scientific Reports" not in pivots["next_people"]
+    assert "Scientific Reports" not in pivots["next_topics"]
+
+
+def test_derive_receipt_next_pivots_excludes_confidence_marker_from_next_urls(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    pivots = tool_worker_graph._derive_receipt_next_pivots(
+        tool_name="tavily_research",
+        key_facts=[],
+        summary="tavily_research failed",
+        next_hints=["confidence:0.86"],
+        llm_next_hints=[],
+    )
+
+    assert pivots["next_urls"] == []
+
+
+def test_call_tool_with_rate_limit_control_spaces_tavily_calls(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    tool_worker_graph.TAVILY_REQUEST_MIN_GAP_SECONDS = 8.0
+    tool_worker_graph._TAVILY_LAST_REQUEST_AT = 100.0
+    tool_worker_graph._TAVILY_NOT_BEFORE_AT = 0.0
+
+    sleep_calls = []
+    monotonic_values = iter([103.0, 108.0])
+
+    monkeypatch.setattr(tool_worker_graph.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(tool_worker_graph.time, "monotonic", lambda: next(monotonic_values))
+
+    client = types.SimpleNamespace(call_tool=lambda name, arguments: types.SimpleNamespace(ok=True, content={}))
+
+    tool_worker_graph._call_tool_with_rate_limit_control(
+        client,
+        "tavily_research",
+        {"input": "Find Frederick Pi"},
+        "run-1",
+    )
+
+    assert sleep_calls == [5.0]
+
+
+def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    tool_worker_graph.TAVILY_REQUEST_MIN_GAP_SECONDS = 8.0
+    tool_worker_graph.TAVILY_RATE_LIMIT_BACKOFF_SECONDS = 30.0
+    tool_worker_graph.TAVILY_MAX_RETRIES = 2
+    tool_worker_graph._TAVILY_LAST_REQUEST_AT = 0.0
+    tool_worker_graph._TAVILY_NOT_BEFORE_AT = 0.0
+
+    sleep_calls = []
+    events = []
+    responses = iter(
+        [
+            types.SimpleNamespace(ok=False, content={"error": "HTTP Error 429: Too Many Requests"}),
+            types.SimpleNamespace(ok=True, content={"results": []}),
+        ]
+    )
+    monotonic_values = iter([100.0, 101.0, 101.0, 132.0])
+
+    monkeypatch.setattr(tool_worker_graph.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(tool_worker_graph.time, "monotonic", lambda: next(monotonic_values))
+    monkeypatch.setattr(tool_worker_graph, "emit_run_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    client = types.SimpleNamespace(call_tool=lambda name, arguments: next(responses))
+
+    result = tool_worker_graph._call_tool_with_rate_limit_control(
+        client,
+        "tavily_research",
+        {"input": "Find Frederick Pi"},
+        "run-2",
+    )
+
+    assert result.ok is True
+    assert sleep_calls == [30.0]
+    assert events
+    assert events[0][0][1] == "TOOL_RATE_LIMIT_BACKOFF"
