@@ -46,6 +46,20 @@ SHODAN_API_KEY=
 If running inside Dev Container, keep service hostnames like `postgres`, `minio`, `mcp-server`.
 If running on native host, use `localhost` endpoints as needed.
 
+Stage 1 blueprint runtime toggles:
+
+```bash
+STAGE1_BLUEPRINT_ENABLED=true
+STAGE1_BLUEPRINT_CONTRACT_PATH=/workspaces/llm-osint/schemas/stage1_graph_blueprint_contract.v1.json
+STAGE1_BLUEPRINT_ENFORCEMENT=balanced
+STAGE1_SOCIAL_TIMELINE_MAX_FAILURES=2
+```
+
+Notes:
+- `STAGE1_BLUEPRINT_ENFORCEMENT=balanced` blocks Stage 1 stop when required blueprint slots are missing.
+- `STAGE1_SOCIAL_TIMELINE_MAX_FAILURES` caps retries for `x_get_user_posts_api` and `linkedin_download_html_ocr` to prevent repeated failure loops.
+- Visual files (`graph_blueprint_sample.json/png`) are design aids only; runtime enforcement uses the contract JSON above.
+
 ---
 
 ## 2) Install JS + Python Dependencies
@@ -102,7 +116,7 @@ yarn infra:restart:embedding
 yarn infra:restart:kali
 ```
 
-Use `yarn infra:restart:all-lite` when you want to restart the main infra stack after code changes without touching `mcp-server-kali` or `worker-embedding`.
+Use `yarn infra:restart:all-lite` when you want to restart the main infra stack after code changes without touching `mcp-server-kali`. If `EMBEDDING_PROVIDER=vllm`, it will also auto-start `worker-embedding` when missing.
 
 Code update workflow without touching the two large images:
 
@@ -301,6 +315,21 @@ Agent-langgraph unit/regression tests:
 . .venv-agent/bin/activate
 cd services/agent-langgraph
 pytest -q
+```
+
+Stage 1 blueprint alignment focused tests:
+
+```bash
+. .venv-agent/bin/activate
+cd services/agent-langgraph
+pytest -q tests/test_planner_technical_smoke.py -k "graph_slot or blueprint or stop_gate"
+pytest -q tests/test_tool_worker_normalization.py -k "topic or timeline or time_node"
+```
+
+Optional MCP graph ingest compatibility smoke:
+
+```bash
+yarn tsx apps/mcp-server/scripts/test-ingest-graph.ts
 ```
 
 Notes:

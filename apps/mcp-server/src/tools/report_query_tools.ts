@@ -15,6 +15,15 @@ type QdrantHit = {
   payload?: Record<string, unknown>;
 };
 
+type GraphScope = "run" | "hybrid" | "global";
+
+function normalizeGraphScope(value?: string): GraphScope {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "global") return "global";
+  if (normalized === "hybrid") return "hybrid";
+  return "run";
+}
+
 async function qdrantSearch(
   vector: number[],
   limit: number,
@@ -112,6 +121,8 @@ function registerVectorSearch(server: McpServer) {
             snippet,
             score: typeof item.score === "number" ? item.score : 0.0,
             sourceUrl: typeof payload.source_url === "string" ? payload.source_url : null,
+            sourceDomain: typeof payload.source_domain === "string" ? payload.source_domain : null,
+            retrievedAt: typeof payload.retrieved_at === "string" ? payload.retrieved_at : null,
             objectRef: {
               bucket: payload.evidence_bucket ?? null,
               objectKey: payload.evidence_object_key ?? null,
@@ -223,18 +234,27 @@ function registerGraphGetEntity(server: McpServer) {
     {
       description: "Fetch one graph entity node by stable ID.",
       inputSchema: {
+        runId: z.string().uuid().optional().describe("Optional run scope"),
+        scope: z.enum(["run", "hybrid", "global"]).optional().describe("Graph query scope when runId is provided"),
         entityId: z.string().min(1).describe("Stable entity ID"),
       },
     },
-    async ({ entityId }) => {
+    async ({ runId, scope, entityId }) => {
       const session = neo4jDriver.session();
       try {
+        const queryScope = normalizeGraphScope(scope);
         const result = await session.run(
           `MATCH (n)
            WHERE coalesce(n.node_id, n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
+             AND (
+               $runId IS NULL
+               OR $scope = 'global'
+               OR ($scope = 'run' AND coalesce(n.run_id, '') = $runId)
+               OR ($scope = 'hybrid' AND (coalesce(n.run_id, '') = $runId OR coalesce(n.external_context, false) = true))
+             )
            RETURN labels(n) as labels, properties(n) as props
            LIMIT 1`,
-          { entityId }
+          { entityId, runId: runId ?? null, scope: queryScope }
         );
         if (!result.records.length) {
           throw new Error("Entity not found");
@@ -264,24 +284,51 @@ function registerGraphNeighbors(server: McpServer) {
     {
       description: "Get 1-2 hop neighbors for an entity with relationship labels and minimal properties.",
       inputSchema: {
+        runId: z.string().uuid().describe("Run ID scope"),
         entityId: z.string().min(1).describe("Stable entity ID"),
+        scope: z.enum(["run", "hybrid", "global"]).optional().describe("Graph query scope (default: run)"),
         depth: z.number().int().min(1).max(2).optional().describe("Traversal depth"),
         relTypes: z.array(z.string()).optional().describe("Optional relationship allowlist"),
       },
     },
-    async ({ entityId, depth, relTypes }) => {
+    async ({ runId, entityId, scope, depth, relTypes }) => {
       const session = neo4jDriver.session();
       try {
+        const queryScope = normalizeGraphScope(scope);
         const hops = depth ?? 1;
         const result = await session.run(
           `MATCH (n)
            WHERE coalesce(n.node_id, n.person_id, n.org_id, n.location_id, n.address, n.uri, n.name, n.domain, n.email) = $entityId
+             AND (
+               $scope = 'global'
+               OR (
+                 $scope = 'run'
+                 AND coalesce(n.run_id, '') = $runId
+               )
+               OR (
+                 $scope = 'hybrid'
+                 AND (coalesce(n.run_id, '') = $runId OR coalesce(n.external_context, false) = true)
+               )
+             )
            MATCH p=(n)-[r*1..${hops}]-(m)
-           WITH m, [rel IN relationships(p) | coalesce(rel.rel_type, type(rel))] as relTypesFound
-           WHERE $relTypes IS NULL OR any(t IN relTypesFound WHERE t IN $relTypes)
+           WITH p, m, [rel IN relationships(p) | coalesce(rel.rel_type, type(rel))] as relTypesFound
+           WHERE (
+               $scope = 'global'
+               OR (
+                 $scope = 'run'
+                 AND coalesce(m.run_id, '') = $runId
+                 AND all(rel IN relationships(p) WHERE coalesce(rel.run_id, '') = $runId)
+               )
+               OR (
+                 $scope = 'hybrid'
+                 AND (coalesce(m.run_id, '') = $runId OR coalesce(m.external_context, false) = true)
+                 AND all(rel IN relationships(p) WHERE coalesce(rel.run_id, '') = $runId OR coalesce(rel.external_context, false) = true)
+               )
+             )
+             AND ($relTypes IS NULL OR any(t IN relTypesFound WHERE t IN $relTypes))
            RETURN DISTINCT labels(m) as labels, properties(m) as props, relTypesFound
            LIMIT 200`,
-          { entityId, relTypes: relTypes && relTypes.length ? relTypes : null }
+          { runId, scope: queryScope, entityId, relTypes: relTypes && relTypes.length ? relTypes : null }
         );
 
         const neighbors = result.records.map((rec) => ({
@@ -311,17 +358,26 @@ function registerGraphSearchEntities(server: McpServer) {
       description:
         "Fallback graph entity search by query string over common ID/name/url/email/domain properties.",
       inputSchema: {
+        runId: z.string().uuid().describe("Run ID scope"),
         query: z.string().min(2).describe("Search query"),
+        scope: z.enum(["run", "hybrid", "global"]).optional().describe("Graph query scope (default: run)"),
         limit: z.number().int().min(1).max(100).optional().describe("Result limit"),
       },
     },
-    async ({ query, limit }) => {
+    async ({ runId, query, scope, limit }) => {
       const session = neo4jDriver.session();
       try {
+        const queryScope = normalizeGraphScope(scope);
         const maxRows = limit ?? 20;
         const result = await session.run(
           `MATCH (n)
-           WHERE toLower(coalesce(n.node_id, '')) CONTAINS toLower($query)
+           WHERE (
+                 $scope = 'global'
+                 OR ($scope = 'run' AND coalesce(n.run_id, '') = $runId)
+                 OR ($scope = 'hybrid' AND (coalesce(n.run_id, '') = $runId OR coalesce(n.external_context, false) = true))
+               )
+             AND (
+              toLower(coalesce(n.node_id, '')) CONTAINS toLower($query)
               OR toLower(coalesce(n.person_id, '')) CONTAINS toLower($query)
               OR toLower(coalesce(n.org_id, '')) CONTAINS toLower($query)
               OR toLower(coalesce(n.location_id, '')) CONTAINS toLower($query)
@@ -335,9 +391,10 @@ function registerGraphSearchEntities(server: McpServer) {
               OR any(v IN coalesce(n.merge_keys, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
               OR any(v IN coalesce(n.attributes, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
               OR any(v IN coalesce(n.filter_terms, []) WHERE toLower(toString(v)) CONTAINS toLower($query))
+             )
            RETURN labels(n) as labels, properties(n) as props
            LIMIT $limit`,
-          { query, limit: neo4j.int(maxRows) }
+          { runId, scope: queryScope, query, limit: neo4j.int(maxRows) }
         );
 
         const entities = result.records.map((rec) => {

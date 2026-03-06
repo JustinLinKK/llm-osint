@@ -18,6 +18,24 @@ def test_extract_person_targets_preserves_real_person_names() -> None:
     ]
 
 
+def test_extract_person_targets_supports_parenthetical_alias_variants() -> None:
+    assert extract_person_targets("Perform a comprehensive search for Xinyu (Frederick) Pi.") == [
+        "Xinyu Pi",
+        "Frederick Pi",
+        "Xinyu Frederick Pi",
+    ]
+
+
+def test_extract_person_targets_rejects_synthetic_none_publications() -> None:
+    assert extract_person_targets("None Publications") == []
+
+
+def test_extract_person_targets_drops_leading_breakwords() -> None:
+    assert extract_person_targets("Ran Tavily research for Xinyu Pi and found 5 results") == [
+        "Xinyu Pi"
+    ]
+
+
 def test_sanitize_search_tool_arguments_uses_fallback_when_query_is_not_a_person() -> None:
     normalized = sanitize_search_tool_arguments(
         "tavily_person_search",

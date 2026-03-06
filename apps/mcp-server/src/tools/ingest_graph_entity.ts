@@ -63,6 +63,7 @@ type LegacyRelationTripletInput = {
 type GraphEntityInput = {
   node_id?: string;
   type?: string;
+  raw_type?: string;
   canonical_name?: string;
   alt_names?: string[];
   attributes?: string[];
@@ -76,7 +77,10 @@ type GraphRelationInput = {
   edge_id?: string;
   src_id: string;
   dst_id: string;
+  src_canonical_id?: string;
+  dst_canonical_id?: string;
   rel_type?: string;
+  raw_relation_type?: string;
   canonical_name?: string;
   alt_names?: string[];
   source_tool?: string;
@@ -85,7 +89,12 @@ type GraphRelationInput = {
 
 type GraphEntityRecord = {
   node_id: string;
+  canonical_id: string;
+  run_scoped_id: string;
+  run_id: string;
+  external_context: boolean;
   type: string;
+  raw_type: string;
   canonical_name: string;
   canonical_name_normalized: string;
   alt_names: string[];
@@ -101,20 +110,29 @@ type GraphEntityRecord = {
   evidence_document_ids?: string[];
   evidence_bucket?: string;
   evidence_object_key?: string;
+  evidence_object_keys?: string[];
   evidence_version_id?: string;
   evidence_etag?: string;
   source_url?: string;
+  source_urls?: string[];
+  source_domain?: string;
   snippet_text?: string;
   snippet_id?: string;
+  ingested_at: string;
   embedding_text: string;
   embedding: number[];
 };
 
 type GraphRelationRecord = {
   edge_id: string;
+  canonical_id: string;
+  run_scoped_id: string;
+  run_id: string;
+  external_context: boolean;
   src_id: string;
   dst_id: string;
   rel_type: string;
+  raw_relation_type: string;
   rel_type_normalized: string;
   canonical_name: string;
   canonical_name_normalized: string;
@@ -127,14 +145,17 @@ type GraphRelationRecord = {
   evidence_document_ids?: string[];
   evidence_bucket?: string;
   evidence_object_key?: string;
+  evidence_object_keys?: string[];
   evidence_version_id?: string;
   evidence_etag?: string;
+  ingested_at: string;
   embedding_text: string;
   embedding: number[];
 };
 
 const ENTITY_EMBEDDING_SCORE_THRESHOLD = 120;
 const RELATION_EMBEDDING_SCORE_THRESHOLD = 220;
+let graphSchemaBootstrapped = false;
 
 const toolSchema = {
   runId: z.string().uuid().describe("Run ID (UUID)"),
@@ -154,6 +175,84 @@ const relationsToolSchema = {
   runId: z.string().uuid().describe("Run ID (UUID)"),
   relationsJson: z.string().describe("JSON array of graph relations"),
 };
+
+const CONTRACT_ENTITY_TYPES = new Set<string>([
+  "Person",
+  "Organization",
+  "Institution",
+  "ContactPoint",
+  "Website",
+  "Domain",
+  "Email",
+  "Phone",
+  "Handle",
+  "Experience",
+  "EducationalCredential",
+  "Affiliation",
+  "Role",
+  "Publication",
+  "Document",
+  "Conference",
+  "Repository",
+  "Project",
+  "Topic",
+  "TimelineEvent",
+  "TimeNode",
+  "Occupation",
+  "OrganizationProfile",
+  "ImageObject",
+]);
+
+const CONTRACT_RELATION_TYPES = new Set<string>([
+  "HAS_PROFILE",
+  "HAS_DOCUMENT",
+  "HAS_HANDLE",
+  "HAS_EMAIL",
+  "HAS_PHONE",
+  "HAS_CONTACT_POINT",
+  "HAS_DOMAIN",
+  "HAS_CREDENTIAL",
+  "HAS_EXPERIENCE",
+  "HAS_AFFILIATION",
+  "HAS_TIMELINE_EVENT",
+  "HAS_OCCUPATION",
+  "HAS_IMAGE",
+  "HAS_ORGANIZATION_PROFILE",
+  "HAS_ROLE",
+  "HOLDS_ROLE",
+  "WORKS_AT",
+  "STUDIED_AT",
+  "AFFILIATED_WITH",
+  "MEMBER_OF",
+  "ISSUED_BY",
+  "OFFICER_OF",
+  "DIRECTOR_OF",
+  "FOUNDED",
+  "COAUTHORED_WITH",
+  "ADVISED_BY",
+  "COLLEAGUE_OF",
+  "COLLABORATED_WITH",
+  "PUBLISHED",
+  "PUBLISHED_IN",
+  "MAINTAINS",
+  "USES_LANGUAGE",
+  "KNOWS_LANGUAGE",
+  "RESEARCHES",
+  "FOCUSES_ON",
+  "HAS_TOPIC",
+  "HAS_SKILL_TOPIC",
+  "HAS_HOBBY_TOPIC",
+  "HAS_INTEREST_TOPIC",
+  "MENTIONS_TIMELINE_EVENT",
+  "IN_TIME_NODE",
+  "NEXT_TIME_NODE",
+  "ABOUT",
+  "FILED",
+  "APPEARS_IN_ARCHIVE",
+  "MENTIONS",
+  "RELATED_TO",
+  "SAME_CANONICAL_AS",
+]);
 
 function utcNow(): string {
   return new Date().toISOString();
@@ -234,7 +333,7 @@ function extractAttributeValues(attributes: string[], prefixes: string[]): strin
 function graphAutoAliases(entityType: string, values: string[]): string[] {
   const aliases: string[] = [];
   const family = entityType.toLowerCase();
-  const conservativeFamilies = new Set(["contactpoint", "educationalcredential", "experience", "affiliation", "timelineevent", "occupation", "imageobject", "organizationprofile", "language"]);
+  const conservativeFamilies = new Set(["contactpoint", "educationalcredential", "experience", "affiliation", "timelineevent", "timenode", "occupation", "imageobject", "organizationprofile", "language"]);
   const stopwords = new Set(["the", "of", "at", "for", "and", "in", "on", "to"]);
   for (const value of values) {
     const text = String(value ?? "").trim();
@@ -273,7 +372,7 @@ function graphEntityFamily(entityType: string): string {
   if (normalized === "contactpoint") return "contact";
   if (normalized === "educationalcredential") return "credential";
   if (normalized === "organizationprofile") return "orgprofile";
-  if (["experience", "affiliation", "timelineevent", "occupation"].includes(normalized)) return normalized;
+  if (["experience", "affiliation", "timelineevent", "timenode", "occupation"].includes(normalized)) return normalized;
   if (normalized === "imageobject") return "image";
   if (["topic", "project", "award", "grant", "patent", "role"].includes(normalized)) return normalized;
   return normalized || "unknown";
@@ -283,7 +382,7 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
   const normalizedType = normalizeName(entityType);
   const joined = normalizeName([entityType, canonicalName, ...attributes].join(" "));
   const explicit: Record<string, string> = {
-    article: "Document",
+    article: "Publication",
     conference: "Conference",
     contactpoint: "ContactPoint",
     contact_point: "ContactPoint",
@@ -301,8 +400,8 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
     imageobject: "ImageObject",
     image_object: "ImageObject",
     institution: "Institution",
-    ip: "IP",
-    location: "Location",
+    ip: "Domain",
+    location: "ContactPoint",
     occupation: "Occupation",
     organization: "Organization",
     patent: "Patent",
@@ -314,9 +413,11 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
     repository: "Repository",
     role: "Role",
     language: "Language",
-    snippet: "Snippet",
+    snippet: "Document",
     timelineevent: "TimelineEvent",
     timeline_event: "TimelineEvent",
+    timenode: "TimeNode",
+    time_node: "TimeNode",
     topic: "Topic",
     organizationprofile: "OrganizationProfile",
     organization_profile: "OrganizationProfile",
@@ -327,6 +428,7 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
   if (/educational credential|credential|degree|bachelor of|master of|doctor of philosophy|phd/.test(joined)) return "EducationalCredential";
   if (/experience|employment|work history|tenure/.test(joined)) return "Experience";
   if (/affiliation|member of|membership|relation/.test(joined)) return "Affiliation";
+  if (/time node|time_key/.test(joined)) return "TimeNode";
   if (/timeline event|milestone|start_date|end_date|tenure_start|tenure_end|event_type/.test(joined)) return "TimelineEvent";
   if (/occupation|job family|profession/.test(joined)) return "Occupation";
   if (/image object|profile image|avatar|headshot/.test(joined)) return "ImageObject";
@@ -361,8 +463,9 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
   if (/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(canonicalName)) return "Email";
   if (/^\+?[0-9][0-9().\-\s]{6,}[0-9]$/.test(canonicalName)) return "Phone";
   if (canonicalName.startsWith("@") || /username|handle/.test(joined)) return "Handle";
-  if (/city|country|location|address|state|region/.test(joined)) return "Location";
-  return entityType.trim() || "Unknown";
+  if (/city|country|location|address|state|region/.test(joined)) return "ContactPoint";
+  const candidate = entityType.trim() || "Topic";
+  return CONTRACT_ENTITY_TYPES.has(candidate) ? candidate : "Topic";
 }
 
 function entityTypeRank(entityType: string): number {
@@ -387,6 +490,7 @@ function entityTypeRank(entityType: string): number {
     patent: 72,
     affiliation: 70,
     timelineevent: 68,
+    timenode: 67,
     occupation: 66,
     location: 52,
     website: 40,
@@ -503,10 +607,10 @@ function deriveMergeKeys(
     const normalized = String(value ?? "").trim().toLowerCase();
     if (normalized) keys.push(`id:${family}:${normalized}`);
   }
-  if (["contact", "credential", "experience", "affiliation", "timelineevent", "occupation", "orgprofile"].includes(family)) {
+  if (["contact", "credential", "experience", "affiliation", "timelineevent", "timenode", "occupation", "orgprofile"].includes(family)) {
     const subjectValues = extractAttributeValues(attributes, ["subject"]);
     const orgValues = extractAttributeValues(attributes, ["organization", "institution", "employer", "company", "subject_org"]);
-    const facetValues = extractAttributeValues(attributes, ["role", "occupation", "degree", "field", "relation", "contact_type", "event_type", "industry", "focus"]);
+    const facetValues = extractAttributeValues(attributes, ["role", "occupation", "degree", "field", "relation", "contact_type", "event_type", "industry", "focus", "time_key"]);
     const dateValues = extractAttributeValues(attributes, ["date", "year", "start_date", "end_date", "tenure_start", "tenure_end"]);
     const directValues = extractAttributeValues(attributes, ["value", "email", "phone", "handle", "username"]);
     for (const value of directValues) {
@@ -654,14 +758,21 @@ function canonicalizeRelationType(relType: string): string {
     HAS_OCCUPATION: "HAS_OCCUPATION",
     HAS_PHONE: "HAS_PHONE",
     HAS_ROLE: "HAS_ROLE",
+    HAS_SKILL_TOPIC: "HAS_SKILL_TOPIC",
+    HAS_HOBBY_TOPIC: "HAS_HOBBY_TOPIC",
+    HAS_INTEREST_TOPIC: "HAS_INTEREST_TOPIC",
     HAS_TIMELINE_EVENT: "HAS_TIMELINE_EVENT",
+    MENTIONS_TIMELINE_EVENT: "MENTIONS_TIMELINE_EVENT",
+    IN_TIME_NODE: "IN_TIME_NODE",
+    NEXT_TIME_NODE: "NEXT_TIME_NODE",
     ISSUED_BY: "ISSUED_BY",
     KNOWS_LANGUAGE: "KNOWS_LANGUAGE",
     PROFILE: "HAS_PROFILE",
     PUBLICATION: "PUBLISHED",
     RESIDENCE: "LOCATED_IN",
   };
-  return mapping[normalized] ?? (normalized || "RELATED_TO");
+  const candidate = mapping[normalized] ?? (normalized || "RELATED_TO");
+  return CONTRACT_RELATION_TYPES.has(candidate) ? candidate : "RELATED_TO";
 }
 
 function ensureStringArray(value: unknown): string[] {
@@ -674,10 +785,22 @@ function stableId(prefix: string, ...parts: string[]): string {
   return `${prefix}_${digest}`;
 }
 
+function sourceDomainFromUrl(url?: string): string | undefined {
+  const candidate = String(url ?? "").trim();
+  if (!candidate || !isUrlLike(candidate)) return undefined;
+  try {
+    const host = new URL(candidate).hostname.trim().toLowerCase();
+    if (!host) return undefined;
+    return host.replace(/^www\./, "");
+  } catch {
+    return undefined;
+  }
+}
+
 function deriveOsintBucket(entityType: string, names: string[], attributes: string[]): string {
   const joined = normalizeName([entityType, ...names, ...attributes].join(" "));
   if (/(person|author|researcher|employee|director|founder|officer|student)/.test(joined)) return "person";
-  if (/(experience|credential|affiliation|occupation|timeline event|timelineevent|contact point|contactpoint)/.test(joined)) return "person";
+  if (/(experience|credential|affiliation|occupation|timeline event|timelineevent|time node|timenode|contact point|contactpoint)/.test(joined)) return "person";
   if (/(organization profile|org profile|subject org)/.test(joined)) return "organization";
   if (/(organization|company|institution|agency|university|lab|firm|committee)/.test(joined)) return "organization";
   if (/(language kind|programming language|spoken language)/.test(joined)) return "language";
@@ -751,7 +874,7 @@ function propertyAttributes(properties: Record<string, unknown>): string[] {
   return uniqueStrings(attributes);
 }
 
-function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
+function normalizeGraphEntity(runId: string, input: GraphEntityInput): GraphEntityRecord {
   const inputNames = uniqueStrings([input.canonical_name, ...(input.alt_names ?? [])]);
   const rawEntityType = String(input.type ?? "Unknown").trim() || "Unknown";
   const attributes = ensureStringArray(input.attributes);
@@ -763,12 +886,21 @@ function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
   const bucket = String(input.osint_bucket ?? deriveOsintBucket(entityType, names, attributes)).trim() || "unknown";
   const createdAt = utcNow();
   const updatedAt = createdAt;
-  const nodeId = String(input.node_id ?? stableId("ent", normalizeName(entityType), normalizeName(canonicalName)));
+  const canonicalId = stableId("entc", normalizeName(entityType), normalizeName(canonicalName));
+  const runScopedId = String(input.node_id ?? stableId("ent", runId, normalizeName(entityType), normalizeName(canonicalName)));
+  const sourceUrl = input.evidence?.sourceUrl?.trim() || undefined;
+  const sourceDomain = sourceDomainFromUrl(sourceUrl);
   const evidenceProps = buildEvidenceProps(input.evidence);
+  const evidenceObjectKey = typeof evidenceProps.evidence_object_key === "string" ? evidenceProps.evidence_object_key : undefined;
 
   return {
-    node_id: nodeId,
+    node_id: runScopedId,
+    canonical_id: canonicalId,
+    run_scoped_id: runScopedId,
+    run_id: runId,
+    external_context: false,
     type: entityType,
+    raw_type: rawEntityType,
     canonical_name: canonicalName,
     canonical_name_normalized: normalizeName(canonicalName),
     alt_names: altNames,
@@ -780,29 +912,55 @@ function normalizeGraphEntity(input: GraphEntityInput): GraphEntityRecord {
     source_tools: ensureStringArray(input.source_tools),
     created_at: createdAt,
     updated_at: updatedAt,
-    source_url: input.evidence?.sourceUrl?.trim() || undefined,
+    source_url: sourceUrl,
+    source_urls: sourceUrl ? [sourceUrl] : undefined,
+    source_domain: sourceDomain,
     snippet_text: input.evidence?.snippetText?.trim() || undefined,
     snippet_id: input.evidence?.snippetId?.trim() || undefined,
+    evidence_object_keys: evidenceObjectKey ? [evidenceObjectKey] : undefined,
+    ingested_at: createdAt,
     embedding_text: "",
     embedding: [],
     ...evidenceProps,
   };
 }
 
-function normalizeGraphRelation(input: GraphRelationInput): GraphRelationRecord {
-  const relType = canonicalizeRelationType(String(input.rel_type ?? "RELATED_TO").trim() || "RELATED_TO");
+function normalizeGraphRelation(runId: string, input: GraphRelationInput): GraphRelationRecord {
+  const rawRelType = String(input.raw_relation_type ?? input.rel_type ?? "RELATED_TO").trim() || "RELATED_TO";
+  const relType = canonicalizeRelationType(rawRelType);
   const canonicalName = String(input.canonical_name ?? relType).trim() || relType;
   const altNames = ensureStringArray(input.alt_names);
   const evidenceProps = buildEvidenceProps(input.evidenceRef);
   const createdAt = utcNow();
+  const evidenceObjectKey = typeof evidenceProps.evidence_object_key === "string" ? evidenceProps.evidence_object_key : undefined;
+  const canonicalId = stableId(
+    "relc",
+    String(input.src_canonical_id ?? input.src_id),
+    String(input.dst_canonical_id ?? input.dst_id),
+    normalizeName(relType),
+    normalizeName(canonicalName)
+  );
+  const runScopedId = String(
+    input.edge_id ??
+      stableId(
+        "rel",
+        runId,
+        input.src_id,
+        input.dst_id,
+        normalizeName(relType),
+        normalizeName(canonicalName)
+      )
+  );
   return {
-    edge_id: String(
-      input.edge_id ??
-        stableId("rel", input.src_id, input.dst_id, normalizeName(relType), normalizeName(canonicalName))
-    ),
+    edge_id: runScopedId,
+    canonical_id: canonicalId,
+    run_scoped_id: runScopedId,
+    run_id: runId,
+    external_context: false,
     src_id: input.src_id,
     dst_id: input.dst_id,
     rel_type: relType,
+    raw_relation_type: rawRelType,
     rel_type_normalized: normalizeName(relType),
     canonical_name: canonicalName,
     canonical_name_normalized: normalizeName(canonicalName),
@@ -811,6 +969,8 @@ function normalizeGraphRelation(input: GraphRelationInput): GraphRelationRecord 
     source_tool: input.source_tool?.trim() || undefined,
     created_at: createdAt,
     updated_at: createdAt,
+    ingested_at: createdAt,
+    evidence_object_keys: evidenceObjectKey ? [evidenceObjectKey] : undefined,
     embedding_text: "",
     embedding: [],
     ...evidenceProps,
@@ -985,7 +1145,7 @@ function embeddingBandScore(left: number[], right: number[]): number {
   return 0;
 }
 
-function normalizeLegacyEntity(input: LegacyBatchEntityInput): GraphEntityRecord {
+function normalizeLegacyEntity(runId: string, input: LegacyBatchEntityInput): GraphEntityRecord {
   const properties = input.properties ?? {};
   const canonicalName = selectPrimaryName(properties, input.entityId, input.entityType);
   const altNames = uniqueStrings([
@@ -995,7 +1155,7 @@ function normalizeLegacyEntity(input: LegacyBatchEntityInput): GraphEntityRecord
     ...(Array.isArray(properties.aliases) ? properties.aliases : []),
   ]);
   const attributes = propertyAttributes(properties);
-  return normalizeGraphEntity({
+  return normalizeGraphEntity(runId, {
     node_id: input.entityId,
     type: input.entityType,
     canonical_name: canonicalName,
@@ -1005,9 +1165,15 @@ function normalizeLegacyEntity(input: LegacyBatchEntityInput): GraphEntityRecord
   });
 }
 
-function normalizeLegacyRelationTarget(targetType: string, targetId: string | undefined, targetProperties: Record<string, unknown>, evidence?: EvidenceObjectRef): GraphEntityRecord {
+function normalizeLegacyRelationTarget(
+  runId: string,
+  targetType: string,
+  targetId: string | undefined,
+  targetProperties: Record<string, unknown>,
+  evidence?: EvidenceObjectRef
+): GraphEntityRecord {
   const canonicalName = selectPrimaryName(targetProperties, targetId, targetType);
-  return normalizeGraphEntity({
+  return normalizeGraphEntity(runId, {
     node_id: targetId,
     type: targetType,
     canonical_name: canonicalName,
@@ -1087,6 +1253,18 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
   );
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
+  const mergedEvidenceObjectKeys = uniqueStrings([
+    ...((existing.evidence_object_keys as string[] | undefined) ?? []),
+    ...((incoming.evidence_object_keys as string[] | undefined) ?? []),
+    String(existing.evidence_object_key ?? ""),
+    String(incoming.evidence_object_key ?? ""),
+  ]);
+  const mergedSourceUrls = uniqueStrings([
+    ...((existing.source_urls as string[] | undefined) ?? []),
+    ...((incoming.source_urls as string[] | undefined) ?? []),
+    String(existing.source_url ?? ""),
+    String(incoming.source_url ?? ""),
+  ]);
   const mergedEmbeddingText = buildEntityEmbeddingText({
     ...incoming,
     canonical_name: canonicalName,
@@ -1096,7 +1274,12 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
   });
   return {
     node_id: String(existing.node_id ?? incoming.node_id),
+    canonical_id: String(existing.canonical_id ?? incoming.canonical_id),
+    run_scoped_id: String(existing.run_scoped_id ?? incoming.run_scoped_id ?? existing.node_id ?? incoming.node_id),
+    run_id: String(existing.run_id ?? incoming.run_id),
+    external_context: Boolean(existing.external_context ?? incoming.external_context ?? false),
     type: entityType,
+    raw_type: String(incoming.raw_type || existing.raw_type || entityType),
     canonical_name: canonicalName,
     canonical_name_normalized: normalizeName(canonicalName),
     alt_names: altNames,
@@ -1108,15 +1291,19 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
     source_tools: uniqueStrings([...(existing.source_tools as string[] ?? []), ...incoming.source_tools]),
     created_at: String(existing.created_at ?? incoming.created_at),
     updated_at: incoming.updated_at,
+    ingested_at: String(existing.ingested_at ?? incoming.ingested_at ?? incoming.updated_at),
     evidence_document_id: mergedEvidenceDocumentIds[0] || undefined,
     evidence_document_ids: mergedEvidenceDocumentIds.length ? mergedEvidenceDocumentIds : undefined,
-    evidence_bucket: String(existing.evidence_bucket ?? incoming.evidence_bucket ?? "") || undefined,
-    evidence_object_key: String(existing.evidence_object_key ?? incoming.evidence_object_key ?? "") || undefined,
-    evidence_version_id: String(existing.evidence_version_id ?? incoming.evidence_version_id ?? "") || undefined,
-    evidence_etag: String(existing.evidence_etag ?? incoming.evidence_etag ?? "") || undefined,
-    source_url: String(existing.source_url ?? incoming.source_url ?? "") || undefined,
-    snippet_text: String(existing.snippet_text ?? incoming.snippet_text ?? "") || undefined,
-    snippet_id: String(existing.snippet_id ?? incoming.snippet_id ?? "") || undefined,
+    evidence_bucket: String(incoming.evidence_bucket ?? existing.evidence_bucket ?? "") || undefined,
+    evidence_object_key: String(incoming.evidence_object_key ?? existing.evidence_object_key ?? "") || undefined,
+    evidence_object_keys: mergedEvidenceObjectKeys.length ? mergedEvidenceObjectKeys : undefined,
+    evidence_version_id: String(incoming.evidence_version_id ?? existing.evidence_version_id ?? "") || undefined,
+    evidence_etag: String(incoming.evidence_etag ?? existing.evidence_etag ?? "") || undefined,
+    source_url: String(incoming.source_url ?? existing.source_url ?? "") || undefined,
+    source_urls: mergedSourceUrls.length ? mergedSourceUrls : undefined,
+    source_domain: String(incoming.source_domain ?? existing.source_domain ?? "") || undefined,
+    snippet_text: String(incoming.snippet_text ?? existing.snippet_text ?? "") || undefined,
+    snippet_id: String(incoming.snippet_id ?? existing.snippet_id ?? "") || undefined,
     embedding_text: mergedEmbeddingText,
     embedding: averageEmbeddings([toNumericArray(existing.embedding), incoming.embedding]),
   };
@@ -1131,11 +1318,22 @@ function mergeRelationRecords(existing: Record<string, unknown> | null, incoming
   const relType = canonicalizeRelationType(chooseCanonicalName([existing.rel_type, incoming.rel_type]));
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
+  const mergedEvidenceObjectKeys = uniqueStrings([
+    ...((existing.evidence_object_keys as string[] | undefined) ?? []),
+    ...((incoming.evidence_object_keys as string[] | undefined) ?? []),
+    String(existing.evidence_object_key ?? ""),
+    String(incoming.evidence_object_key ?? ""),
+  ]);
   return {
     edge_id: String(existing.edge_id ?? incoming.edge_id),
+    canonical_id: String(existing.canonical_id ?? incoming.canonical_id),
+    run_scoped_id: String(existing.run_scoped_id ?? incoming.run_scoped_id ?? existing.edge_id ?? incoming.edge_id),
+    run_id: String(existing.run_id ?? incoming.run_id),
+    external_context: Boolean(existing.external_context ?? incoming.external_context ?? false),
     src_id: incoming.src_id,
     dst_id: incoming.dst_id,
     rel_type: relType,
+    raw_relation_type: String(incoming.raw_relation_type || existing.raw_relation_type || relType),
     rel_type_normalized: normalizeName(relType),
     canonical_name: canonicalName,
     canonical_name_normalized: normalizeName(canonicalName),
@@ -1144,12 +1342,14 @@ function mergeRelationRecords(existing: Record<string, unknown> | null, incoming
     source_tool: String(existing.source_tool ?? incoming.source_tool ?? "") || undefined,
     created_at: String(existing.created_at ?? incoming.created_at),
     updated_at: incoming.updated_at,
+    ingested_at: String(existing.ingested_at ?? incoming.ingested_at ?? incoming.updated_at),
     evidence_document_id: mergedEvidenceDocumentIds[0] || undefined,
     evidence_document_ids: mergedEvidenceDocumentIds.length ? mergedEvidenceDocumentIds : undefined,
-    evidence_bucket: String(existing.evidence_bucket ?? incoming.evidence_bucket ?? "") || undefined,
-    evidence_object_key: String(existing.evidence_object_key ?? incoming.evidence_object_key ?? "") || undefined,
-    evidence_version_id: String(existing.evidence_version_id ?? incoming.evidence_version_id ?? "") || undefined,
-    evidence_etag: String(existing.evidence_etag ?? incoming.evidence_etag ?? "") || undefined,
+    evidence_bucket: String(incoming.evidence_bucket ?? existing.evidence_bucket ?? "") || undefined,
+    evidence_object_key: String(incoming.evidence_object_key ?? existing.evidence_object_key ?? "") || undefined,
+    evidence_object_keys: mergedEvidenceObjectKeys.length ? mergedEvidenceObjectKeys : undefined,
+    evidence_version_id: String(incoming.evidence_version_id ?? existing.evidence_version_id ?? "") || undefined,
+    evidence_etag: String(incoming.evidence_etag ?? existing.evidence_etag ?? "") || undefined,
     embedding_text: incoming.embedding_text,
     embedding: averageEmbeddings([toNumericArray(existing.embedding), incoming.embedding]),
   };
@@ -1161,14 +1361,20 @@ async function findExistingEntity(
 ): Promise<Record<string, unknown> | null> {
   let result = await session.run(
     `MATCH (n:Entity)
-     WHERE n.node_id = $nodeId
-        OR n.canonical_name_normalized = $canonical
-        OR any(name IN coalesce(n.alt_names_normalized, []) WHERE name IN $names)
-        OR any(key IN coalesce(n.merge_keys, []) WHERE key IN $mergeKeys)
-        OR any(term IN coalesce(n.filter_terms, []) WHERE term IN $terms)
+     WHERE coalesce(n.run_id, '') = $runId
+       AND (
+            n.run_scoped_id = $runScopedId
+         OR n.node_id = $nodeId
+         OR n.canonical_name_normalized = $canonical
+         OR any(name IN coalesce(n.alt_names_normalized, []) WHERE name IN $names)
+         OR any(key IN coalesce(n.merge_keys, []) WHERE key IN $mergeKeys)
+         OR any(term IN coalesce(n.filter_terms, []) WHERE term IN $terms)
+       )
      RETURN properties(n) AS props
      LIMIT 100`,
     {
+      runId: incoming.run_id,
+      runScopedId: incoming.run_scoped_id,
       nodeId: incoming.node_id,
       canonical: incoming.canonical_name_normalized,
       names: [incoming.canonical_name_normalized, ...incoming.alt_names_normalized],
@@ -1179,10 +1385,12 @@ async function findExistingEntity(
   if (!result.records.length && incoming.embedding.length) {
     result = await session.run(
       `MATCH (n:Entity)
-       WHERE n.type = $type OR n.osint_bucket = $bucket
+       WHERE coalesce(n.run_id, '') = $runId
+         AND (n.type = $type OR n.osint_bucket = $bucket)
        RETURN properties(n) AS props
        LIMIT 100`,
       {
+        runId: incoming.run_id,
         type: incoming.type,
         bucket: incoming.osint_bucket,
       }
@@ -1208,12 +1416,18 @@ async function findExistingRelation(
 ): Promise<Record<string, unknown> | null> {
   const result = await session.run(
     `MATCH (:Entity {node_id: $srcId})-[r:RELATED_TO]->(:Entity {node_id: $dstId})
-     WHERE r.edge_id = $edgeId
-        OR r.rel_type_normalized = $relType
-        OR r.canonical_name_normalized = $canonical
+     WHERE coalesce(r.run_id, '') = $runId
+       AND (
+            r.run_scoped_id = $runScopedId
+         OR r.edge_id = $edgeId
+         OR r.rel_type_normalized = $relType
+         OR r.canonical_name_normalized = $canonical
+       )
      RETURN properties(r) AS props
      LIMIT 25`,
     {
+      runId: incoming.run_id,
+      runScopedId: incoming.run_scoped_id,
       srcId: incoming.src_id,
       dstId: incoming.dst_id,
       edgeId: incoming.edge_id,
@@ -1249,6 +1463,7 @@ async function upsertGraphEntity(
      SET n += $props`,
     { node_id: merged.node_id, props: merged }
   );
+  await linkSameCanonicalEntities(session, merged);
   return merged;
 }
 
@@ -1268,7 +1483,86 @@ async function upsertGraphRelation(
   return merged;
 }
 
-function parseEntityBatchPayload(value: string): { entities: GraphEntityRecord[]; relations: GraphRelationRecord[] } {
+async function linkSameCanonicalEntities(
+  session: ReturnType<typeof neo4jDriver.session>,
+  entity: GraphEntityRecord
+): Promise<void> {
+  if (!entity.canonical_id) return;
+  const result = await session.run(
+    `MATCH (other:Entity)
+     WHERE other.canonical_id = $canonicalId
+       AND other.node_id <> $nodeId
+       AND coalesce(other.run_id, '') <> $runId
+     RETURN other.node_id AS nodeId
+     LIMIT 25`,
+    { canonicalId: entity.canonical_id, nodeId: entity.node_id, runId: entity.run_id }
+  );
+
+  for (const record of result.records) {
+    const otherNodeId = String(record.get("nodeId") ?? "").trim();
+    if (!otherNodeId) continue;
+    const edgeId = stableId("rel", entity.run_id, entity.node_id, otherNodeId, "same_canonical_as");
+    const relation: GraphRelationRecord = {
+      edge_id: edgeId,
+      canonical_id: stableId("relc", entity.canonical_id, "same_canonical_as"),
+      run_scoped_id: edgeId,
+      run_id: entity.run_id,
+      external_context: true,
+      src_id: entity.node_id,
+      dst_id: otherNodeId,
+      rel_type: "SAME_CANONICAL_AS",
+      raw_relation_type: "SAME_CANONICAL_AS",
+      rel_type_normalized: normalizeName("SAME_CANONICAL_AS"),
+      canonical_name: "SAME_CANONICAL_AS",
+      canonical_name_normalized: normalizeName("SAME_CANONICAL_AS"),
+      alt_names: [],
+      alt_names_normalized: [],
+      source_tool: "ingest_graph_entities",
+      created_at: entity.updated_at,
+      updated_at: entity.updated_at,
+      ingested_at: entity.ingested_at,
+      embedding_text: "SAME_CANONICAL_AS",
+      embedding: [],
+    };
+    await session.run(
+      `MATCH (src:Entity {node_id: $src_id})
+       MATCH (dst:Entity {node_id: $dst_id})
+       MERGE (src)-[r:RELATED_TO {edge_id: $edge_id}]->(dst)
+       SET r += $props`,
+      { src_id: relation.src_id, dst_id: relation.dst_id, edge_id: relation.edge_id, props: relation }
+    );
+  }
+}
+
+async function ensureGraphSchema(session: ReturnType<typeof neo4jDriver.session>): Promise<void> {
+  if (graphSchemaBootstrapped) return;
+  await session.run(
+    "CREATE CONSTRAINT entity_node_id_unique IF NOT EXISTS FOR (n:Entity) REQUIRE n.node_id IS UNIQUE"
+  );
+  await session.run("CREATE INDEX entity_type_idx IF NOT EXISTS FOR (n:Entity) ON (n.type)");
+  await session.run("CREATE INDEX entity_run_id_idx IF NOT EXISTS FOR (n:Entity) ON (n.run_id)");
+  await session.run("CREATE INDEX entity_canonical_id_idx IF NOT EXISTS FOR (n:Entity) ON (n.canonical_id)");
+  await session.run("CREATE INDEX entity_run_scoped_id_idx IF NOT EXISTS FOR (n:Entity) ON (n.run_scoped_id)");
+  await session.run(
+    "CREATE INDEX entity_canonical_name_norm_idx IF NOT EXISTS FOR (n:Entity) ON (n.canonical_name_normalized)"
+  );
+  await session.run("CREATE INDEX entity_osint_bucket_idx IF NOT EXISTS FOR (n:Entity) ON (n.osint_bucket)");
+  try {
+    await session.run(
+      "CREATE INDEX related_to_rel_type_norm_idx IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.rel_type_normalized)"
+    );
+    await session.run(
+      "CREATE INDEX related_to_run_id_idx IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.run_id)"
+    );
+  } catch (error) {
+    logger.warn("Relationship rel_type_normalized index bootstrap skipped", {
+      error: (error as Error).message,
+    });
+  }
+  graphSchemaBootstrapped = true;
+}
+
+function parseEntityBatchPayload(runId: string, value: string): { entities: GraphEntityRecord[]; relations: GraphRelationRecord[] } {
   const parsed = parseJson<unknown>("entities", value);
   if (!Array.isArray(parsed)) throw new Error("entitiesJson must be a JSON array");
 
@@ -1282,15 +1576,16 @@ function parseEntityBatchPayload(value: string): { entities: GraphEntityRecord[]
   for (const item of parsed) {
     const record = item as Record<string, unknown>;
     if ("canonical_name" in record || "node_id" in record) {
-      addEntity(normalizeGraphEntity(record as GraphEntityInput));
+      addEntity(normalizeGraphEntity(runId, record as GraphEntityInput));
       continue;
     }
 
     const legacy = record as LegacyBatchEntityInput;
-    const sourceEntity = normalizeLegacyEntity(legacy);
+    const sourceEntity = normalizeLegacyEntity(runId, legacy);
     addEntity(sourceEntity);
     for (const relation of legacy.relations ?? []) {
       const targetEntity = normalizeLegacyRelationTarget(
+        runId,
         relation.targetType,
         relation.targetId,
         relation.targetProperties ?? {},
@@ -1298,9 +1593,11 @@ function parseEntityBatchPayload(value: string): { entities: GraphEntityRecord[]
       );
       addEntity(targetEntity);
       relations.push(
-        normalizeGraphRelation({
+        normalizeGraphRelation(runId, {
           src_id: sourceEntity.node_id,
           dst_id: targetEntity.node_id,
+          src_canonical_id: sourceEntity.canonical_id,
+          dst_canonical_id: targetEntity.canonical_id,
           rel_type: relation.type,
           canonical_name: relation.type,
           evidenceRef: relation.evidenceRef,
@@ -1312,7 +1609,7 @@ function parseEntityBatchPayload(value: string): { entities: GraphEntityRecord[]
   return { entities: [...entityMap.values()], relations };
 }
 
-function parseRelationsPayload(value: string): { entities: GraphEntityRecord[]; relations: GraphRelationRecord[] } {
+function parseRelationsPayload(runId: string, value: string): { entities: GraphEntityRecord[]; relations: GraphRelationRecord[] } {
   const parsed = parseJson<unknown>("relations", value);
   if (!Array.isArray(parsed)) throw new Error("relationsJson must be a JSON array");
 
@@ -1321,19 +1618,21 @@ function parseRelationsPayload(value: string): { entities: GraphEntityRecord[]; 
   for (const item of parsed) {
     const record = item as Record<string, unknown>;
     if ("src_id" in record || "edge_id" in record) {
-      relations.push(normalizeGraphRelation(record as GraphRelationInput));
+      relations.push(normalizeGraphRelation(runId, record as GraphRelationInput));
       continue;
     }
 
     const legacy = record as LegacyRelationTripletInput;
-    const srcEntity = normalizeLegacyRelationTarget(legacy.srcType, legacy.srcId, legacy.srcProperties ?? {});
-    const dstEntity = normalizeLegacyRelationTarget(legacy.dstType, legacy.dstId, legacy.dstProperties ?? {});
+    const srcEntity = normalizeLegacyRelationTarget(runId, legacy.srcType, legacy.srcId, legacy.srcProperties ?? {});
+    const dstEntity = normalizeLegacyRelationTarget(runId, legacy.dstType, legacy.dstId, legacy.dstProperties ?? {});
     entityMap.set(srcEntity.node_id, srcEntity);
     entityMap.set(dstEntity.node_id, dstEntity);
     relations.push(
-      normalizeGraphRelation({
+      normalizeGraphRelation(runId, {
         src_id: srcEntity.node_id,
         dst_id: dstEntity.node_id,
+        src_canonical_id: srcEntity.canonical_id,
+        dst_canonical_id: dstEntity.canonical_id,
         rel_type: legacy.relType,
         canonical_name: legacy.relType,
         evidenceRef: legacy.evidenceRef,
@@ -1341,6 +1640,55 @@ function parseRelationsPayload(value: string): { entities: GraphEntityRecord[]; 
     );
   }
   return { entities: [...entityMap.values()], relations };
+}
+
+function validateGraphBatch(entities: GraphEntityRecord[], relations: GraphRelationRecord[]) {
+  const entityErrors: string[] = [];
+  const relationErrors: string[] = [];
+  let entityTypeCoercions = 0;
+  let relationTypeCoercions = 0;
+
+  for (const entity of entities) {
+    if (!entity.node_id || !entity.run_id || !entity.canonical_name) {
+      entityErrors.push(`entity missing required fields: node_id/run_id/canonical_name (${entity.node_id || "unknown"})`);
+      continue;
+    }
+    if (!CONTRACT_ENTITY_TYPES.has(entity.type)) {
+      entityErrors.push(`entity type out of contract: ${entity.type} (${entity.node_id})`);
+    }
+    if (normalizeName(entity.raw_type) !== normalizeName(entity.type)) {
+      entityTypeCoercions += 1;
+    }
+  }
+
+  const nodeIds = new Set(entities.map((item) => item.node_id));
+  for (const relation of relations) {
+    if (!relation.edge_id || !relation.run_id || !relation.src_id || !relation.dst_id) {
+      relationErrors.push(`relation missing required fields: edge_id/run_id/src_id/dst_id (${relation.edge_id || "unknown"})`);
+      continue;
+    }
+    if (!CONTRACT_RELATION_TYPES.has(relation.rel_type)) {
+      relationErrors.push(`relation type out of contract: ${relation.rel_type} (${relation.edge_id})`);
+    }
+    if (nodeIds.size > 0 && (!nodeIds.has(relation.src_id) || !nodeIds.has(relation.dst_id))) {
+      relationErrors.push(`relation endpoint missing in batch: ${relation.edge_id}`);
+    }
+    if (normalizeName(relation.raw_relation_type) !== normalizeName(relation.rel_type)) {
+      relationTypeCoercions += 1;
+    }
+  }
+
+  if (entityErrors.length || relationErrors.length) {
+    const lines = [...entityErrors.slice(0, 8), ...relationErrors.slice(0, 8)];
+    throw new Error(`Graph blueprint contract violation: ${lines.join("; ")}`);
+  }
+
+  return {
+    entityTypeCoercions,
+    relationTypeCoercions,
+    entityCount: entities.length,
+    relationCount: relations.length,
+  };
 }
 
 export function registerIngestGraphEntity(server: McpServer) {
@@ -1359,12 +1707,15 @@ export function registerIngestGraphEntity(server: McpServer) {
       let evidence: EvidenceInput | undefined;
       let relations: LegacyRelationInput[] = [];
       try {
+        await ensureGraphSchema(session);
         properties = parseJson<Record<string, unknown>>("properties", propertiesJson) ?? {};
         evidence = parseJson<EvidenceInput>("evidence", evidenceJson);
         relations = parseJson<LegacyRelationInput[]>("relations", relationsJson) ?? [];
         const { entities, relations: normalizedRelations } = parseEntityBatchPayload(
+          runId,
           JSON.stringify([{ entityType, entityId, properties, evidence, relations } satisfies LegacyBatchEntityInput])
         );
+        const contractMetrics = validateGraphBatch(entities, normalizedRelations);
         await ensureGraphEmbeddings(entities, normalizedRelations);
 
         const storedEntities: GraphEntityRecord[] = [];
@@ -1381,9 +1732,11 @@ export function registerIngestGraphEntity(server: McpServer) {
           key: primary?.node_id ?? entityId ?? "",
           relationCount: normalizedRelations.length,
           graphSchema: "sample_v1",
+          contractMetrics,
         };
 
         await logToolCall(runId, "ingest_graph_entity", { entityType, entityId, properties, evidence, relations }, output, "ok");
+        await emitRunEvent(runId, "GRAPH_CONTRACT_VALIDATED", { tool: "ingest_graph_entity", ...contractMetrics });
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "ingest_graph_entity", ok: true, entityType });
         logger.info("ingest_graph_entity finished", { runId, entityType, key: output.key });
         return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
@@ -1416,7 +1769,9 @@ export function registerIngestGraphEntities(server: McpServer) {
 
       const session = neo4jDriver.session();
       try {
-        const parsed = parseEntityBatchPayload(entitiesJson);
+        await ensureGraphSchema(session);
+        const parsed = parseEntityBatchPayload(runId, entitiesJson);
+        const contractMetrics = validateGraphBatch(parsed.entities, parsed.relations);
         await ensureGraphEmbeddings(parsed.entities, parsed.relations);
         const storedEntities: GraphEntityRecord[] = [];
         for (const entity of parsed.entities) {
@@ -1436,10 +1791,12 @@ export function registerIngestGraphEntities(server: McpServer) {
             canonicalName: entity.canonical_name,
             osintBucket: entity.osint_bucket,
           })),
+          contractMetrics,
           warnings: [],
         };
 
         await logToolCall(runId, "ingest_graph_entities", { entitiesJson }, output, "ok");
+        await emitRunEvent(runId, "GRAPH_CONTRACT_VALIDATED", { tool: "ingest_graph_entities", ...contractMetrics });
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "ingest_graph_entities", ok: true, count: storedEntities.length });
         logger.info("ingest_graph_entities finished", { runId, count: storedEntities.length });
         return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
@@ -1472,7 +1829,9 @@ export function registerIngestGraphRelations(server: McpServer) {
 
       const session = neo4jDriver.session();
       try {
-        const parsed = parseRelationsPayload(relationsJson);
+        await ensureGraphSchema(session);
+        const parsed = parseRelationsPayload(runId, relationsJson);
+        const contractMetrics = validateGraphBatch(parsed.entities, parsed.relations);
         await ensureGraphEmbeddings(parsed.entities, parsed.relations);
         for (const entity of parsed.entities) {
           await upsertGraphEntity(session, entity);
@@ -1485,10 +1844,12 @@ export function registerIngestGraphRelations(server: McpServer) {
         const output = {
           count: storedRelations.length,
           graphSchema: "sample_v1",
+          contractMetrics,
           warnings: [],
         };
 
         await logToolCall(runId, "ingest_graph_relations", { relationsJson }, output, "ok");
+        await emitRunEvent(runId, "GRAPH_CONTRACT_VALIDATED", { tool: "ingest_graph_relations", ...contractMetrics });
         await emitRunEvent(runId, "TOOL_CALL_FINISHED", { tool: "ingest_graph_relations", ok: true, count: storedRelations.length });
         logger.info("ingest_graph_relations finished", { runId, count: storedRelations.length });
         return { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };

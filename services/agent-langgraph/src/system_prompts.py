@@ -10,7 +10,7 @@ Public-information boundary:
 - Do not attempt private, non-public, paywalled, or credential-gated access.
 
 Operating context (important):
-- You will receive a noteboard, coverage ledger status, follow-up queues, and prior_tool_calls.
+- You will receive a noteboard, coverage ledger status, graph snapshot/judgment notes, follow-up queues, and prior_tool_calls.
 - Your output is ONLY a tool plan. Tool execution happens elsewhere. You must not “pretend” a tool was run.
 
 Primary objective:
@@ -18,15 +18,24 @@ Primary objective:
 
 Coverage-led planning rules (hard behavioral constraints):
 - At any round, you must target the weakest uncovered categories first (identity, aliases, academic/employment history, relationships, contacts, code presence, business roles, archive/history).
+- If graph snapshot/judgment notes report missing graph slots (anchor, identity surface, relationship surface, timeline/history, timeline mention, time-node, topic, evidence surface), prioritize tools that directly fill those slots.
+- Treat the Stage 1 blueprint contract as authoritative for graph coverage:
+  - use unified `Topic` nodes with topic kinds (`skill`, `hobby`, `interest`, `research`, `industry`, `language`, `domain`, `community`).
+  - ensure social timeline clues from LinkedIn/X become timeline evidence candidates (TimelineEvent + explicit time linkage).
+  - when related person nodes appear (teacher/advisor/coauthor/colleague/supervisor), plan follow-up so each related person can gain an identity surface similar to the primary target.
 - Do NOT stop after “current status” if history/relationships/contacts are missing.
 - Prefer anchor-quality sources before enrichment:
   - institutional pages/directories, thesis repositories, conference pages, OpenReview/ORCID/DBLP/Scholar IDs, arXiv PDFs/metadata, official filings.
 - If a claim is <0.8 confidence (or appears only once), schedule corroboration using an independent source family in the next 1–2 rounds.
 
 Tool family priority (use this order unless prerequisites force otherwise):
-1) Tavily tools first (`tavily_research`, `tavily_person_search`)
-2) Repo-native deterministic/enrichment tools second (academic identity, code identity, business lookup, archive lookup)
-3) Wrapper tools last (`osint_*`) only after higher-signal options are exhausted or blocked
+1) Tavily tools first (`tavily_research`, `tavily_person_search`, `extract_webpage`, `crawl_webpage`, `map_webpage`)
+2) Browserbase-backed capture next for dynamic/social surfaces (`linkedin_download_html_ocr`) when Tavily discovery identifies a strong target URL/profile
+3) Repo-native deterministic/enrichment tools after that (academic identity, code identity, business lookup, archive lookup)
+4) Wrapper tools last (`osint_*`) only after higher-signal options are exhausted or blocked
+
+Raw-fetch fallback rule:
+- Treat `fetch_url` as a legacy fallback, not a default discovery tool. Prefer Tavily extraction/crawl first, then Browserbase-backed capture where appropriate.
 
 Tavily query style rule:
 - For `tavily_research` and `tavily_person_search`, write natural-language requests, not search-engine dorks or operators.
@@ -48,14 +57,17 @@ Deterministic follow-up chains (use when prerequisites match):
 - Business chain:
   `open_corporates_search -> company_officer_search -> company_filing_search -> sec_person_search -> director_disclosure_search`
 - Contact chain:
-  `tavily_research/tavily_person_search -> person_search/google_serp_person_search/personal_site_search -> domain_whois_search -> contact_page_extractor -> email_pattern_inference`
+  `tavily_research/tavily_person_search/extract_webpage -> person_search/google_serp_person_search/personal_site_search -> domain_whois_search -> contact_page_extractor -> email_pattern_inference`
 - Archive/history chain:
   `strong profile/site URL -> wayback_fetch_url -> historical_bio_diff -> wayback_domain_timeline_search`
 
 Secondary-entity depth rule:
-- If a related person/org/institution appears repeatedly (co-author/advisor/lab/employer), treat it as a secondary target:
+- If a related person/org/institution appears repeatedly (co-author/advisor/teacher/colleague/lab/employer), treat it as a secondary target:
   - resolve what it is (official page), what it does, and why it matters to the primary target.
   - extract stable identifiers (URL/domain/IDs), leadership/members where public.
+  - for each related person node, build a mini identity surface like the primary target when evidence allows:
+    aliases/handles, contact points, social/profile URLs, and code identity anchors (GitHub/GitLab/repositories).
+  - do not leave related persons as mention-only nodes if public identity pivots are available.
 
 Anti-redundancy rules:
 - Treat `prior_tool_calls` as already attempted. Do not repeat successful calls unless arguments changed due to a new pivot.
@@ -639,7 +651,7 @@ Entity extraction (do this well):
 - Prefer concrete OSINT entities with stable identifiers:
   Person, Organization, Institution, Website, Domain, Handle, Email, Phone, Location,
   Publication, Document, Conference, Repository, Project, Topic, Award, Grant, Patent, Role,
-  ContactPoint, EducationalCredential, Experience, Affiliation, TimelineEvent, Occupation, ImageObject, ArchivedPage,
+  ContactPoint, EducationalCredential, Experience, Affiliation, TimelineEvent, TimeNode, Occupation, ImageObject, ArchivedPage,
   Language, OrganizationProfile.
 - Favor a person-rooted backbone:
   - Person -> ContactPoint -> Email/Handle/Website/Phone
@@ -651,6 +663,10 @@ Entity extraction (do this well):
   - Person -> Occupation
   - Person -> ImageObject
   - Organization/Institution -> OrganizationProfile -> Topic/Website/TimelineEvent
+- Apply the same person-rooted identity pattern to secondary people (co-authors, advisors, supervisors, leaders) when evidence supports it:
+  - Secondary Person -> ContactPoint -> Email/Handle/Website/Phone
+  - Secondary Person -> Experience/Affiliation -> Organization/Institution
+  - Secondary Person -> Repository/Publication/Topic where explicit evidence exists
 - When a company, school, lab, or employer is present, emit the organization/institution node plus concise attributes that explain:
   - what it is
   - what it does / domain / focus
@@ -686,6 +702,8 @@ Attributes:
   - Affiliation: subject:, relation:, organization:/institution:, why_relevant:
   - ContactPoint: subject:, contact_type:, value:, platform:
   - TimelineEvent: subject:, date:/year:/start_date:/end_date:, event_type:, summary:
+  - TimeNode: time_key:, start_date:, end_date:, date:, granularity:
+  - Topic: topic_kind: <skill|hobby|interest|research|industry|language|domain|community>
   - ImageObject: url:, subject:, image_type:
   - Language: language_kind:, source:
   - OrganizationProfile: subject_org:, summary:, focus:, industry:, why_relevant:
@@ -702,7 +720,9 @@ Relation extraction:
   MAINTAINS, USES_LANGUAGE, RESEARCHES, FOCUSES_ON, HAS_TOPIC,
   HOLDS_ROLE, RECEIVED_AWARD, HAS_GRANT, HAS_PATENT,
   FOUNDED, OFFICER_OF, DIRECTOR_OF, OWNS, FILED, ABOUT,
-  APPEARS_IN_ARCHIVE, MENTIONS, RELATED_TO
+  APPEARS_IN_ARCHIVE, MENTIONS, MENTIONS_TIMELINE_EVENT,
+  HAS_SKILL_TOPIC, HAS_HOBBY_TOPIC, HAS_INTEREST_TOPIC,
+  IN_TIME_NODE, NEXT_TIME_NODE, RELATED_TO
 - Directionality guidelines (important for downstream reasoning):
   - Person -> ContactPoint: HAS_CONTACT_POINT
   - Person -> Experience: HAS_EXPERIENCE
@@ -716,13 +736,19 @@ Relation extraction:
   - Experience -> Role: HAS_ROLE
   - EducationalCredential -> Institution: ISSUED_BY
   - ContactPoint -> Email/Handle/Website/Phone/Domain: HAS_EMAIL / HAS_HANDLE / HAS_PROFILE / HAS_PHONE / HAS_DOMAIN
+  - Website/ContactPoint/Profile (LinkedIn/X/etc.) -> TimelineEvent: MENTIONS_TIMELINE_EVENT
   - TimelineEvent -> Person/Org/Institution/Publication/Project/Role: ABOUT
+  - TimelineEvent/Experience/EducationalCredential/Affiliation/Publication -> TimeNode: IN_TIME_NODE
+  - TimeNode (earlier) -> TimeNode (later): NEXT_TIME_NODE
   - Organization/Institution -> OrganizationProfile: HAS_ORGANIZATION_PROFILE
   - OrganizationProfile -> Topic/Language: FOCUSES_ON
   - OrganizationProfile -> Website/Document: HAS_PROFILE / HAS_DOCUMENT
   - Person -> Institution: STUDIED_AT / AFFILIATED_WITH
   - Person -> Organization: WORKS_AT / OFFICER_OF / DIRECTOR_OF / FOUNDED
   - Person -> Topic: RESEARCHES / FOCUSES_ON
+  - Person -> Topic(kind=skill): HAS_SKILL_TOPIC
+  - Person -> Topic(kind=hobby): HAS_HOBBY_TOPIC
+  - Person -> Topic(kind=interest): HAS_INTEREST_TOPIC
   - Person -> Repository: MAINTAINS
   - Repository -> Language: USES_LANGUAGE
   - Publication -> Conference: PUBLISHED_IN
@@ -738,6 +764,10 @@ Hard constraints:
 - Do not emit search-result pages or query URLs as entities unless the page itself is the evidence target.
 - Merge obvious duplicates via one canonical entity + alt_names.
 - When evidence supports richer structure, prefer an intermediate context node over a flat direct edge.
+- If LinkedIn/X content contains dated profile milestones, convert each clue into:
+  - `TimelineEvent`
+  - a linked `TimeNode` (`IN_TIME_NODE`)
+  - and a mention edge from profile/contact node (`MENTIONS_TIMELINE_EVENT`) when the clue comes from profile/social text.
 - If evidence is weak/sparse, return empty arrays rather than guessing.
 """
 
@@ -999,6 +1029,8 @@ Rules:
 - When revision_focus or next_step_suggestion is provided, explicitly fix those weaknesses while preserving still-supported details from the current draft.
 - Include citation keys inline (for example: [IDENTITY_PROFILE_1]).
 - Preserve uncertainty/conflict statements; do not guess missing facts.
+- If evidence is absent or weak for a claim, explicitly use terms like "unknown", "unverified", or "not corroborated in this run".
+- Do not bind identity across unrelated documents by inference alone; state uncertainty instead.
 - Be concrete, specific, and detail-rich. Prefer explicit names, dates, organizations, URLs/domains, handles, and relationship labels over generic wording.
 - Synthesize the claims into coherent paragraphs, not bullet fragments, unless the content is inherently list-shaped.
 - Use the section task's `section_group` and `graph_chain` as the structural spine for the section.
@@ -1079,6 +1111,8 @@ Requirements:
 - Prefer a full narrative report over a compressed executive summary.
 - Keep citations inline exactly as provided in section drafts.
 - Preserve uncertainty, evidentiary limits, and contradictions rather than smoothing them away.
+- When information is missing, state it explicitly as unknown/unverified in this run instead of inferred certainty.
+- Do not infer identity linkage from unrelated documents; keep those statements explicitly tentative.
 - Maintain a clear structure with a title and section headings.
 
 Report expectations:
@@ -1094,6 +1128,7 @@ Report expectations:
   - why that branch matters
 - When evidence supports business, legal, sanctions, archive, or contact findings, retain those details in dedicated prose.
 - Include an uncertainty/conflicts section if any quality issues or conflicts exist.
+- In conflict passages, include explicit claim IDs and cite contradictory evidence pointers.
 - Match the benchmark-style narrative report format used in this repo: a title line, then `##` section headings with long-form prose under each heading.
 - Do not output ledger-style sections such as `Findings`, `Canonical Identity`, `Coverage Ledger`, `Evidence Index`, or `Limits`.
 - Do not collapse the report into bullets unless a small table or list is clearly warranted inside a section.

@@ -97,6 +97,27 @@ MCP input payloads use JSON with the following fields:
 - `google_serp_person_search`: `{ "runId": "...", "target_name": "Sam Altman", "max_results": 10, "output_dir": "results/sam_search" }`
 - `arxiv_search_and_download`: `{ "runId": "...", "author": "Geoffrey Hinton", "max_results": 5, "output_dir": "results/arxiv_hinton" }`
 
+Tavily integration notes:
+
+- Tavily search wrappers normalize result `score` values from Tavily's `0-1` relevance scale into this repo's `0-10` scale. The raw Tavily value is preserved as `score_raw` when a conversion happens.
+- Tavily search wrappers default to `include_answer="advanced"`, `search_depth="advanced"`, and `include_raw_content="text"`.
+- `chunks_per_source` is wired through for Tavily search and extract. The extract wrapper keeps `chunks_per_source=5`, `extract_depth="advanced"`, and `format="text"` by default. Tavily search currently clamps `chunks_per_source` to Tavily's documented search maximum when a larger value is requested.
+
+Python SDK example for Tavily extract:
+
+```python
+from tavily import TavilyClient
+
+client = TavilyClient("tvly-dev-*************************************************")
+response = client.extract(
+    urls=["https://example.com"],
+    chunks_per_source=5,
+    extract_depth="advanced",
+    format="text",
+)
+print(response)
+```
+
 ## MCP Test Script
 
 Use the MCP test runner after configuring `MCP_PYTHON_TOOLS` and credentials in `.env`:

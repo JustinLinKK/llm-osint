@@ -30,6 +30,12 @@ _RELATIONSHIP_DIR = _THIS_DIR / "relationship"
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
+TAVILY_SCORE_SCALE_MAX = 10.0
+TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT = 5
+TAVILY_SEARCH_CHUNKS_PER_SOURCE_MAX = 3
+TAVILY_EXTRACT_CHUNKS_PER_SOURCE_DEFAULT = 5
+TAVILY_EXTRACT_CHUNKS_PER_SOURCE_MAX = 5
+
 
 def _find_repo_root(start: Path) -> Path | None:
     for parent in [start, *start.parents]:
@@ -262,6 +268,26 @@ def _normalize_tavily_instructions(input_data: dict[str, Any]) -> str:
     return str(input_data.get("instructions") or input_data.get("instruction") or "").strip()
 
 
+def _normalize_positive_int(value: Any, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        normalized = default
+    normalized = max(minimum, normalized)
+    if maximum is not None:
+        normalized = min(maximum, normalized)
+    return normalized
+
+
+def _normalize_tavily_score(value: Any) -> tuple[float | None, float | None]:
+    if not isinstance(value, (int, float)):
+        return None, None
+    raw_score = float(value)
+    if 0.0 <= raw_score <= 1.0:
+        return round(raw_score * TAVILY_SCORE_SCALE_MAX, 4), round(raw_score, 4)
+    return round(raw_score, 4), round(raw_score, 4)
+
+
 def _build_tavily_search_payload(
     *,
     query: str,
@@ -270,6 +296,7 @@ def _build_tavily_search_payload(
     topic: str | None,
     include_raw_content: str | bool,
     include_answer: bool | str | None,
+    chunks_per_source: int | None,
     include_images: bool,
     include_domains: list[str] | None = None,
     exclude_domains: list[str] | None = None,
@@ -287,6 +314,8 @@ def _build_tavily_search_payload(
         payload["topic"] = topic
     if include_answer is not None:
         payload["include_answer"] = include_answer
+    if chunks_per_source is not None and chunks_per_source > 0:
+        payload["chunks_per_source"] = chunks_per_source
     if include_domains:
         payload["include_domains"] = include_domains
     if exclude_domains:
@@ -300,7 +329,18 @@ def _build_tavily_search_payload(
 
 def _extract_tavily_search_results(raw_response: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     raw_results = raw_response.get("results")
-    result_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+    raw_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+    result_rows: list[dict[str, Any]] = []
+    for item in raw_rows:
+        normalized_row = dict(item)
+        normalized_score, raw_score = _normalize_tavily_score(item.get("score"))
+        if normalized_score is not None:
+            normalized_row["score"] = normalized_score
+            normalized_row["score_scale"] = "0-10"
+            if raw_score is not None and normalized_score != raw_score:
+                normalized_row["score_raw"] = raw_score
+        result_rows.append(normalized_row)
+
     extracted_results: list[dict[str, Any]] = []
     for index, item in enumerate(result_rows[:20], start=1):
         extracted_results.append(
@@ -530,6 +570,22 @@ def _tool_linkedin_download_html_ocr(input_data: dict[str, Any]) -> dict[str, An
     stdout, stderr = _run_cmd(cmd, timeout_seconds=timeout_seconds)
 
     html_files = sorted(str(p) for p in output_path.glob("*.html") if p.is_file())
+    json_files = sorted(str(p) for p in output_path.glob("*.json") if p.is_file())
+    contact_info: dict[str, Any] = {}
+    contact_info_path = ""
+    for json_file in reversed(json_files):
+        candidate_path = Path(json_file)
+        if not candidate_path.name.startswith("contact_info_"):
+            continue
+        try:
+            parsed = json.loads(candidate_path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            contact_info = parsed
+            contact_info_path = json_file
+            break
+
     extracted_pages: list[dict[str, Any]] = []
     for file_path in html_files[:5]:
         path = Path(file_path)
@@ -545,9 +601,12 @@ def _tool_linkedin_download_html_ocr(input_data: dict[str, Any]) -> dict[str, An
         "profile": profile,
         "output_dir": str(output_path),
         "html_files": html_files,
-        "raw_files": html_files,
+        "json_files": json_files,
+        "raw_files": [*html_files, *json_files],
         "file_count": len(html_files),
         "extracted_pages": extracted_pages,
+        "contact_info": contact_info,
+        "contact_info_path": contact_info_path,
         "stdout": stdout[:3000],
         "stderr": stderr[:3000],
     }
@@ -671,7 +730,13 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
     search_depth = str(input_data.get("search_depth") or "advanced").strip() or "advanced"
     topic = str(input_data.get("topic") or "general").strip() or "general"
     include_raw_content = _normalize_tavily_include_raw_content(input_data.get("include_raw_content"), default="text")
-    include_answer = input_data.get("include_answer", False)
+    include_answer = input_data.get("include_answer", "advanced")
+    requested_chunks_per_source = input_data.get("chunks_per_source", TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT)
+    chunks_per_source = _normalize_positive_int(
+        requested_chunks_per_source,
+        TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT,
+        maximum=TAVILY_SEARCH_CHUNKS_PER_SOURCE_MAX,
+    )
     include_images = bool(input_data.get("include_images", False))
     include_domains = _normalize_optional_str_list(input_data.get("include_domains"))
     exclude_domains = _normalize_optional_str_list(input_data.get("exclude_domains"))
@@ -695,6 +760,7 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
         topic=topic,
         include_raw_content=include_raw_content,
         include_answer=include_answer,
+        chunks_per_source=chunks_per_source,
         include_images=include_images,
         include_domains=include_domains,
         exclude_domains=exclude_domains,
@@ -715,6 +781,10 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
         "results_found": len(result_rows),
         "search_depth": search_depth,
         "include_raw_content": include_raw_content,
+        "include_answer": include_answer,
+        "chunks_per_source": chunks_per_source,
+        "chunks_per_source_requested": requested_chunks_per_source,
+        "score_scale": "0-10 normalized from Tavily 0-1 scores",
         "response_time": raw_response.get("response_time"),
         "request_id": raw_response.get("request_id"),
         "results": result_rows,
@@ -747,7 +817,11 @@ def _tool_web_search(input_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
-    target_name = str(input_data.get("target_name") or input_data.get("query") or input_data.get("name") or "").strip()
+    target_name = str(input_data.get("target_name") or input_data.get("name") or "").strip()
+    requested_query = str(input_data.get("query") or "").strip()
+    search_query = requested_query or target_name
+    if not target_name and requested_query:
+        target_name = requested_query
     if not target_name:
         raise RuntimeError("Missing required input: target_name (or query/name)")
 
@@ -756,7 +830,13 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
     timeout_seconds = int(input_data.get("timeout_seconds", 120))
     search_depth = str(input_data.get("search_depth") or "advanced").strip() or "advanced"
     include_raw_content = _normalize_tavily_include_raw_content(input_data.get("include_raw_content"), default="text")
-    include_answer = input_data.get("include_answer", False)
+    include_answer = input_data.get("include_answer", "advanced")
+    requested_chunks_per_source = input_data.get("chunks_per_source", TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT)
+    chunks_per_source = _normalize_positive_int(
+        requested_chunks_per_source,
+        TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT,
+        maximum=TAVILY_SEARCH_CHUNKS_PER_SOURCE_MAX,
+    )
     include_images = bool(input_data.get("include_images", False))
     include_domains = _normalize_optional_str_list(input_data.get("include_domains"))
     exclude_domains = _normalize_optional_str_list(input_data.get("exclude_domains"))
@@ -775,12 +855,13 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
         output_dir = Path(tempfile.mkdtemp(prefix="tavily_search_"))
 
     payload = _build_tavily_search_payload(
-        query=target_name,
+        query=search_query,
         max_results=max_results,
         search_depth=search_depth,
         topic=topic,
         include_raw_content=include_raw_content,
         include_answer=include_answer,
+        chunks_per_source=chunks_per_source,
         include_images=include_images,
         include_domains=include_domains,
         exclude_domains=exclude_domains,
@@ -795,7 +876,8 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
 
     summary = {
         "target_name": target_name,
-        "query": raw_response.get("query") or target_name,
+        "query": raw_response.get("query") or search_query,
+        "requested_query": requested_query,
         "topic": topic,
         "follow_up_questions": raw_response.get("follow_up_questions"),
         "answer": raw_response.get("answer"),
@@ -803,6 +885,10 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
         "results_found": len(result_rows),
         "search_depth": search_depth,
         "include_raw_content": include_raw_content,
+        "include_answer": include_answer,
+        "chunks_per_source": chunks_per_source,
+        "chunks_per_source_requested": requested_chunks_per_source,
+        "score_scale": "0-10 normalized from Tavily 0-1 scores",
         "response_time": raw_response.get("response_time"),
         "request_id": raw_response.get("request_id"),
         "results": result_rows,
@@ -813,7 +899,8 @@ def _tool_tavily_person_search(input_data: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         "target_name": target_name,
-        "query": raw_response.get("query") or target_name,
+        "query": raw_response.get("query") or search_query,
+        "requested_query": requested_query,
         "topic": topic,
         "follow_up_questions": raw_response.get("follow_up_questions"),
         "answer": raw_response.get("answer"),
@@ -844,10 +931,16 @@ def _tool_extract_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
 
     api_url = str(os.getenv("TAVILY_EXTRACT_API_URL") or "https://api.tavily.com/extract").strip()
     timeout_seconds = int(input_data.get("timeout_seconds", 180))
+    query = str(input_data.get("query") or input_data.get("input") or "").strip()
     include_images = bool(input_data.get("include_images", False))
     include_favicon = bool(input_data.get("include_favicon", True))
     extract_depth = str(input_data.get("extract_depth") or "advanced").strip() or "advanced"
-    format_value = str(input_data.get("format") or "markdown").strip().lower() or "markdown"
+    format_value = str(input_data.get("format") or "text").strip().lower() or "text"
+    chunks_per_source = _normalize_positive_int(
+        input_data.get("chunks_per_source", TAVILY_EXTRACT_CHUNKS_PER_SOURCE_DEFAULT),
+        TAVILY_EXTRACT_CHUNKS_PER_SOURCE_DEFAULT,
+        maximum=TAVILY_EXTRACT_CHUNKS_PER_SOURCE_MAX,
+    )
 
     out_input = input_data.get("output_dir")
     temp_output = False
@@ -862,9 +955,12 @@ def _tool_extract_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "urls": urls,
         "extract_depth": extract_depth,
         "format": format_value,
+        "chunks_per_source": chunks_per_source,
         "include_images": include_images,
         "include_favicon": include_favicon,
     }
+    if query:
+        payload["query"] = query
     raw_response = _tavily_json_request(api_url, payload, timeout_seconds=timeout_seconds)
     raw_path = _write_json_file(output_dir / "extract_response.json", raw_response)
 
@@ -892,9 +988,12 @@ def _tool_extract_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     page_manifest_path = _write_json_file(output_dir / "page_manifest.json", page_files)
     summary = {
         "urls": urls,
+        "query": query,
         "results_found": len(result_rows),
         "failed_results_count": max(0, len(urls) - len(result_rows)),
+        "chunks_per_source": chunks_per_source,
         "extract_depth": extract_depth,
+        "format": format_value,
         "results": extracted_pages,
     }
     summary_path = _write_json_file(output_dir / "extract_summary.json", summary)
@@ -903,6 +1002,7 @@ def _tool_extract_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     result = {
         "url": urls[0] if len(urls) == 1 else None,
         "urls": urls,
+        "query": query,
         "output_dir": str(output_dir),
         "summary_path": str(summary_path),
         "api_response_path": str(raw_path),
@@ -914,6 +1014,7 @@ def _tool_extract_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "failed_results_count": max(0, len(urls) - len(result_rows)),
         "summary": summary,
         "extracted_pages": extracted_pages,
+        "payload": payload,
     }
     if temp_output:
         result["note"] = "Output was written to a temporary directory. Pass output_dir to persist files."

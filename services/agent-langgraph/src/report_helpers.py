@@ -42,6 +42,68 @@ if TYPE_CHECKING:
 from openrouter_llm import get_openrouter_timeout, invoke_complete_json
 
 logger = get_logger(__name__)
+REPORT_RELATED_PERSON_REJECT_TOKENS = {
+    "none",
+    "null",
+    "unknown",
+    "na",
+    "n/a",
+    "publication",
+    "publications",
+    "record",
+    "records",
+    "result",
+    "results",
+    "source",
+    "sources",
+    "search",
+    "research",
+    "profile",
+    "profiles",
+    "candidate",
+    "candidates",
+    "tavily",
+    "google",
+    "serp",
+    "duckduckgo",
+    "github",
+    "gitlab",
+    "linkedin",
+}
+REPORT_PROVIDER_BLOCKLIST = {
+    "tavily",
+    "google",
+    "duckduckgo",
+    "wikipedia",
+    "researchgate",
+    "linkedin",
+    "github",
+    "gitlab",
+}
+REPORT_ORG_GENERIC_TOKENS = {
+    "search",
+    "research",
+    "result",
+    "results",
+    "source",
+    "sources",
+    "profile",
+    "profiles",
+    "person",
+    "people",
+    "public",
+    "web",
+}
+REPORT_ORG_DESCRIPTOR_TERMS = {
+    "startup",
+    "stealth startup",
+    "stealth company",
+    "stealth mode",
+    "self-employed",
+    "self employed",
+    "independent",
+    "confidential",
+}
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -299,6 +361,7 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
 
 def pick_primary_entities(
     mcp_client: McpClientProtocol,
+    run_id: str,
     prompt: str,
     noteboard: List[str],
     receipts: List[ToolReceipt],
@@ -331,7 +394,10 @@ def pick_primary_entities(
 
     stable_ids: List[str] = []
     for query in candidates:
-        result = mcp_client.call_tool("graph_search_entities", {"query": query})
+        result = mcp_client.call_tool(
+            "graph_search_entities",
+            {"runId": run_id, "scope": "run", "query": query},
+        )
         if not result.ok:
             continue
         entities = pick_list(result.content, ["entities", "results", "items"])
@@ -345,7 +411,11 @@ def pick_primary_entities(
     return dedupe_str_list(stable_ids or candidates)
 
 
-def graph_context_signals(mcp_client: McpClientProtocol, entity_ids: List[str]) -> tuple[List[str], List[str], List[str]]:
+def graph_context_signals(
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    entity_ids: List[str],
+) -> tuple[List[str], List[str], List[str]]:
     if not _env_flag("STAGE2_ENABLE_GRAPH_CONTEXT", False):
         return ([], [], [])
 
@@ -355,7 +425,7 @@ def graph_context_signals(mcp_client: McpClientProtocol, entity_ids: List[str]) 
     for entity_id in entity_ids[:2]:
         result = mcp_client.call_tool(
             "graph_neighbors",
-            {"entityId": entity_id, "depth": 1},
+            {"runId": run_id, "scope": "run", "entityId": entity_id, "depth": 1},
         )
         if not result.ok:
             continue
@@ -435,12 +505,16 @@ def vector_multi_query(
 
 def graph_multi_entity_query(
     mcp_client: McpClientProtocol,
+    run_id: str,
     entity_ids: List[str],
     neighbor_depth: int = 1,
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     for entity_id in dedupe_str_list(entity_ids)[:4]:
-        entity_result = mcp_client.call_tool("graph_get_entity", {"entityId": entity_id})
+        entity_result = mcp_client.call_tool(
+            "graph_get_entity",
+            {"runId": run_id, "scope": "run", "entityId": entity_id},
+        )
         if entity_result.ok and isinstance(entity_result.content, dict):
             props = pick_dict(entity_result.content, ["properties", "props"])
             labels = pick_list(entity_result.content, ["labels"])
@@ -450,7 +524,7 @@ def graph_multi_entity_query(
 
         neighbor_result = mcp_client.call_tool(
             "graph_neighbors",
-            {"entityId": entity_id, "depth": neighbor_depth},
+            {"runId": run_id, "scope": "run", "entityId": entity_id, "depth": neighbor_depth},
         )
         if not neighbor_result.ok or not isinstance(neighbor_result.content, dict):
             continue
@@ -515,6 +589,61 @@ def _is_valid_public_source_url(url: str) -> bool:
     return True
 
 
+def _tokenize_relevance_terms(text: str) -> List[str]:
+    lowered = str(text or "").lower()
+    tokens = re.findall(r"[a-z0-9][a-z0-9._-]{1,}", lowered)
+    stopwords = {
+        "about",
+        "from",
+        "with",
+        "this",
+        "that",
+        "into",
+        "where",
+        "which",
+        "their",
+        "while",
+        "when",
+        "section",
+        "report",
+        "analysis",
+        "objective",
+        "profile",
+    }
+    return [token for token in tokens if token not in stopwords and len(token) >= 3]
+
+
+def _evidence_relevance_score(
+    section_context: SectionTaskModel | None,
+    snippet: str,
+    source_url: str | None,
+    title: str | None,
+) -> float:
+    if section_context is None:
+        return 1.0
+    context_blob = " ".join(
+        [
+            section_context.title,
+            section_context.objective,
+            section_context.section_group,
+            " ".join(section_context.graph_chain),
+            " ".join(section_context.query_hints),
+            " ".join(section_context.entity_ids),
+        ]
+    )
+    context_tokens = set(_tokenize_relevance_terms(context_blob))
+    if not context_tokens:
+        return 1.0
+    evidence_blob = " ".join([snippet or "", source_url or "", title or ""])
+    evidence_tokens = set(_tokenize_relevance_terms(evidence_blob))
+    if not evidence_tokens:
+        return 0.0
+    overlap = context_tokens & evidence_tokens
+    overlap_ratio = len(overlap) / max(1, len(context_tokens))
+    density = len(overlap) / max(1, len(evidence_tokens))
+    return min(1.0, overlap_ratio * 0.75 + density * 0.25)
+
+
 def _include_in_evidence_appendix(item: EvidenceRefModel) -> bool:
     if _looks_like_tool_invocation_json(item.snippet or ""):
         return False
@@ -523,7 +652,12 @@ def _include_in_evidence_appendix(item: EvidenceRefModel) -> bool:
     return bool(item.document_id or item.object_ref)
 
 
-def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[EvidenceRefModel]:
+def pack_evidence(
+    section_id: str,
+    rows: List[Dict[str, Any]],
+    k: int,
+    section_context: SectionTaskModel | None = None,
+) -> List[EvidenceRefModel]:
     sorted_rows = sorted(
         [row for row in rows if _row_has_database_evidence(row)],
         key=lambda item: float(item.get("score", 0.0) or 0.0),
@@ -545,6 +679,22 @@ def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[E
         document_id = str(row.get("document_id") or row.get("documentId") or "") or None
         object_ref = pick_dict(row, ["objectRef", "object_ref"]) or pick_dict(metadata, ["objectRef", "object_ref"])
         graph_ref = pick_dict(row, ["graph_ref"])
+        evidence_object_key = (
+            pick_str(object_ref, ["objectKey", "object_key"])
+            or pick_str(metadata, ["evidence_object_key", "object_key"])
+            or pick_str(row, ["evidence_object_key"])
+        )
+        if section_context is not None:
+            relevance_score = _evidence_relevance_score(
+                section_context,
+                snippet,
+                source_url,
+                pick_str(row, ["title", "document_title", "page_title"]),
+            )
+            if relevance_score < 0.06:
+                continue
+        else:
+            relevance_score = 1.0
         if not source_url and not document_id and not object_ref and not graph_ref:
             # Do not cite tool receipts or internal artifacts as evidence.
             continue
@@ -555,10 +705,17 @@ def pack_evidence(section_id: str, rows: List[Dict[str, Any]], k: int) -> List[E
                 document_id=document_id,
                 snippet=snippet,
                 source_url=source_url,
+                source_url_unavailable_reason=(
+                    None
+                    if source_url
+                    else "source_url_missing_in_retrieved_evidence"
+                ),
                 title=pick_str(row, ["title", "document_title", "page_title"]),
                 domain=_domain_from_url(source_url),
                 retrieved_at=pick_str(row, ["retrievedAt", "retrieved_at", "created_at"]) or pick_str(metadata, ["retrievedAt", "retrieved_at", "created_at"]),
                 content_hash=pick_str(row, ["contentHash", "content_hash", "sha256"]),
+                relevance_score=relevance_score,
+                evidence_object_key=evidence_object_key,
                 source_type=_infer_source_type(row),
                 score=float(row.get("score", 0.0) or 0.0),
                 db_source=pick_str(row, ["db_source"]) or ("graph" if row.get("graph_entity_id") or row.get("graph_ref") else "vector"),
@@ -1244,7 +1401,7 @@ def _extract_related_depth_candidates(receipts: List["ToolReceipt"], primary_ent
 def _related_people_from_value(value: Any) -> List[str]:
     values: List[str] = []
     if isinstance(value, str):
-        values.extend(extract_person_targets(value))
+        values.extend(_filter_related_person_candidates(extract_person_targets(value)))
     elif isinstance(value, list):
         for item in value:
             values.extend(_related_people_from_value(item))
@@ -1252,8 +1409,25 @@ def _related_people_from_value(value: Any) -> List[str]:
         for key in ("name", "person", "author", "advisor", "colleague", "collaborator", "displayName"):
             item = value.get(key)
             if isinstance(item, str):
-                values.extend(extract_person_targets(item))
+                values.extend(_filter_related_person_candidates(extract_person_targets(item)))
     return dedupe_str_list(values)
+
+
+def _filter_related_person_candidates(values: List[str]) -> List[str]:
+    filtered: List[str] = []
+    for candidate in values:
+        cleaned = " ".join(str(candidate or "").strip().split())
+        tokens = [token.casefold() for token in cleaned.split() if token]
+        if len(tokens) < 2 or len(tokens) > 4:
+            continue
+        if any(token in REPORT_RELATED_PERSON_REJECT_TOKENS for token in tokens):
+            continue
+        if any(token in REPORT_PROVIDER_BLOCKLIST for token in tokens):
+            continue
+        if not all(re.fullmatch(r"[A-Za-z][A-Za-z'-]*", token) for token in cleaned.split()):
+            continue
+        filtered.append(cleaned)
+    return dedupe_str_list(filtered)
 
 
 def _related_orgs_from_value(value: Any) -> List[str]:
@@ -1280,6 +1454,21 @@ def _normalize_related_org_candidate(value: str) -> str | None:
     if len(candidate) < 3:
         return None
     lowered = candidate.casefold()
+    if lowered in REPORT_ORG_DESCRIPTOR_TERMS:
+        return None
+    tokens = [token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z'-]*", candidate)]
+    if not tokens:
+        return None
+    if (
+        tokens[0] in REPORT_PROVIDER_BLOCKLIST
+        and len(tokens) <= 2
+        and (len(tokens) == 1 or tokens[1] in {"research", "search", "person", "results", "sources", "profile"})
+    ):
+        return None
+    if lowered in {"tavily research", "tavily person search", "google serp person search"}:
+        return None
+    if tokens and all(token in REPORT_ORG_GENERIC_TOKENS for token in tokens):
+        return None
     markers = ("university", "college", "school", "lab", "laboratory", "institute", "department", "company", "corp", "inc", "llc", "group", "center", "centre")
     if not any(marker in lowered for marker in markers) and len(candidate.split()) < 2:
         return None
@@ -1287,8 +1476,30 @@ def _normalize_related_org_candidate(value: str) -> str | None:
 
 
 def _stage1_receipts_investigated_related_entity(receipts: List["ToolReceipt"], entity_name: str, entity_type: str) -> bool:
-    person_tools = {"tavily_research", "tavily_person_search", "person_search", "github_identity_search", "gitlab_identity_search", "arxiv_search_and_download", "orcid_search", "semantic_scholar_search", "dblp_author_search"}
-    org_tools = {"tavily_research", "open_corporates_search", "company_officer_search", "domain_whois_search", "contact_page_extractor", "org_staff_page_search", "wayback_fetch_url"}
+    person_tools = {
+        "tavily_research",
+        "tavily_person_search",
+        "extract_webpage",
+        "crawl_webpage",
+        "person_search",
+        "github_identity_search",
+        "gitlab_identity_search",
+        "arxiv_search_and_download",
+        "orcid_search",
+        "semantic_scholar_search",
+        "dblp_author_search",
+    }
+    org_tools = {
+        "tavily_research",
+        "extract_webpage",
+        "crawl_webpage",
+        "open_corporates_search",
+        "company_officer_search",
+        "domain_whois_search",
+        "contact_page_extractor",
+        "org_staff_page_search",
+        "wayback_fetch_url",
+    }
     tool_set = person_tools if entity_type == "person" else org_tools
     target = entity_name.casefold()
     for receipt in receipts:

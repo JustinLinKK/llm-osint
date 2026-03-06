@@ -421,6 +421,55 @@ def test_extract_phone_numbers_ignores_date_like_values(monkeypatch) -> None:
     assert "09/04/2019" not in numbers
 
 
+def test_extract_usernames_supports_dotted_handles_and_profile_urls(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    usernames = planner_graph._extract_usernames(
+        "Mentions: @xinyu.pi and @xinyu-pi. Profiles: "
+        "https://github.com/xinyu.pi https://gitlab.com/xinyu-pi "
+        "https://www.reddit.com/user/xinyu_pi/"
+    )
+
+    assert "xinyu.pi" in usernames
+    assert "xinyu-pi" in usernames
+    assert "xinyu_pi" in usernames
+
+
+def test_related_person_candidate_filter_rejects_none_publications(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert not planner_graph._is_related_person_candidate(
+        "None Publications",
+        source_key="relatedPeople",
+        source_tool="tavily_research",
+    )
+
+
+def test_related_person_candidate_filter_rejects_noisy_suggest_phrase(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert not planner_graph._is_related_person_candidate(
+        "Suggest Name Emails",
+        source_key="relatedPeople",
+        source_tool="tavily_person_search",
+    )
+
+
+def test_google_scholar_profile_query_is_site_constrained(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert planner_graph._google_scholar_profile_query("Ada Lovelace") == (
+        'site:scholar.google.com/citations "Ada Lovelace"'
+    )
+
+
+def test_normalize_related_org_name_rejects_tool_provider_labels(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert planner_graph._normalize_related_org_name("Tavily research") is None
+    assert planner_graph._normalize_related_org_name("Google SERP person search") is None
+
+
 def test_filter_completed_tool_plan_skips_successful_semantic_repeats(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 

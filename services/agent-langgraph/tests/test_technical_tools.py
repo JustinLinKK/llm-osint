@@ -107,6 +107,50 @@ def test_github_identity_search_direct_username(monkeypatch) -> None:
     assert any(item["value"] == "ada@example.com" for item in result["contact_signals"])
 
 
+def test_github_identity_search_composite_name_falls_back_to_name_variants(monkeypatch) -> None:
+    def _mock_http_request(url, method="GET", params=None, headers=None, timeout=20):
+        query = str((params or {}).get("q") or "")
+        if query == "Xinyu Frederick Pi":
+            body = {"items": []}
+        elif query == "Xinyu Frederick Pi in:fullname":
+            body = {"items": []}
+        elif query == "Xinyu Pi":
+            body = {"items": []}
+        elif query == "Frederick Pi":
+            body = {"items": [{"login": "FrederickPi1969"}]}
+        else:
+            body = {"items": []}
+        return 200, {}, json.dumps(body), url
+
+    monkeypatch.setattr("technical.common.http_request", _mock_http_request)
+    monkeypatch.setattr(
+        "technical.github_identity_search._fetch_user",
+        lambda username: {
+            "login": username,
+            "id": 1969,
+            "name": "Frederick Pi",
+            "bio": "AI researcher",
+            "blog": "",
+            "email": "",
+            "company": "",
+            "location": "",
+            "followers": 42,
+            "public_repos": 3,
+            "created_at": "2020-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+            "html_url": f"https://github.com/{username}",
+        },
+    )
+    monkeypatch.setattr("technical.github_identity_search._fetch_orgs_list", lambda username: [])
+    monkeypatch.setattr("technical.github_identity_search._fetch_repos", lambda username: [])
+
+    result = run_github_search({"person_name": "Xinyu Frederick Pi", "max_results": 5})
+
+    assert result["username"] == "FrederickPi1969"
+    assert result["profile_url"] == "https://github.com/FrederickPi1969"
+    assert result["match_features"]["candidate_count"] >= 1
+
+
 def test_personal_site_search_extracts_links_and_contact(monkeypatch) -> None:
     html = """
     <html>

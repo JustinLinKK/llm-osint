@@ -8,8 +8,11 @@ EMAIL_REGEX = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORE
 DOMAIN_REGEX = re.compile(
     r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE
 )
-USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,32})")
+USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9](?:[A-Za-z0-9_.-]{1,62}[A-Za-z0-9])?)")
 CAPITALIZED_NAME_REGEX = re.compile(r"\b[A-Z][a-z]+(?:[\s-]+[A-Z][a-z]+){0,3}\b")
+PARENTHETICAL_ALIAS_NAME_REGEX = re.compile(
+    r"\b([A-Za-z][A-Za-z'-]{1,31})\s*\(\s*([A-Za-z][A-Za-z'-]{1,31})\s*\)\s*([A-Za-z][A-Za-z'-]{1,31})\b"
+)
 PERSON_HINT_REGEX = re.compile(
     r"(?i)\b(?:investigate|investigation(?:\s+into)?|profile|research|look\s+into|find\s+info\s+on|osint(?:\s+on)?)\b[:\s-]*([A-Za-z][A-Za-z'\s-]{1,79})"
 )
@@ -58,6 +61,11 @@ PERSON_CANDIDATE_BREAKWORDS = {
 }
 
 PERSON_CANDIDATE_REJECT_TOKENS = {
+    "none",
+    "null",
+    "unknown",
+    "na",
+    "n/a",
     "search",
     "through",
     "internet",
@@ -140,6 +148,12 @@ PERSON_CANDIDATE_REJECT_TOKENS = {
     "tech",
     "wikipedia",
     "society",
+    "publication",
+    "publications",
+    "record",
+    "records",
+    "candidate",
+    "candidates",
     "github",
     "gitlab",
     "linkedin",
@@ -180,6 +194,12 @@ PERSON_CANDIDATE_REJECT_SUFFIXES = {
     "pages",
     "profile",
     "profiles",
+    "publication",
+    "publications",
+    "record",
+    "records",
+    "result",
+    "results",
     "research",
     "repository",
     "repositories",
@@ -215,16 +235,23 @@ def normalize_person_candidate(value: str) -> str | None:
     words = normalized.split()
     collected: List[str] = []
     for word in words:
-        lower_word = word.lower()
+        cleaned_word = word.strip("()[]{}\"'.,;:!?")
+        if not cleaned_word:
+            continue
+        lower_word = cleaned_word.lower()
         if lower_word in PERSON_CANDIDATE_STOPWORDS:
             if collected:
                 break
             continue
-        if lower_word in PERSON_CANDIDATE_BREAKWORDS and collected:
-            break
-        if not re.fullmatch(r"[A-Za-z][A-Za-z'-]*", word):
-            break
-        collected.append(word)
+        if lower_word in PERSON_CANDIDATE_BREAKWORDS:
+            if collected:
+                break
+            continue
+        if not re.fullmatch(r"[A-Za-z][A-Za-z'-]*", cleaned_word):
+            if collected:
+                break
+            continue
+        collected.append(cleaned_word)
         if len(collected) >= 4:
             break
 
@@ -241,6 +268,21 @@ def normalize_person_candidate(value: str) -> str | None:
     if not _is_valid_person_candidate(candidate):
         return None
     return candidate
+
+
+def _extract_parenthetical_alias_variants(text: str) -> List[str]:
+    candidates: List[str] = []
+    for first, alias, last in PARENTHETICAL_ALIAS_NAME_REGEX.findall(text or ""):
+        variants = (
+            f"{first} {last}",
+            f"{alias} {last}",
+            f"{first} {alias} {last}",
+        )
+        for item in variants:
+            normalized = normalize_person_candidate(item)
+            if normalized:
+                candidates.append(normalized)
+    return _dedupe(candidates)
 
 
 def _is_valid_person_candidate(value: str) -> bool:
@@ -284,7 +326,7 @@ def extract_person_targets(text: str) -> List[str]:
     scrubbed = DOMAIN_REGEX.sub(" ", scrubbed)
     scrubbed = USERNAME_REGEX.sub(" ", scrubbed)
 
-    candidates: List[str] = []
+    candidates: List[str] = _extract_parenthetical_alias_variants(scrubbed)
     for match in PERSON_HINT_REGEX.findall(scrubbed):
         normalized = normalize_person_candidate(match)
         if normalized:

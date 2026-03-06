@@ -126,6 +126,7 @@ def build_report_graph(
         report_type = decide_report_type(state.get("prompt", ""), state.get("noteboard", []))
         primary_entities = pick_primary_entities(
             mcp_client=mcp_client,
+            run_id=state["run_id"],
             prompt=state.get("prompt", ""),
             noteboard=state.get("noteboard", []),
             receipts=state.get("stage1_receipts", []),
@@ -209,7 +210,7 @@ def build_report_graph(
             cached = entity_signal_cache.get(entity_id)
         if cached is not None:
             return cached
-        resolved = graph_context_signals(mcp_client, [entity_id])
+        resolved = graph_context_signals(mcp_client, state["run_id"], [entity_id])
         with cache_lock:
             return entity_signal_cache.setdefault(entity_id, resolved)
 
@@ -318,6 +319,14 @@ def build_report_graph(
             if primary_evidence is None:
                 issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
                 continue
+            has_run_evidence_link = bool(
+                primary_evidence.evidence_object_key
+                or (isinstance(primary_evidence.object_ref, dict) and (primary_evidence.object_ref.get("objectKey") or primary_evidence.object_ref.get("object_key")))
+                or primary_evidence.document_id
+            )
+            if not has_run_evidence_link:
+                issues.append(f"{task.section_id}: dropped claim without run-linked evidence object: {claim.claim_id}")
+                continue
             normalized = claim.model_copy(
                 update={
                     "evidence_keys": matched,
@@ -365,7 +374,7 @@ def build_report_graph(
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
         queries = dedupe_str_list(build_section_queries(hydrated_task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
-        graph_hits = graph_multi_entity_query(mcp_client, hydrated_task.entity_ids)
+        graph_hits = graph_multi_entity_query(mcp_client, state["run_id"], hydrated_task.entity_ids)
         for query in queries:
             hits.extend(_cached_vector_rows(state["run_id"], query))
         hits.extend(graph_hits)
@@ -381,7 +390,7 @@ def build_report_graph(
         )
 
         emit_stage(state, "evidence_pack_node", "started", section_id=task.section_id)
-        evidence = pack_evidence(hydrated_task.section_id, hits, k=vector_k)
+        evidence = pack_evidence(hydrated_task.section_id, hits, k=vector_k, section_context=hydrated_task)
         emit_stage(state, "evidence_pack_node", "completed", section_id=task.section_id, evidence_count=len(evidence))
 
         claims = _extract_claims_for_task(state, hydrated_task, evidence)
@@ -603,7 +612,7 @@ def build_report_graph(
         for entity_id in entity_ids:
             cached = entity_signal_cache.get(entity_id)
             if cached is None:
-                cached = graph_context_signals(mcp_client, [entity_id])
+                cached = graph_context_signals(mcp_client, state["run_id"], [entity_id])
                 entity_signal_cache[entity_id] = cached
             item_aliases, item_handles, item_domains = cached
             aliases.extend(item_aliases)
@@ -628,7 +637,7 @@ def build_report_graph(
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
         queries = dedupe_str_list(build_section_queries(task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
-        graph_hits = graph_multi_entity_query(mcp_client, task.entity_ids)
+        graph_hits = graph_multi_entity_query(mcp_client, state["run_id"], task.entity_ids)
         for query in queries:
             cache_key = f"{state['run_id']}::{query.strip().lower()}"
             cached_rows = vector_query_cache.get(cache_key)
@@ -655,7 +664,7 @@ def build_report_graph(
             return dict(state)
 
         emit_stage(state, "evidence_pack_node", "started", section_id=task.section_id)
-        packed = pack_evidence(task.section_id, state.get("section_hits", []), k=vector_k)
+        packed = pack_evidence(task.section_id, state.get("section_hits", []), k=vector_k, section_context=task)
         emit_stage(state, "evidence_pack_node", "completed", section_id=task.section_id, evidence_count=len(packed))
         return {"section_evidence_buffer": packed}
 
@@ -747,6 +756,14 @@ def build_report_graph(
             )
             if primary_evidence is None:
                 issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
+                continue
+            has_run_evidence_link = bool(
+                primary_evidence.evidence_object_key
+                or (isinstance(primary_evidence.object_ref, dict) and (primary_evidence.object_ref.get("objectKey") or primary_evidence.object_ref.get("object_key")))
+                or primary_evidence.document_id
+            )
+            if not has_run_evidence_link:
+                issues.append(f"{task.section_id}: dropped claim without run-linked evidence object: {claim.claim_id}")
                 continue
             normalized = claim.model_copy(
                 update={
@@ -1032,6 +1049,53 @@ def build_report_graph(
         if no_evidence_or_claims:
             section_issues.append("No evidence/claims extracted; finalized with draft-only sections.")
 
+        if evidence_refs:
+            resolvable_url_count = len([item for item in evidence_refs if item.source_url])
+            evidence_object_key_count = len(
+                [
+                    item
+                    for item in evidence_refs
+                    if item.evidence_object_key
+                    or (isinstance(item.object_ref, dict) and (item.object_ref.get("objectKey") or item.object_ref.get("object_key")))
+                ]
+            )
+            source_url_ratio = resolvable_url_count / max(1, len(evidence_refs))
+            object_key_ratio = evidence_object_key_count / max(1, len(evidence_refs))
+            if source_url_ratio < 0.95:
+                section_issues.append(
+                    f"Citation linkage quality gate: source URL coverage {source_url_ratio:.2f} below required 0.95."
+                )
+            if object_key_ratio < 1.0:
+                section_issues.append(
+                    f"Citation linkage quality gate: evidence object key coverage {object_key_ratio:.2f} below required 1.00."
+                )
+
+            unique_urls = {item.source_url for item in evidence_refs if item.source_url}
+            unique_domains = {(item.domain or "").lower() for item in evidence_refs if (item.source_url or item.domain)}
+            unique_domains = {item for item in unique_domains if item}
+            if len(unique_urls) < 30 or len(unique_domains) < 10:
+                section_issues.append(
+                    "Retrieval diversity gate: below target (need >=30 unique URLs and >=10 unique domains) for final person report."
+                )
+
+            section_evidence_map: Dict[str, List[EvidenceRefModel]] = {}
+            for item in evidence_refs:
+                section_evidence_map.setdefault(item.section_id, []).append(item)
+            for draft in drafts:
+                section_items = section_evidence_map.get(draft.section_id, [])
+                has_high_relevance = any(
+                    float(item.relevance_score or 0.0) >= 0.08
+                    and (
+                        bool(item.evidence_object_key)
+                        or (isinstance(item.object_ref, dict) and (item.object_ref.get("objectKey") or item.object_ref.get("object_key")))
+                    )
+                    for item in section_items
+                )
+                if draft.content.strip() and not has_high_relevance:
+                    section_issues.append(
+                        f"{draft.section_id}: section-level evidence gate failed (missing high-relevance citation tied to run evidence)."
+                    )
+
         coverage = report_memory.coverage if report_memory is not None else build_coverage_ledger(
             state.get("report_type", "person"),
             claims,
@@ -1047,6 +1111,9 @@ def build_report_graph(
             not missing
             and not revision_targets
             and not any("high-impact claim missing evidence" in item for item in section_issues)
+            and not any("Citation linkage quality gate:" in item for item in section_issues)
+            and not any("Retrieval diversity gate:" in item for item in section_issues)
+            and not any("section-level evidence gate failed" in item for item in section_issues)
             and not consistency_issues
             and coverage_is_complete(coverage, state.get("report_type", "person"))
         )

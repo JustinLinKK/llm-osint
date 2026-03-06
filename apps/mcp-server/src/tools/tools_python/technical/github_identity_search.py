@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -79,6 +80,90 @@ def _search_query(query: Dict[str, Any]) -> str:
     if query.get("domain"):
         pieces.append(str(query["domain"]))
     return " ".join(piece for piece in pieces if piece).strip()
+
+
+def _dedupe_strings(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    output: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        output.append(text)
+    return output
+
+
+def _person_name_variants(person_name: str) -> List[str]:
+    normalized = " ".join(person_name.split()).strip()
+    if not normalized:
+        return []
+    variants: List[str] = [normalized]
+    tokens = [token for token in re.split(r"\s+", normalized) if token]
+    if len(tokens) >= 2:
+        variants.append(f"{tokens[0]} {tokens[-1]}")
+    if len(tokens) >= 3:
+        variants.append(f"{tokens[1]} {tokens[-1]}")
+        for idx in range(len(tokens) - 1):
+            variants.append(f"{tokens[idx]} {tokens[idx + 1]}")
+    return _dedupe_strings(variants)
+
+
+def _search_query_variants(query: Dict[str, Any]) -> List[str]:
+    person_name = str(query.get("person_name") or "").strip()
+    email = str(query.get("email") or "").strip()
+    domain = str(query.get("domain") or "").strip()
+    blog_domain = domain_from_url(query.get("blog"))
+
+    variants: List[str] = []
+    for name_variant in _person_name_variants(person_name):
+        variants.append(name_variant)
+        variants.append(f"{name_variant} in:fullname")
+
+    if email:
+        variants.append(email)
+    if blog_domain:
+        variants.append(blog_domain)
+    if domain:
+        variants.append(domain)
+
+    fallback = _search_query(query)
+    if fallback:
+        variants.append(fallback)
+
+    return _dedupe_strings(variants)
+
+
+def _search_usernames(search_query: str, max_results: int) -> List[str]:
+    from technical.common import http_request
+
+    status, _, body, _ = http_request(
+        SEARCH_USERS_URL,
+        params={"q": search_query, "per_page": max(max_results, 5)},
+        headers=_github_headers(),
+    )
+    if status == 422:
+        return []
+    if status >= 400:
+        raise RuntimeError(f"GitHub search failed with HTTP {status}")
+
+    import json
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        return []
+    items = parsed.get("items") if isinstance(parsed, dict) else []
+    if not isinstance(items, list):
+        return []
+    return [
+        str(item.get("login") or "").strip()
+        for item in items[: max(max_results, 5)]
+        if isinstance(item, dict) and str(item.get("login") or "").strip()
+    ]
 
 
 def _fetch_user(username: str) -> Dict[str, Any]:
@@ -265,30 +350,27 @@ def run(input_data: Dict[str, Any]) -> Dict[str, Any]:
         user = _fetch_user(username)
         return _candidate_result(query, user, _fetch_orgs_list(username), _fetch_repos(username))
 
-    search_query = _search_query(query)
-    if not search_query:
+    search_queries = _search_query_variants(query)
+    if not search_queries:
         raise RuntimeError("Missing required input: person_name, username, profile_url, email, or repo_url")
-    from technical.common import http_request
-    status, _, body, _ = http_request(
-        SEARCH_USERS_URL,
-        params={"q": search_query, "per_page": max(query["max_results"], 5)},
-        headers=_github_headers(),
-    )
-    if status >= 400:
-        raise RuntimeError(f"GitHub search failed with HTTP {status}")
-    import json
-    parsed = json.loads(body)
-    items = parsed.get("items") if isinstance(parsed, dict) else []
+
+    candidate_usernames: List[str] = []
+    target_candidate_count = max(query["max_results"], 5)
+    candidate_username_limit = min(20, max(target_candidate_count * 3, 10))
+    for search_query in search_queries[:6]:
+        for candidate_username in _search_usernames(search_query, max_results=target_candidate_count):
+            if candidate_username not in candidate_usernames:
+                candidate_usernames.append(candidate_username)
+            if len(candidate_usernames) >= candidate_username_limit:
+                break
+        if len(candidate_usernames) >= candidate_username_limit:
+            break
+
     candidates: List[Dict[str, Any]] = []
-    if isinstance(items, list):
-        for item in items[: query["max_results"]]:
-            if not isinstance(item, dict):
-                continue
-            candidate_username = str(item.get("login") or "").strip()
-            if not candidate_username:
-                continue
-            user = _fetch_user(candidate_username)
-            candidates.append(_candidate_result(query, user, _fetch_orgs_list(candidate_username), _fetch_repos(candidate_username)))
+    for candidate_username in candidate_usernames[:candidate_username_limit]:
+        user = _fetch_user(candidate_username)
+        candidates.append(_candidate_result(query, user, _fetch_orgs_list(candidate_username), _fetch_repos(candidate_username)))
+
     if not candidates:
         return validate_result_shape(build_base_result("github_identity_search", "github", query))
     candidates.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)

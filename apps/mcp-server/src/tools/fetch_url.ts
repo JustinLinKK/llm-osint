@@ -145,6 +145,19 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function looksLikePdf(bytes: Buffer): boolean {
+  if (!bytes || bytes.length < 5) return false;
+  return bytes.subarray(0, 5).toString("ascii") === "%PDF-";
+}
+
+function inferSourceType(contentType: string, bytes: Buffer): "html" | "pdf" | "image" | "text" {
+  if (contentType.startsWith("text/html")) return "html";
+  if (contentType.startsWith("application/pdf")) return "pdf";
+  if (looksLikePdf(bytes)) return "pdf";
+  if (contentType.startsWith("image/")) return "image";
+  return "text";
+}
+
 function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
 }
@@ -234,19 +247,12 @@ async function storeDocument(
   runId: string,
   url: string,
   bytes: Buffer,
-  contentType: string
+  contentType: string,
+  sourceType: "html" | "pdf" | "image" | "text"
 ): Promise<{ documentId: string; objectKey: string; etag: string | null; sourceType: string; sha256: string }> {
   const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
 
   await ensureBucket(cfg.minio.bucket);
-
-  const sourceType = contentType.startsWith("text/html")
-    ? "html"
-    : contentType.startsWith("application/pdf")
-    ? "pdf"
-    : contentType.startsWith("image/")
-    ? "image"
-    : "text";
 
   const objectKey = `runs/${runId}/raw/${sourceType}/${sha256}.${sourceType}`;
 
@@ -312,19 +318,23 @@ export function registerFetchUrl(server: McpServer) {
 
       try {
         const result = await makeHttpRequest(url);
-        const { bytes, contentType, finalUrl, statusCode, attempts, requestProfile } = result;
-        const htmlText = contentType.startsWith("text/html") ? bytes.toString("utf-8") : null;
+        const { bytes, finalUrl, statusCode, attempts, requestProfile } = result;
+        const sourceType = inferSourceType(result.contentType, bytes);
+        const contentType = sourceType === "pdf" ? "application/pdf" : result.contentType;
+        const pdfDetectedByMagic = sourceType === "pdf" && !result.contentType.startsWith("application/pdf");
+        const htmlText = sourceType === "html" ? bytes.toString("utf-8") : null;
         const crawlHints = htmlText ? extractHtmlHints(htmlText, finalUrl) : {
           title: null,
           links: [],
           sameHostLinks: [],
         };
 
-        const { documentId, objectKey, etag, sourceType, sha256 } = await storeDocument(
+        const { documentId, objectKey, etag, sha256 } = await storeDocument(
           runId,
           finalUrl,
           bytes,
-          contentType
+          contentType,
+          sourceType
         );
 
         const output = {
@@ -336,6 +346,7 @@ export function registerFetchUrl(server: McpServer) {
           sizeBytes: bytes.length,
           contentType,
           sourceType,
+          pdfDetectedByMagic,
           url,
           finalUrl,
           statusCode,

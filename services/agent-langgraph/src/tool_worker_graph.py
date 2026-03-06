@@ -70,6 +70,9 @@ TOOL_CONFIDENCE_REGISTRY: Dict[str, Dict[str, Any]] = {
     "person_search": {"type": "person_recon", "confidence": 0.65},
     "tavily_research": {"type": "deep_research", "confidence": 0.86},
     "tavily_person_search": {"type": "web_search", "confidence": 0.9},
+    "extract_webpage": {"type": "web_extract", "confidence": 0.88},
+    "crawl_webpage": {"type": "web_crawl", "confidence": 0.82},
+    "map_webpage": {"type": "web_map", "confidence": 0.8},
     "x_get_user_posts_api": {"type": "social_posts", "confidence": 0.8},
     "linkedin_download_html_ocr": {"type": "social_profile_capture", "confidence": 0.75},
     "google_serp_person_search": {"type": "web_search", "confidence": 0.7},
@@ -233,7 +236,7 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
         return {"vector_ingest_result": result}
 
     def graph_ingest_worker(state: ToolWorkerState) -> Dict[str, Any]:
-        # Phase 2b: graph ingestion is always derived from normalized tool_result_summary text.
+        # Phase 2b: graph ingestion uses normalized summary text plus deterministic raw-result normalization.
         if not _should_run_post_ingest(state["tool_name"], bool(state.get("ok", False))):
             emit_stage(state, "graph_ingest_worker", "completed", skipped=True)
             return {"graph_ingest_result": {}}
@@ -469,7 +472,7 @@ def _summarize_tool_output_for_ingestion(
 def _tool_summary_prompt(tool_name: str) -> str:
     if tool_name == "person_search":
         return PERSON_SEARCH_TOOL_SUMMARY_SYSTEM_PROMPT
-    if tool_name in {"google_serp_person_search", "tavily_person_search", "tavily_research"}:
+    if tool_name in {"google_serp_person_search", "tavily_person_search", "tavily_research", "extract_webpage", "crawl_webpage", "map_webpage"}:
         return GOOGLE_SERP_PERSON_SEARCH_TOOL_SUMMARY_SYSTEM_PROMPT
     if tool_name in {"arxiv_search_and_download", "arxiv_paper_ingest"}:
         return ARXIV_TOOL_SUMMARY_SYSTEM_PROMPT
@@ -762,10 +765,11 @@ def _extract_graph_construction_payload(
     result: Dict[str, Any],
     tool_result_summary: str,
 ) -> Dict[str, Any]:
+    graph_result = _normalize_tool_result_for_graph(tool_name, arguments, result)
     payload = {
         "tool_name": tool_name,
         "arguments": arguments,
-        "result": result,
+        "result": graph_result,
         "tool_result_summary": tool_result_summary,
         "output_schema": {
             "entities": [
@@ -806,17 +810,18 @@ def _build_graph_construction_batches(
     result: Dict[str, Any],
     extracted_graph: Dict[str, Any],
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    graph_result = _normalize_tool_result_for_graph(tool_name, arguments, result)
     raw_entities = extracted_graph.get("entities")
     raw_relations = extracted_graph.get("relations")
     if not isinstance(raw_entities, list):
         raw_entities = []
     if not isinstance(raw_relations, list):
         raw_relations = []
-    supplemental_entities, supplemental_relations = _supplemental_graph_components_from_result(tool_name, arguments, result)
+    supplemental_entities, supplemental_relations = _supplemental_graph_components_from_result(tool_name, arguments, graph_result)
     raw_entities = list(raw_entities) + supplemental_entities
     raw_relations = list(raw_relations) + supplemental_relations
 
-    evidence_ref = _extract_evidence(result)
+    evidence_ref = _extract_evidence(graph_result)
     grouped_entities: Dict[str, Dict[str, Any]] = {}
     signature_to_bucket: Dict[str, str] = {}
     for row in raw_entities:
@@ -882,9 +887,16 @@ def _build_graph_construction_batches(
             [name for name in names if _normalize_graph_name(name) != _normalize_graph_name(canonical_name)],
             attributes,
         )
+        canonical_id = _canonical_graph_node_id(entity_type, canonical_name)
+        run_scoped_id = _stable_graph_node_id(run_id, entity_type, canonical_name)
         entity_payload = {
-            "node_id": _stable_graph_node_id(run_id, entity_type, canonical_name),
+            "node_id": run_scoped_id,
+            "canonical_id": canonical_id,
+            "run_scoped_id": run_scoped_id,
+            "run_id": run_id,
+            "external_context": False,
             "type": entity_type,
+            "raw_type": entity_type,
             "canonical_name": canonical_name,
             "alt_names": [name for name in names if _normalize_graph_name(name) != _normalize_graph_name(canonical_name)],
             "attributes": attributes,
@@ -939,9 +951,26 @@ def _build_graph_construction_batches(
                 rel_type,
                 canonical_name,
             ),
+            "canonical_id": _canonical_graph_edge_id(
+                str(src_entity.get("canonical_id") or src_entity["node_id"]),
+                str(dst_entity.get("canonical_id") or dst_entity["node_id"]),
+                rel_type,
+                canonical_name,
+            ),
+            "run_scoped_id": _stable_graph_edge_id(
+                str(src_entity["node_id"]),
+                str(dst_entity["node_id"]),
+                rel_type,
+                canonical_name,
+            ),
+            "run_id": run_id,
+            "external_context": False,
             "src_id": src_entity["node_id"],
             "dst_id": dst_entity["node_id"],
+            "src_canonical_id": src_entity.get("canonical_id"),
+            "dst_canonical_id": dst_entity.get("canonical_id"),
             "rel_type": rel_type,
+            "raw_relation_type": str(row.get("rel_type") or rel_type),
             "canonical_name": canonical_name,
             "alt_names": alt_names,
             "source_tool": tool_name,
@@ -980,9 +1009,26 @@ def _build_graph_construction_batches(
                 rel_type,
                 rel_type,
             ),
+            "canonical_id": _canonical_graph_edge_id(
+                str(entity.get("canonical_id") or entity["node_id"]),
+                str(domain_entity.get("canonical_id") or domain_entity["node_id"]),
+                rel_type,
+                rel_type,
+            ),
+            "run_scoped_id": _stable_graph_edge_id(
+                str(entity["node_id"]),
+                str(domain_entity["node_id"]),
+                rel_type,
+                rel_type,
+            ),
+            "run_id": run_id,
+            "external_context": False,
             "src_id": entity["node_id"],
             "dst_id": domain_entity["node_id"],
+            "src_canonical_id": entity.get("canonical_id"),
+            "dst_canonical_id": domain_entity.get("canonical_id"),
             "rel_type": rel_type,
+            "raw_relation_type": rel_type,
             "canonical_name": rel_type,
             "alt_names": [],
             "source_tool": tool_name,
@@ -1027,7 +1073,7 @@ def _coerce_json_argument_fields(
             try:
                 json.loads(value)
                 continue
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 pass
         if key in seed_args:
             output[key] = seed_args[key]
@@ -1042,7 +1088,7 @@ def _parse_json_object_argument(value: Any) -> Dict[str, Any]:
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, TypeError):
             return {}
         if isinstance(parsed, dict):
             return parsed
@@ -1258,9 +1304,16 @@ def _majority_value(values: List[str], fallback: str) -> str:
 
 def _stable_graph_node_id(run_id: str, entity_type: str, canonical_name: str) -> str:
     digest = hashlib.sha256(
-        f"{_normalize_graph_name(entity_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
+        f"{run_id}|{_normalize_graph_name(entity_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
     ).hexdigest()[:20]
     return f"ent_{digest}"
+
+
+def _canonical_graph_node_id(entity_type: str, canonical_name: str) -> str:
+    digest = hashlib.sha256(
+        f"{_normalize_graph_name(entity_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"entc_{digest}"
 
 
 def _stable_graph_edge_id(src_id: str, dst_id: str, rel_type: str, canonical_name: str) -> str:
@@ -1270,12 +1323,19 @@ def _stable_graph_edge_id(src_id: str, dst_id: str, rel_type: str, canonical_nam
     return f"rel_{digest}"
 
 
+def _canonical_graph_edge_id(src_canonical_id: str, dst_canonical_id: str, rel_type: str, canonical_name: str) -> str:
+    digest = hashlib.sha256(
+        f"{src_canonical_id}|{dst_canonical_id}|{_normalize_graph_name(rel_type)}|{_normalize_graph_name(canonical_name)}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"relc_{digest}"
+
+
 def _infer_osint_bucket(entity_type: str, canonical_name: str, attributes: List[str]) -> str:
     type_text = _normalize_graph_name(entity_type)
     joined = " ".join([type_text, _normalize_graph_name(canonical_name), *[_normalize_graph_name(item) for item in attributes]])
     if any(token in joined for token in ("person", "author", "researcher", "founder", "director", "employee")):
         return "person"
-    if any(token in joined for token in ("experience", "credential", "affiliation", "occupation", "timeline event", "timelineevent", "contact point", "contactpoint")):
+    if any(token in joined for token in ("experience", "credential", "affiliation", "occupation", "timeline event", "timelineevent", "time node", "timenode", "contact point", "contactpoint")):
         return "person"
     if any(token in joined for token in ("organization profile", "org profile", "subject_org")):
         return "organization"
@@ -1317,6 +1377,8 @@ def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attribut
         "affiliation": "Affiliation",
         "timelineevent": "TimelineEvent",
         "timeline_event": "TimelineEvent",
+        "timenode": "TimeNode",
+        "time_node": "TimeNode",
         "occupation": "Occupation",
         "imageobject": "ImageObject",
         "image_object": "ImageObject",
@@ -1347,6 +1409,8 @@ def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attribut
         return "ContactPoint"
     if any(token in normalized for token in ("educational credential", "credential", "degree", "bachelor of", "master of", "doctor of philosophy", "phd")):
         return "EducationalCredential"
+    if any(token in normalized for token in ("time node", "time_key")):
+        return "TimeNode"
     if any(token in normalized for token in ("timeline event", "milestone", "start_date", "end_date", "tenure_start", "tenure_end", "event_type")):
         return "TimelineEvent"
     if any(token in normalized for token in ("experience", "employment", "work history", "tenure")):
@@ -1434,6 +1498,9 @@ def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) 
         "HAS_EXPERIENCE": "HAS_EXPERIENCE",
         "HAS_AFFILIATION": "HAS_AFFILIATION",
         "HAS_TIMELINE_EVENT": "HAS_TIMELINE_EVENT",
+        "MENTIONS_TIMELINE_EVENT": "MENTIONS_TIMELINE_EVENT",
+        "IN_TIME_NODE": "IN_TIME_NODE",
+        "NEXT_TIME_NODE": "NEXT_TIME_NODE",
         "HAS_OCCUPATION": "HAS_OCCUPATION",
         "HAS_IMAGE": "HAS_IMAGE",
         "HAS_ROLE": "HAS_ROLE",
@@ -1450,6 +1517,9 @@ def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) 
         "RESEARCHES": "RESEARCHES",
         "FOCUSES_ON": "FOCUSES_ON",
         "HAS_TOPIC": "HAS_TOPIC",
+        "HAS_SKILL_TOPIC": "HAS_SKILL_TOPIC",
+        "HAS_HOBBY_TOPIC": "HAS_HOBBY_TOPIC",
+        "HAS_INTEREST_TOPIC": "HAS_INTEREST_TOPIC",
         "HAS_ORGANIZATION_PROFILE": "HAS_ORGANIZATION_PROFILE",
         "RECEIVED_AWARD": "RECEIVED_AWARD",
         "HAS_GRANT": "HAS_GRANT",
@@ -1490,6 +1560,8 @@ def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) 
         return "HAS_AFFILIATION"
     if dst_type == "TimelineEvent":
         return "HAS_TIMELINE_EVENT"
+    if dst_type == "TimeNode":
+        return "IN_TIME_NODE"
     if dst_type == "Occupation":
         return "HAS_OCCUPATION"
     if dst_type == "ImageObject":
@@ -1512,6 +1584,8 @@ def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) 
         return "AFFILIATED_WITH"
     if src_type == "TimelineEvent":
         return "ABOUT"
+    if src_type == "TimeNode" and dst_type == "TimeNode":
+        return "NEXT_TIME_NODE"
     if src_type == "Person" and dst_type == "Award":
         return "RECEIVED_AWARD"
     if dst_type == "Grant":
@@ -1561,6 +1635,7 @@ def _graph_auto_aliases(entity_type: str, values: List[str]) -> List[str]:
         "experience",
         "affiliation",
         "timelineevent",
+        "timenode",
         "occupation",
         "imageobject",
         "organizationprofile",
@@ -1610,7 +1685,7 @@ def _graph_entity_family(entity_type: str) -> str:
         return "credential"
     if normalized == "organizationprofile":
         return "orgprofile"
-    if normalized in {"experience", "affiliation", "timelineevent", "occupation"}:
+    if normalized in {"experience", "affiliation", "timelineevent", "timenode", "occupation"}:
         return normalized
     if normalized == "imageobject":
         return "image"
@@ -1686,10 +1761,10 @@ def _graph_entity_merge_keys(entity_type: str, canonical_name: str, alt_names: L
         text = str(value or "").strip().lower()
         if text:
             keys.append(f"id:{family}:{text}")
-    if family in {"contact", "credential", "experience", "affiliation", "timelineevent", "occupation", "orgprofile"}:
+    if family in {"contact", "credential", "experience", "affiliation", "timelineevent", "timenode", "occupation", "orgprofile"}:
         subject_values = _graph_attribute_values(attributes, "subject")
         org_values = _graph_attribute_values(attributes, "organization", "institution", "employer", "company", "subject_org")
-        role_values = _graph_attribute_values(attributes, "role", "occupation", "degree", "field", "relation", "contact_type", "event_type", "industry", "focus")
+        role_values = _graph_attribute_values(attributes, "role", "occupation", "degree", "field", "relation", "contact_type", "event_type", "industry", "focus", "time_key")
         date_values = _graph_attribute_values(attributes, "date", "year", "start_date", "end_date", "tenure_start", "tenure_end")
         direct_values = _graph_attribute_values(attributes, "value", "email", "phone", "handle", "username")
         for value in direct_values:
@@ -1839,6 +1914,802 @@ def _graph_date_span_label(start_date: str, end_date: str, year: str = "") -> st
     return year
 
 
+def _graph_normalize_time_token(value: str) -> tuple[str, str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return "", "", ""
+    lower = text.casefold()
+    if lower in {"present", "current", "now"}:
+        return "present", "open", "9999-12-31"
+    year_match = re.fullmatch(r"(19|20)\d{2}", text)
+    if year_match:
+        normalized = year_match.group(0)
+        return normalized, "year", f"{normalized}-01-01"
+    year_month_match = re.fullmatch(r"((?:19|20)\d{2})[-/](0?[1-9]|1[0-2])", text)
+    if year_month_match:
+        normalized = f"{year_month_match.group(1)}-{int(year_month_match.group(2)):02d}"
+        return normalized, "month", f"{normalized}-01"
+    ymd_match = re.fullmatch(r"((?:19|20)\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])", text)
+    if ymd_match:
+        normalized = f"{ymd_match.group(1)}-{int(ymd_match.group(2)):02d}-{int(ymd_match.group(3)):02d}"
+        return normalized, "day", normalized
+    iso_embedded = re.search(r"((?:19|20)\d{2})-(0[1-9]|1[0-2])-([0-3]\d)", text)
+    if iso_embedded:
+        normalized = f"{iso_embedded.group(1)}-{iso_embedded.group(2)}-{iso_embedded.group(3)}"
+        return normalized, "day", normalized
+    month_map = {
+        "jan": 1,
+        "january": 1,
+        "feb": 2,
+        "february": 2,
+        "mar": 3,
+        "march": 3,
+        "apr": 4,
+        "april": 4,
+        "may": 5,
+        "jun": 6,
+        "june": 6,
+        "jul": 7,
+        "july": 7,
+        "aug": 8,
+        "august": 8,
+        "sep": 9,
+        "sept": 9,
+        "september": 9,
+        "oct": 10,
+        "october": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
+    month_year_match = re.fullmatch(r"([A-Za-z]{3,9})\s+((?:19|20)\d{2})", text)
+    if month_year_match:
+        month = month_map.get(month_year_match.group(1).casefold())
+        year = month_year_match.group(2)
+        if month:
+            normalized = f"{year}-{month:02d}"
+            return normalized, "month", f"{normalized}-01"
+    year_in_text = re.search(r"(19|20)\d{2}", text)
+    if year_in_text:
+        normalized = year_in_text.group(0)
+        return normalized, "year", f"{normalized}-01-01"
+    return "", "", ""
+
+
+def _graph_time_node_parts(date: str = "", start_date: str = "", end_date: str = "") -> tuple[str, List[str], str]:
+    normalized_date, date_granularity, date_sort = _graph_normalize_time_token(date)
+    normalized_start, start_granularity, start_sort = _graph_normalize_time_token(start_date)
+    normalized_end, end_granularity, end_sort = _graph_normalize_time_token(end_date)
+
+    if normalized_start and normalized_end:
+        key = f"{normalized_start}__{normalized_end}"
+        label = f"{normalized_start} to {normalized_end}"
+        granularity = start_granularity or end_granularity or "range"
+        sort_key = start_sort or end_sort
+    elif normalized_start:
+        key = f"{normalized_start}__present"
+        label = f"{normalized_start} to present"
+        granularity = start_granularity or "range"
+        sort_key = start_sort
+    elif normalized_date:
+        key = normalized_date
+        label = normalized_date
+        granularity = date_granularity or "point"
+        sort_key = date_sort
+    elif normalized_end:
+        key = f"until__{normalized_end}"
+        label = f"until {normalized_end}"
+        granularity = end_granularity or "range"
+        sort_key = end_sort
+    else:
+        return "", [], ""
+
+    attrs = [f"time_key: {key}", f"granularity: {granularity}"]
+    if normalized_date:
+        attrs.append(f"date: {normalized_date}")
+    if normalized_start:
+        attrs.append(f"start_date: {normalized_start}")
+    if normalized_end:
+        attrs.append(f"end_date: {normalized_end}")
+    return f"Time node {label}", attrs, sort_key
+
+
+GRAPH_SEARCH_NORMALIZER_TOOL_NAMES = {
+    "person_search",
+    "google_serp_person_search",
+    "tavily_person_search",
+    "tavily_research",
+}
+GRAPH_SEARCH_NOISY_PERSON_TOKENS = {
+    "advisor",
+    "advisors",
+    "anthology",
+    "citation",
+    "citations",
+    "conflicts",
+    "dblp",
+    "email",
+    "emails",
+    "generator",
+    "github",
+    "google",
+    "linkedin",
+    "name",
+    "names",
+    "openreview",
+    "profile",
+    "relations",
+    "scholar",
+    "semantic",
+    "semanticscholar",
+    "suggest",
+    "url",
+    "wikipedia",
+}
+GRAPH_SEARCH_NOISY_PERSON_PHRASES = (
+    "suggest name emails",
+    "suggest position advisors",
+    "google scholar",
+    "semantic scholar",
+)
+GRAPH_SEARCH_ROLE_PATTERN = re.compile(
+    r"\b("
+    r"assistant professor|associate professor|postdoctoral researcher|research scientist|"
+    r"research assistant|research intern|doctoral candidate|graduate student|"
+    r"undergraduate student|software engineer|staff engineer|phd student|"
+    r"researcher|scientist|engineer|professor|student|founder|director"
+    r")\b",
+    re.IGNORECASE,
+)
+GRAPH_SEARCH_YEAR_RANGE_PATTERN = re.compile(
+    r"\b((?:19|20)\d{2})\s*[–-]\s*((?:19|20)\d{2}|present|current|now)\b",
+    re.IGNORECASE,
+)
+
+
+def _graph_dedupe_mixed_items(values: List[Any]) -> List[Any]:
+    output: List[Any] = []
+    seen: set[str] = set()
+    for value in values:
+        if isinstance(value, str):
+            cleaned = str(value).strip()
+            if not cleaned:
+                continue
+            fingerprint = f"s:{cleaned.casefold()}"
+            normalized_value: Any = cleaned
+        elif isinstance(value, dict):
+            cleaned_dict = {
+                str(key): nested
+                for key, nested in value.items()
+                if nested not in (None, "", [], {})
+            }
+            if not cleaned_dict:
+                continue
+            fingerprint = f"d:{json.dumps(cleaned_dict, sort_keys=True, ensure_ascii=True, default=str)}"
+            normalized_value = cleaned_dict
+        else:
+            continue
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        output.append(normalized_value)
+    return output
+
+
+def _graph_merge_result_list(result: Dict[str, Any], key: str, additions: List[Any]) -> None:
+    existing = result.get(key)
+    merged = _graph_dedupe_mixed_items(
+        [*(existing if isinstance(existing, list) else []), *additions]
+    )
+    if merged:
+        result[key] = merged
+
+
+def _graph_org_aliases(org_name: str) -> List[str]:
+    text = str(org_name or "").strip()
+    normalized = _normalize_graph_name(text)
+    aliases: List[str] = []
+    if normalized in {"ucsd", "uc san diego", "university of california san diego"}:
+        aliases.extend(["UC San Diego", "UCSD", "University of California, San Diego"])
+    if normalized in {
+        "uiuc",
+        "university of illinois urbana champaign",
+        "university of illinois at urbana champaign",
+    }:
+        aliases.extend(["UIUC", "University of Illinois Urbana-Champaign", "University of Illinois at Urbana-Champaign"])
+    return [alias for alias in _graph_unique_strings(aliases) if _normalize_graph_name(alias) != normalized]
+
+
+def _graph_canonical_org_name(org_name: str) -> str:
+    text = str(org_name or "").strip()
+    normalized = _normalize_graph_name(text)
+    if normalized in {"ucsd", "uc san diego", "university of california san diego"}:
+        return "University of California, San Diego"
+    if normalized in {
+        "uiuc",
+        "university of illinois urbana champaign",
+        "university of illinois at urbana champaign",
+    }:
+        return "University of Illinois at Urbana-Champaign"
+    return text
+
+
+def _graph_person_name_from_profile_url(url: str) -> str:
+    cleaned = _clean_url_candidate(url)
+    if not cleaned.startswith(("http://", "https://")):
+        return ""
+    parsed = urlparse(cleaned)
+    parts = [part for part in parsed.path.strip("/").split("/") if part]
+    if not parts:
+        return ""
+    slug = parts[-1]
+    tokens = [token for token in re.split(r"[-_]+", slug) if token]
+    name_tokens = [token for token in tokens if re.fullmatch(r"[A-Za-z][A-Za-z']*", token)]
+    if len(name_tokens) < 2:
+        return ""
+    candidate = " ".join(token.title() for token in name_tokens[:4])
+    return candidate if _graph_is_valid_search_person_candidate(candidate) else ""
+
+
+def _graph_is_noisy_search_person_candidate(value: str) -> bool:
+    candidate = " ".join(str(value or "").strip().split()).strip(" -,:;|")
+    if not candidate:
+        return True
+    normalized = _normalize_graph_name(candidate)
+    if any(phrase in normalized for phrase in GRAPH_SEARCH_NOISY_PERSON_PHRASES):
+        return True
+    tokens = [token for token in normalized.split() if token]
+    if any(token in GRAPH_SEARCH_NOISY_PERSON_TOKENS for token in tokens):
+        return True
+    return bool(re.search(r"[@/:]|\b(?:search|result|results)\b", candidate, re.IGNORECASE))
+
+
+def _graph_is_valid_search_person_candidate(value: str) -> bool:
+    candidate = str(value or "").strip()
+    if not candidate or _graph_is_noisy_search_person_candidate(candidate):
+        return False
+    return _graph_looks_like_person_name(candidate)
+
+
+def _graph_collect_row_records(tool_name: str, result: Dict[str, Any]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    raw_rows: List[Any] = []
+    if tool_name == "person_search":
+        if isinstance(result.get("results"), list):
+            raw_rows.extend(result.get("results", [])[:20])
+    elif tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES:
+        if isinstance(result.get("extracted_results"), list):
+            raw_rows.extend(result.get("extracted_results", [])[:20])
+        if tool_name == "tavily_research" and isinstance(result.get("sources"), list):
+            raw_rows.extend(result.get("sources", [])[:20])
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        url = _clean_url_candidate(str(row.get("url") or "").strip())
+        title = str(row.get("title") or "").strip()
+        text = " ".join(
+            part
+            for part in (
+                str(row.get("text") or "").strip(),
+                str(row.get("extracted_text") or "").strip(),
+                str(row.get("snippet") or "").strip(),
+                str(row.get("content") or "").strip(),
+                str(row.get("main_text") or "").strip(),
+                str(row.get("description") or "").strip(),
+            )
+            if part
+        ).strip()
+        if not any([url, title, text]):
+            continue
+        rows.append({"url": url, "title": title, "text": text})
+    return rows
+
+
+def _graph_title_person_candidates(title: str) -> List[str]:
+    cleaned = str(title or "").replace("\u202a", "").replace("\u202c", "").replace("\u200e", "").strip()
+    segments = [cleaned]
+    segments.extend(re.split(r"\s+[|·–]\s+|\s+-\s+", cleaned))
+    candidates: List[str] = []
+    for segment in segments[:4]:
+        value = segment.strip(" []()")
+        if not value:
+            continue
+        if _graph_is_valid_search_person_candidate(value):
+            candidates.append(value)
+            continue
+        candidates.extend(
+            candidate
+            for candidate in _extract_related_people(value)
+            if _graph_is_valid_search_person_candidate(candidate)
+        )
+    return _graph_unique_strings(candidates)
+
+
+def _graph_resolve_primary_person_from_rows(rows: List[Dict[str, str]], fallback_names: List[str]) -> str:
+    scores: Dict[str, float] = {}
+    for fallback in fallback_names:
+        candidate = str(fallback or "").strip()
+        if _graph_is_valid_search_person_candidate(candidate):
+            scores[candidate] = scores.get(candidate, 0.0) + 1.0
+    for row in rows[:12]:
+        title = str(row.get("title") or "")
+        for candidate in _graph_title_person_candidates(title):
+            scores[candidate] = scores.get(candidate, 0.0) + 4.0
+        text = str(row.get("text") or "")
+        for candidate in _extract_related_people(text)[:10]:
+            if _graph_is_valid_search_person_candidate(candidate):
+                scores[candidate] = scores.get(candidate, 0.0) + 1.0
+    if not scores:
+        return ""
+    ranked = sorted(
+        scores.items(),
+        key=lambda item: (item[1], _graph_score_name_candidate("Person", item[0]), -len(item[0]), item[0]),
+        reverse=True,
+    )
+    return ranked[0][0]
+
+
+def _graph_is_profileish_result_url(url: str, title: str) -> bool:
+    cleaned = _clean_url_candidate(url)
+    if not cleaned.startswith(("http://", "https://")) or _is_graph_noise_url(cleaned):
+        return False
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parsed.path.lower()
+    if host in {
+        "openreview.net",
+        "scholar.google.com",
+        "dblp.org",
+        "researchgate.net",
+        "semanticscholar.org",
+        "www.semanticscholar.org",
+        "aclanthology.org",
+        "underline.io",
+        "catalyzex.com",
+        "linkedin.com",
+        "www.linkedin.com",
+        "github.com",
+    }:
+        return True
+    if any(token in path for token in ("/profile", "/author", "/citations", "/people/", "/speakers/", "/pid/", "/in/")):
+        return True
+    return any(_graph_is_valid_search_person_candidate(candidate) for candidate in _graph_title_person_candidates(title))
+
+
+def _graph_extract_org_mentions_with_positions(text: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    patterns = (
+        r"University of California,?\s+San Diego",
+        r"University of Illinois(?: at)? Urbana-Champaign",
+        r"UC San Diego",
+        r"UCSD",
+        r"UIUC",
+        r"Stealth Startup",
+        r"[A-Z][A-Za-z0-9&.'-]*(?:\s+[A-Z][A-Za-z0-9&.'-]*){0,7}\s+(?:University|College|Institute|School|Laboratory|Lab|Startup|Corporation|Corp|Inc|LLC)",
+    )
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            raw_name = str(match.group(0) or "").strip(" ,.;|")
+            if not raw_name:
+                continue
+            canonical_name = _graph_canonical_org_name(raw_name)
+            normalized_name = _normalize_graph_name(canonical_name)
+            if normalized_name not in {
+                "university of california san diego",
+                "university of illinois at urbana champaign",
+                "stealth startup",
+            } and any(
+                token in normalized_name
+                for token in ("linkedin", "openreview", "google scholar", "scholar", "relations", "conflicts", "career", "education")
+            ):
+                continue
+            fingerprint = f"{canonical_name.casefold()}:{match.start()}"
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            candidates.append(
+                {
+                    "name": canonical_name,
+                    "alt_names": _graph_org_aliases(canonical_name) + ([raw_name] if _normalize_graph_name(raw_name) != _normalize_graph_name(canonical_name) else []),
+                    "start": match.start(),
+                    "end": match.end(),
+                }
+            )
+    return sorted(candidates, key=lambda item: (int(item["start"]), int(item["end"])))
+
+
+def _graph_clean_field_segment(value: str) -> str:
+    text = str(value or "").strip(" ,.;:|·")
+    text = re.sub(r"^(?:at|@)\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*\([^)]*\)\s*$", "", text).strip(" ,.;:|·")
+    if not text:
+        return ""
+    if _graph_is_url_candidate(text) or _graph_looks_like_domain(text):
+        return ""
+    if len(text) > 80:
+        return ""
+    return text
+
+
+def _graph_extract_role_records_from_text(text: str, *, source_url: str = "") -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    org_mentions = _graph_extract_org_mentions_with_positions(text)
+    if not org_mentions:
+        return records
+    for match in GRAPH_SEARCH_ROLE_PATTERN.finditer(text):
+        role_title = " ".join(str(match.group(1) or "").split()).strip()
+        if not role_title:
+            continue
+        role_end = match.end()
+        org_match = next(
+            (
+                item
+                for item in org_mentions
+                if int(item["start"]) >= role_end and int(item["start"]) - role_end <= 120
+            ),
+            None,
+        )
+        if org_match is None:
+            continue
+        field = _graph_clean_field_segment(text[role_end:int(org_match["start"])])
+        search_window = text[match.start(): min(len(text), int(org_match["end"]) + 64)]
+        date_match = GRAPH_SEARCH_YEAR_RANGE_PATTERN.search(search_window)
+        start_date = str(date_match.group(1) or "").strip() if date_match else ""
+        end_date = str(date_match.group(2) or "").strip() if date_match else ""
+        record = {
+            "title": role_title,
+            "organization": str(org_match["name"]),
+            "source_url": source_url,
+        }
+        if field:
+            record["field"] = field
+        if start_date:
+            record["start_date"] = start_date
+        if end_date:
+            record["end_date"] = end_date
+        records.append(record)
+    return _graph_dedupe_mixed_items(records)
+
+
+def _graph_extract_affiliation_records_from_text(text: str, *, source_url: str = "", relation: str = "profile affiliation") -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for org_match in _graph_extract_org_mentions_with_positions(text):
+        records.append(
+            {
+                "name": str(org_match["name"]),
+                "relation": relation,
+                "url": source_url,
+            }
+        )
+    return _graph_dedupe_mixed_items(records)
+
+
+def _graph_extract_advisors_from_text(text: str, exclude_names: List[str]) -> List[str]:
+    advisor_names: List[str] = []
+    for match in re.finditer(r"\b(?:phd\s+advisor|advisor|advisors)\b[:\s,]+(.{0,120})", text, re.IGNORECASE):
+        snippet = str(match.group(1) or "").strip()
+        leading_tokens = re.findall(r"[A-Z][A-Za-z'-]*", snippet)
+        for size in range(2, min(4, len(leading_tokens)) + 1):
+            candidate = " ".join(leading_tokens[:size]).strip()
+            if _graph_is_valid_search_person_candidate(candidate):
+                advisor_names.append(candidate)
+                break
+        advisor_names.extend(
+            candidate
+            for candidate in _extract_related_people(snippet, exclude_names=exclude_names)[:4]
+            if _graph_is_valid_search_person_candidate(candidate)
+        )
+    return _graph_unique_strings(advisor_names)
+
+
+def _graph_extract_topics_from_row(row: Dict[str, str], primary_person: str = "") -> List[str]:
+    title = str(row.get("title") or "")
+    text = str(row.get("text") or "")
+    url = str(row.get("url") or "")
+    parsed = urlparse(_clean_url_candidate(url))
+    host = (parsed.hostname or "").lower()
+    segments = [
+        segment.strip(" \u202a\u202c")
+        for segment in re.split(r"\s+[|·]\s+|\s+-\s+", title)
+        if segment.strip(" \u202a\u202c")
+    ]
+    topics: List[str] = []
+    if host == "scholar.google.com":
+        for segment in segments:
+            normalized = _normalize_graph_name(segment)
+            if not normalized or normalized.startswith("verified email at"):
+                continue
+            if _normalize_graph_name(segment) == _normalize_graph_name(primary_person):
+                continue
+            if _graph_extract_org_mentions_with_positions(segment):
+                continue
+            if _graph_looks_like_domain(segment) or _graph_is_url_candidate(segment):
+                continue
+            if any(token in normalized for token in ("articles", "cited by", "public access", "privacy", "terms", "help", "google scholar", "openreview", "dblp", "linkedin", "semantic scholar")):
+                continue
+            if 2 <= len(segment.split()) <= 5:
+                topics.append(segment)
+    verified_email_match = re.search(r"verified email at\s+([A-Za-z0-9.-]+\.[A-Za-z]{2,})", text, re.IGNORECASE)
+    if verified_email_match:
+        topics.extend(
+            segment
+            for segment in segments
+            if "verified email at" not in segment.casefold()
+            and _normalize_graph_name(segment) != _normalize_graph_name(primary_person)
+            and not _graph_extract_org_mentions_with_positions(segment)
+            and not any(token in _normalize_graph_name(segment) for token in ("google scholar", "openreview", "dblp", "linkedin", "semantic scholar"))
+            and 2 <= len(segment.split()) <= 5
+        )
+    return _graph_unique_strings(topics)
+
+
+def _normalize_search_like_result_for_graph(tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(result)
+    rows = _graph_collect_row_records(tool_name, result)
+    affiliation_hosts = {
+        "openreview.net",
+        "scholar.google.com",
+        "researchgate.net",
+        "underline.io",
+        "linkedin.com",
+        "www.linkedin.com",
+        "dl.acm.org",
+        "dblp.org",
+        "aclanthology.org",
+        "catalyzex.com",
+        "academia.edu",
+        "independent.academia.edu",
+    }
+    fallback_names = _graph_unique_strings(
+        [
+            str(result.get("canonical_name") or "").strip(),
+            str(result.get("display_name") or "").strip(),
+            str(result.get("target_name") or "").strip(),
+            str(result.get("name") or "").strip(),
+            str(result.get("input") or "").strip(),
+            str(arguments.get("person_name") or "").strip(),
+            str(arguments.get("target_name") or "").strip(),
+            str(arguments.get("name") or "").strip(),
+        ]
+    )
+    resolved_primary_person = _graph_resolve_primary_person_from_rows(rows, fallback_names)
+    if resolved_primary_person:
+        normalized["resolved_primary_person"] = resolved_primary_person
+        if not str(normalized.get("canonical_name") or "").strip() or _graph_is_noisy_search_person_candidate(str(normalized.get("canonical_name") or "")):
+            normalized["canonical_name"] = resolved_primary_person
+
+    external_links: List[Dict[str, Any]] = []
+    contact_signals: List[Dict[str, Any]] = []
+    organizations: List[Dict[str, Any]] = []
+    roles: List[Dict[str, Any]] = []
+    education: List[Dict[str, Any]] = []
+    advisors: List[Dict[str, Any]] = []
+    topics: List[str] = []
+    related_org_names_from_roles: set[str] = set()
+
+    for row in rows[:20]:
+        url = str(row.get("url") or "")
+        title = str(row.get("title") or "")
+        body_text = str(row.get("text") or "").strip()
+        text = " ".join(part for part in (title, body_text) if part).strip()
+        parsed_url = urlparse(_clean_url_candidate(url))
+        host = (parsed_url.hostname or "").lower()
+        if _graph_is_profileish_result_url(url, title):
+            external_links.append(
+                {
+                    "type": _graph_platform_label(None, url) or "profile",
+                    "url": url,
+                    "title": title,
+                }
+            )
+        for email in _extract_strings_from_text(text, kind="email"):
+            contact_signals.append({"type": "email", "value": email})
+        for phone in _extract_phone_numbers_from_text(text):
+            contact_signals.append({"type": "phone", "value": phone})
+        if host == "scholar.google.com":
+            for segment in re.split(r"\s+[|·]\s+|\s+-\s+", title):
+                normalized_segment = _normalize_graph_name(segment)
+                if normalized_segment in {"uc san diego", "ucsd", "university of california san diego"}:
+                    organizations.append(
+                        {
+                            "name": "University of California, San Diego",
+                            "relation": "scholar affiliation",
+                            "url": url,
+                        }
+                    )
+                elif normalized_segment in {
+                    "uiuc",
+                    "university of illinois urbana champaign",
+                    "university of illinois at urbana champaign",
+                }:
+                    organizations.append(
+                        {
+                            "name": "University of Illinois at Urbana-Champaign",
+                            "relation": "scholar affiliation",
+                            "url": url,
+                        }
+                    )
+        if host.endswith("linkedin.com") and re.search(r"\bStealth Startup\b", body_text, re.IGNORECASE):
+            organizations.append({"name": "Stealth Startup", "relation": "member", "url": url})
+
+        row_roles = _graph_extract_role_records_from_text(body_text or text, source_url=url)
+        roles.extend(row_roles)
+        for row_role in row_roles:
+            org_name = str(row_role.get("organization") or "").strip()
+            if org_name:
+                related_org_names_from_roles.add(_normalize_graph_name(org_name))
+            if _graph_is_education_relation(
+                _graph_role_relation_type(str(row_role.get("title") or "")),
+                str(row_role.get("title") or ""),
+            ):
+                education_record = {
+                    "degree": row_role.get("title"),
+                    "institution": row_role.get("organization"),
+                    "source_url": row_role.get("source_url"),
+                }
+                if row_role.get("field"):
+                    education_record["field"] = row_role.get("field")
+                if row_role.get("start_date"):
+                    education_record["start_date"] = row_role.get("start_date")
+                if row_role.get("end_date"):
+                    education_record["end_date"] = row_role.get("end_date")
+                education.append(education_record)
+
+        row_orgs = (
+            []
+            if host.endswith("linkedin.com") or host not in affiliation_hosts
+            else _graph_extract_affiliation_records_from_text(
+                body_text or text,
+                source_url=url,
+                relation="profile affiliation",
+            )
+        )
+        for row_org in row_orgs:
+            org_name = str(row_org.get("name") or "").strip()
+            if _normalize_graph_name(org_name) in related_org_names_from_roles:
+                continue
+            organizations.append(row_org)
+
+        for advisor_name in _graph_extract_advisors_from_text(body_text or text, exclude_names=[resolved_primary_person]):
+            advisors.append({"name": advisor_name})
+        topics.extend(_graph_extract_topics_from_row(row, primary_person=resolved_primary_person))
+
+    _graph_merge_result_list(normalized, "external_links", external_links)
+    _graph_merge_result_list(normalized, "contact_signals", contact_signals)
+    _graph_merge_result_list(normalized, "organizations", organizations)
+    _graph_merge_result_list(normalized, "roles", roles)
+    _graph_merge_result_list(normalized, "education", education)
+    _graph_merge_result_list(normalized, "advisors", advisors)
+    _graph_merge_result_list(normalized, "topics", topics)
+    return normalized
+
+
+def _normalize_linkedin_result_for_graph(arguments: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(result)
+    profile_url = _clean_url_candidate(str(result.get("profile") or arguments.get("profile") or "").strip())
+    if profile_url:
+        normalized["profile_url"] = profile_url
+        if not str(normalized.get("canonical_name") or "").strip():
+            slug_name = _graph_person_name_from_profile_url(profile_url)
+            if slug_name:
+                normalized["canonical_name"] = slug_name
+
+    contact_signals: List[Dict[str, Any]] = []
+    external_links: List[Dict[str, Any]] = []
+    contact_info = result.get("contact_info") if isinstance(result.get("contact_info"), dict) else {}
+    if contact_info:
+        for email in _extract_string_list(contact_info.get("emails"))[:10]:
+            contact_signals.append({"type": "email", "value": email})
+        for phone in _extract_string_list(contact_info.get("phones"))[:10]:
+            contact_signals.append({"type": "phone", "value": phone})
+        for website in _extract_string_list(contact_info.get("websites"))[:10]:
+            contact_signals.append({"type": "website", "value": website, "platform": "Personal Site"})
+        for profile in _extract_string_list(contact_info.get("profiles"))[:10]:
+            external_links.append({"type": _graph_platform_label(None, profile) or "profile", "url": profile})
+        overlay_url = _clean_url_candidate(str(contact_info.get("overlay_url") or "").strip())
+        if overlay_url:
+            external_links.append({"type": "LinkedIn", "url": overlay_url})
+
+    rows: List[Dict[str, str]] = []
+    for page in result.get("extracted_pages", []) if isinstance(result.get("extracted_pages"), list) else []:
+        if not isinstance(page, dict):
+            continue
+        rows.append(
+            {
+                "url": profile_url,
+                "title": str(page.get("file") or "").strip(),
+                "text": str(page.get("extracted_text") or "").strip(),
+            }
+        )
+    if rows:
+        derived = _normalize_search_like_result_for_graph("person_search", arguments, {"results": rows, **normalized})
+        for key in ("resolved_primary_person", "canonical_name", "organizations", "roles", "education", "advisors", "topics"):
+            if key in derived and derived.get(key):
+                normalized[key] = derived[key]
+        if not str(normalized.get("headline") or "").strip():
+            combined_text = " ".join(str(row.get("text") or "") for row in rows)
+            headline_match = re.search(r"\bbuilds?\s+[A-Za-z0-9 ,'-]{10,120}", combined_text, re.IGNORECASE)
+            if headline_match:
+                normalized["headline"] = " ".join(headline_match.group(0).split()).strip(" ,.;")
+            if re.search(r"\bStealth Startup\b", combined_text):
+                _graph_merge_result_list(
+                    normalized,
+                    "organizations",
+                    [{"name": "Stealth Startup", "relation": "member", "url": profile_url}],
+                )
+            location_match = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3},\s*[A-Z]{2})\b", combined_text)
+            if location_match:
+                contact_signals.append({"type": "location", "value": location_match.group(1)})
+
+    _graph_merge_result_list(normalized, "contact_signals", contact_signals)
+    _graph_merge_result_list(normalized, "external_links", external_links)
+    return normalized
+
+
+def _normalize_tool_result_for_graph(tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return {}
+    if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES:
+        return _normalize_search_like_result_for_graph(tool_name, arguments, result)
+    if tool_name == "linkedin_download_html_ocr":
+        return _normalize_linkedin_result_for_graph(arguments, result)
+    return result
+
+
+def _graph_primary_people_from_context(tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
+    ordered_candidates = (
+        [
+            str(result.get("resolved_primary_person") or "").strip(),
+            str(result.get("display_name") or "").strip(),
+            str(result.get("canonical_name") or "").strip(),
+            str(arguments.get("person_name") or "").strip(),
+            str(arguments.get("target_name") or "").strip(),
+            str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "",
+            str(arguments.get("author") or "").strip(),
+            str(result.get("target_name") or "").strip(),
+            str(result.get("name") or "").strip(),
+            str(result.get("input") or "").strip() if tool_name == "tavily_research" else "",
+        ]
+        if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr"
+        else [
+            str(arguments.get("person_name") or "").strip(),
+            str(arguments.get("target_name") or "").strip(),
+            str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "",
+            str(arguments.get("author") or "").strip(),
+            str(result.get("display_name") or "").strip(),
+            str(result.get("canonical_name") or "").strip(),
+        ]
+    )
+    candidates = []
+    for candidate in ordered_candidates:
+        if not candidate:
+            continue
+        if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr":
+            if not _graph_is_valid_search_person_candidate(candidate):
+                continue
+        candidates.append(candidate)
+    primary_people = _graph_unique_strings(candidates)
+    if primary_people:
+        return primary_people
+    query = result.get("query")
+    if isinstance(query, dict):
+        query_candidates = [
+            str(query.get("person_name") or "").strip(),
+            str(query.get("name") or "").strip(),
+            str(query.get("author") or "").strip(),
+        ]
+        if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr":
+            return _graph_unique_strings(
+                [candidate for candidate in query_candidates if _graph_is_valid_search_person_candidate(candidate)]
+            )
+        return _graph_unique_strings(query_candidates)
+    return []
+
+
 def _graph_is_education_relation(rel_type: str, role_text: str) -> bool:
     normalized = _normalize_graph_name(role_text)
     if rel_type == "STUDIED_AT":
@@ -1854,6 +2725,7 @@ def _supplemental_graph_components_from_result(
     entities_by_key: Dict[str, Dict[str, Any]] = {}
     relations_by_key: Dict[str, Dict[str, Any]] = {}
     consumed_urls: set[str] = set()
+    time_node_sort_keys: Dict[str, str] = {}
 
     def add_entity(canonical_name: str, entity_type: str, *, alt_names: List[str] | None = None, attributes: List[str] | None = None) -> str | None:
         names = _graph_unique_strings([canonical_name, *(alt_names or [])])
@@ -1897,6 +2769,25 @@ def _supplemental_graph_components_from_result(
             "rel_type": rel_type,
             "alt_names": _graph_unique_strings(alt_names or []),
         }
+
+    def add_time_node(*, date: str = "", start_date: str = "", end_date: str = "") -> str | None:
+        canonical, attrs, sort_key = _graph_time_node_parts(date=date, start_date=start_date, end_date=end_date)
+        if not canonical:
+            return None
+        time_node = add_entity(canonical, "TimeNode", attributes=attrs)
+        if time_node and sort_key:
+            previous = time_node_sort_keys.get(time_node)
+            if not previous or sort_key < previous:
+                time_node_sort_keys[time_node] = sort_key
+        return time_node
+
+    def link_entity_to_time_node(entity_name: str | None, *, date: str = "", start_date: str = "", end_date: str = "") -> str | None:
+        if not entity_name:
+            return None
+        time_node = add_time_node(date=date, start_date=start_date, end_date=end_date)
+        if time_node:
+            add_relation(entity_name, time_node, "IN_TIME_NODE")
+        return time_node
 
     def add_profile(
         owner_name: str | None,
@@ -2014,9 +2905,23 @@ def _supplemental_graph_components_from_result(
             add_profile(contact_label, text, platform=platform, title=semantic_title, subject_name=owner_name)
         return contact_label
 
-    def add_topic_bundle(owner_name: str | None, topics: List[str], relation_type: str) -> None:
+    def topic_kind_for_relation(relation_type: str, explicit_kind: str = "") -> str:
+        if explicit_kind:
+            return explicit_kind
+        mapping = {
+            "HAS_SKILL_TOPIC": "skill",
+            "HAS_HOBBY_TOPIC": "hobby",
+            "HAS_INTEREST_TOPIC": "interest",
+            "RESEARCHES": "research",
+            "FOCUSES_ON": "domain",
+        }
+        return mapping.get(str(relation_type or "").strip().upper(), "")
+
+    def add_topic_bundle(owner_name: str | None, topics: List[str], relation_type: str, *, topic_kind: str = "") -> None:
+        resolved_kind = topic_kind_for_relation(relation_type, topic_kind)
         for topic in _graph_unique_strings(topics)[:12]:
-            add_entity(topic, "Topic")
+            attrs = [f"topic_kind: {resolved_kind}"] if resolved_kind else []
+            add_entity(topic, "Topic", attributes=attrs)
             if owner_name:
                 add_relation(owner_name, topic, relation_type)
 
@@ -2072,7 +2977,7 @@ def _supplemental_graph_components_from_result(
                     subject_name=org_name,
                 )
             for focus_value in _graph_unique_strings(focus_values or [])[:8]:
-                add_entity(focus_value, "Topic")
+                add_entity(focus_value, "Topic", attributes=["topic_kind: domain"])
                 add_relation(canonical, focus_value, "FOCUSES_ON")
             if industry:
                 industry_node = add_entity(industry, "Topic", attributes=["topic_kind: industry"])
@@ -2083,6 +2988,7 @@ def _supplemental_graph_components_from_result(
     def add_organization_context(org_name: str, *, org_url: str | None = None, summary: str | None = None, focus_values: List[str] | None = None, industry: str | None = None, why_relevant: str | None = None, extra_attributes: List[str] | None = None) -> str | None:
         if not org_name:
             return None
+        canonical_org_name = _graph_canonical_org_name(org_name)
         attrs: List[str] = []
         if org_url:
             attrs.append(f"url: {org_url}")
@@ -2095,7 +3001,12 @@ def _supplemental_graph_components_from_result(
         for focus_value in focus_values or []:
             attrs.append(f"focus: {focus_value}")
         attrs.extend(extra_attributes or [])
-        canonical = add_entity(org_name, _graph_org_type(org_name), attributes=_graph_unique_strings(attrs))
+        canonical = add_entity(
+            canonical_org_name,
+            _graph_org_type(canonical_org_name),
+            alt_names=_graph_unique_strings([org_name, *_graph_org_aliases(canonical_org_name)]),
+            attributes=_graph_unique_strings(attrs),
+        )
         if canonical and org_url:
             add_profile(
                 canonical,
@@ -2114,11 +3025,21 @@ def _supplemental_graph_components_from_result(
                 why_relevant=why_relevant or None,
             )
             for focus_value in _graph_unique_strings(focus_values or [])[:8]:
-                add_entity(focus_value, "Topic")
+                add_entity(focus_value, "Topic", attributes=["topic_kind: domain"])
                 add_relation(canonical, focus_value, "FOCUSES_ON")
         return canonical
 
-    def add_timeline_event(owner_name: str | None, label: str, *, date: str = "", start_date: str = "", end_date: str = "", event_type: str = "", related_entities: List[str] | None = None) -> str | None:
+    def add_timeline_event(
+        owner_name: str | None,
+        label: str,
+        *,
+        date: str = "",
+        start_date: str = "",
+        end_date: str = "",
+        event_type: str = "",
+        related_entities: List[str] | None = None,
+        mention_sources: List[str] | None = None,
+    ) -> str | None:
         if not owner_name or not label:
             return None
         timeline_name = label
@@ -2137,9 +3058,12 @@ def _supplemental_graph_components_from_result(
         event_name = add_entity(timeline_name, "TimelineEvent", attributes=attrs)
         if event_name:
             add_relation(owner_name, event_name, "HAS_TIMELINE_EVENT")
+            link_entity_to_time_node(event_name, date=date, start_date=start_date, end_date=end_date)
             for related in related_entities or []:
                 if related:
                     add_relation(event_name, related, "ABOUT")
+            for source in _graph_unique_strings(mention_sources or [])[:6]:
+                add_relation(source, event_name, "MENTIONS_TIMELINE_EVENT")
         return event_name
 
     def add_occupation(owner_name: str | None, occupation_name: str) -> str | None:
@@ -2177,6 +3101,7 @@ def _supplemental_graph_components_from_result(
         affiliation = add_entity(affiliation_name, "Affiliation", attributes=attrs)
         if affiliation:
             add_relation(owner_name, affiliation, "HAS_AFFILIATION")
+            link_entity_to_time_node(affiliation, start_date=start_date, end_date=end_date)
             if org_canonical:
                 aff_rel = "MEMBER_OF" if rel_label in {"member", "owner", "maintainer"} else "AFFILIATED_WITH"
                 add_relation(affiliation, org_canonical, aff_rel, canonical_name=rel_label or aff_rel)
@@ -2215,10 +3140,11 @@ def _supplemental_graph_components_from_result(
         credential = add_entity(credential_name, "EducationalCredential", attributes=attrs)
         if credential:
             add_relation(owner_name, credential, "HAS_CREDENTIAL")
+            link_entity_to_time_node(credential, start_date=start_date, end_date=end_date)
             if institution_canonical:
                 add_relation(credential, institution_canonical, "ISSUED_BY")
             if field:
-                add_entity(field, "Topic")
+                add_entity(field, "Topic", attributes=["topic_kind: research"])
                 add_relation(credential, field, "HAS_TOPIC")
             add_timeline_event(
                 owner_name,
@@ -2281,6 +3207,7 @@ def _supplemental_graph_components_from_result(
         experience = add_entity(experience_name, "Experience", attributes=attrs)
         if experience:
             add_relation(owner_name, experience, "HAS_EXPERIENCE")
+            link_entity_to_time_node(experience, start_date=start_date, end_date=end_date)
             if role_name:
                 add_relation(experience, role_name, "HAS_ROLE")
                 add_relation(owner_name, role_name, "HOLDS_ROLE")
@@ -2372,57 +3299,79 @@ def _supplemental_graph_components_from_result(
             ]
         )
 
-    primary_people = _graph_unique_strings(
-        [
-            str(arguments.get("person_name") or "").strip(),
-            str(arguments.get("target_name") or "").strip(),
-            str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "",
-            str(arguments.get("author") or "").strip(),
-            str(result.get("display_name") or "").strip(),
-            str(result.get("canonical_name") or "").strip(),
-        ]
-    )
+    primary_people = _graph_primary_people_from_context(tool_name, arguments, result)
     if not primary_people:
         query = result.get("query")
         if isinstance(query, dict):
-            primary_people = _graph_unique_strings(
-                [
-                    str(query.get("person_name") or "").strip(),
-                    str(query.get("name") or "").strip(),
-                    str(query.get("author") or "").strip(),
-                ]
+            primary_people = _graph_primary_people_from_context(
+                tool_name,
+                arguments,
+                {"query": query, **result},
             )
     primary_person = primary_people[0] if primary_people else None
     for person_name in primary_people[:3]:
         add_entity(person_name, "Person")
+    timeline_mention_sources: List[str] = []
+
+    def register_timeline_mention_source(node_name: str | None, url: str = "", platform: str = "") -> None:
+        if not node_name:
+            return
+        platform_text = str(platform or "").strip().casefold()
+        host = (urlparse(_clean_url_candidate(url)).hostname or "").casefold()
+        if host.startswith("www."):
+            host = host[4:]
+        if platform_text in {"linkedin", "x", "twitter"} or host in {"linkedin.com", "x.com", "twitter.com"}:
+            timeline_mention_sources.append(node_name)
 
     username = str(result.get("username") or arguments.get("username") or "").strip().lstrip("@")
     if username:
-        add_contact_point(
+        handle_node = add_contact_point(
             primary_person,
             "handle",
             f"@{username}",
             platform=str(result.get("platform") or "").strip() or None,
         )
+        register_timeline_mention_source(
+            handle_node,
+            platform=str(result.get("platform") or "").strip(),
+        )
 
-    profile_url = str(result.get("profile_url") or result.get("profileUrl") or arguments.get("profile_url") or "").strip()
+    profile_url = str(
+        result.get("profile_url")
+        or result.get("profileUrl")
+        or arguments.get("profile_url")
+        or arguments.get("profile")
+        or ""
+    ).strip()
     if profile_url and primary_person:
-        add_contact_point(
+        profile_node = add_contact_point(
             primary_person,
             "profile",
             profile_url,
             platform=str(result.get("platform") or "").strip() or None,
         )
+        register_timeline_mention_source(
+            profile_node,
+            url=profile_url,
+            platform=str(result.get("platform") or "").strip(),
+        )
+    if tool_name == "x_get_user_posts_api" and username and primary_person:
+        x_profile_url = f"https://x.com/{username}"
+        x_profile_node = add_contact_point(primary_person, "profile", x_profile_url, platform="X")
+        register_timeline_mention_source(x_profile_node, url=x_profile_url, platform="X")
 
     for link in result.get("external_links", []) if isinstance(result.get("external_links"), list) else []:
         if not isinstance(link, dict):
             continue
-        add_contact_point(
+        link_url = str(link.get("url") or "").strip()
+        link_platform = str(link.get("type") or result.get("platform") or "").strip() or None
+        link_node = add_contact_point(
             primary_person,
             "profile",
-            str(link.get("url") or "").strip(),
-            platform=str(link.get("type") or result.get("platform") or "").strip() or None,
+            link_url,
+            platform=link_platform,
         )
+        register_timeline_mention_source(link_node, url=link_url, platform=str(link_platform or ""))
 
     for image_key in ("image_url", "avatar_url", "photo_url", "profile_image_url", "image"):
         image_url = str(result.get(image_key) or "").strip()
@@ -2441,7 +3390,9 @@ def _supplemental_graph_components_from_result(
         elif signal_type == "phone":
             add_contact_point(primary_person, "phone", value)
         elif signal_type in {"profile", "url", "website", "site"}:
-            add_contact_point(primary_person, "profile", value, platform=str(signal.get("platform") or "").strip() or None)
+            signal_platform = str(signal.get("platform") or "").strip() or None
+            signal_node = add_contact_point(primary_person, "profile", value, platform=signal_platform)
+            register_timeline_mention_source(signal_node, url=value, platform=str(signal_platform or ""))
         elif signal_type in {"company", "organization", "institution"}:
             add_affiliation_context(
                 primary_person,
@@ -2453,6 +3404,30 @@ def _supplemental_graph_components_from_result(
             add_entity(value, "Location")
             if primary_person:
                 add_relation(primary_person, value, "LOCATED_IN")
+
+    advisor_names: List[str] = []
+    for key in ("advisors", "advisor", "mentors"):
+        value = result.get(key)
+        if isinstance(value, str):
+            advisor_names.extend(
+                candidate
+                for candidate in _extract_related_people(value, exclude_names=primary_people)[:4]
+                if _graph_is_valid_search_person_candidate(candidate)
+            )
+        elif isinstance(value, list):
+            for item in value[:8]:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or item.get("person_name") or "").strip()
+                    if _graph_is_valid_search_person_candidate(name):
+                        advisor_names.append(name)
+                elif isinstance(item, str) and _graph_is_valid_search_person_candidate(item):
+                    advisor_names.append(item.strip())
+    for advisor_name in _graph_unique_strings(advisor_names)[:8]:
+        if advisor_name.casefold() == str(primary_person or "").casefold():
+            continue
+        add_entity(advisor_name, "Person")
+        if primary_person:
+            add_relation(primary_person, advisor_name, "ADVISED_BY", canonical_name="advisor")
 
     for occupation_value in _graph_unique_strings(
         [
@@ -2570,12 +3545,46 @@ def _supplemental_graph_components_from_result(
             [
                 *_extract_string_list(result.get("topics"))[:12],
                 *_extract_string_list(result.get("research_interests"))[:12],
-                *_extract_string_list(result.get("skills"))[:12],
                 *_extract_string_list(result.get("field_keywords"))[:12],
                 *_extract_string_list(arguments.get("field_keywords"))[:12],
             ]
         ),
         "RESEARCHES",
+        topic_kind="research",
+    )
+    add_topic_bundle(
+        primary_person,
+        _graph_unique_strings(
+            [
+                *_extract_string_list(result.get("skills"))[:12],
+                *_extract_string_list(result.get("skill_set"))[:12],
+                *_extract_string_list(result.get("technical_skills"))[:12],
+            ]
+        ),
+        "HAS_SKILL_TOPIC",
+        topic_kind="skill",
+    )
+    add_topic_bundle(
+        primary_person,
+        _graph_unique_strings(
+            [
+                *_extract_string_list(result.get("hobbies"))[:12],
+            ]
+        ),
+        "HAS_HOBBY_TOPIC",
+        topic_kind="hobby",
+    )
+    add_topic_bundle(
+        primary_person,
+        _graph_unique_strings(
+            [
+                *_extract_string_list(result.get("interests"))[:12],
+                *_extract_string_list(result.get("personal_interests"))[:12],
+                *_extract_string_list(result.get("extracurriculars"))[:12],
+            ]
+        ),
+        "HAS_INTEREST_TOPIC",
+        topic_kind="interest",
     )
 
     publication_records: List[Dict[str, Any]] = []
@@ -2609,6 +3618,7 @@ def _supplemental_graph_components_from_result(
             pub_attributes.append(f"url: {pub_url}")
             consumed_urls.add(pub_url.lower())
         add_entity(pub_name, "Publication", attributes=pub_attributes)
+        link_entity_to_time_node(pub_name, date=year[:4] if year else "")
         if primary_person:
             add_relation(primary_person, pub_name, "PUBLISHED")
         authors = []
@@ -2628,7 +3638,7 @@ def _supplemental_graph_components_from_result(
                 add_relation(primary_person, author_name, "COAUTHORED_WITH")
         pub_topics = publication_topics(publication)
         for topic in pub_topics[:12]:
-            add_entity(topic, "Topic")
+            add_entity(topic, "Topic", attributes=["topic_kind: research"])
             add_relation(pub_name, topic, "HAS_TOPIC")
             if primary_person:
                 add_relation(primary_person, topic, "RESEARCHES")
@@ -2684,11 +3694,51 @@ def _supplemental_graph_components_from_result(
                     relation="candidate affiliation",
                     why_relevant=f"candidate evidence for {candidate_name}",
                 )
-        topics = candidate.get("topics")
-        if isinstance(topics, list):
-            for topic in [str(item).strip() for item in topics if isinstance(item, str) and str(item).strip()][:10]:
-                add_entity(topic, "Topic")
-                add_relation(candidate_name, topic, "RESEARCHES")
+        add_topic_bundle(
+            candidate_name,
+            _graph_unique_strings(
+                [
+                    *_extract_string_list(candidate.get("topics"))[:10],
+                    *_extract_string_list(candidate.get("research_interests"))[:10],
+                ]
+            ),
+            "RESEARCHES",
+            topic_kind="research",
+        )
+        add_topic_bundle(
+            candidate_name,
+            _graph_unique_strings(
+                [
+                    *_extract_string_list(candidate.get("skills"))[:10],
+                    *_extract_string_list(candidate.get("technical_skills"))[:10],
+                    *_extract_string_list(candidate.get("skill_set"))[:10],
+                ]
+            ),
+            "HAS_SKILL_TOPIC",
+            topic_kind="skill",
+        )
+        add_topic_bundle(
+            candidate_name,
+            _graph_unique_strings(
+                [
+                    *_extract_string_list(candidate.get("hobbies"))[:10],
+                ]
+            ),
+            "HAS_HOBBY_TOPIC",
+            topic_kind="hobby",
+        )
+        add_topic_bundle(
+            candidate_name,
+            _graph_unique_strings(
+                [
+                    *_extract_string_list(candidate.get("interests"))[:10],
+                    *_extract_string_list(candidate.get("personal_interests"))[:10],
+                    *_extract_string_list(candidate.get("extracurriculars"))[:10],
+                ]
+            ),
+            "HAS_INTEREST_TOPIC",
+            topic_kind="interest",
+        )
         for evidence_item in candidate.get("evidence", []) if isinstance(candidate.get("evidence"), list) else []:
             if not isinstance(evidence_item, dict):
                 continue
@@ -2817,7 +3867,7 @@ def _supplemental_graph_components_from_result(
         if primary_person:
             add_relation(primary_person, project_name, "RELATED_TO", canonical_name="project_focus")
         for topic in _extract_string_list(project_meta.get("topics"))[:8]:
-            add_entity(topic, "Topic")
+            add_entity(topic, "Topic", attributes=["topic_kind: domain"])
             add_relation(project_name, topic, "HAS_TOPIC")
         if project_url:
             add_profile(project_name, project_url, title=f"Project page for {project_name}", subject_name=project_name)
@@ -2933,7 +3983,7 @@ def _supplemental_graph_components_from_result(
             org_summary=staff_summary,
         )
         if staff_topics:
-            add_topic_bundle(staff_name, staff_topics, "RESEARCHES")
+            add_topic_bundle(staff_name, staff_topics, "RESEARCHES", topic_kind="research")
 
     role_records: List[Dict[str, Any]] = []
     for key in ("roles", "positions", "experience", "employments", "directorships"):
@@ -3120,7 +4170,40 @@ def _supplemental_graph_components_from_result(
             end_date=str(timeline_meta.get("end_date") or "").strip(),
             event_type=str(timeline_meta.get("type") or timeline_meta.get("event_type") or "").strip(),
             related_entities=related_entities,
+            mention_sources=timeline_mention_sources if tool_name in {"linkedin_download_html_ocr", "x_get_user_posts_api"} else None,
         )
+
+    if tool_name == "x_get_user_posts_api":
+        nested = result.get("result") if isinstance(result.get("result"), dict) else {}
+        tweets = nested.get("tweets") if isinstance(nested.get("tweets"), list) else []
+        for tweet in tweets[:12]:
+            if not isinstance(tweet, dict):
+                continue
+            post_text = str(
+                tweet.get("full_text")
+                or tweet.get("text")
+                or tweet.get("content")
+                or ""
+            ).strip()
+            created_at = str(
+                tweet.get("created_at")
+                or tweet.get("date")
+                or tweet.get("timestamp")
+                or ""
+            ).strip()
+            if not post_text and not created_at:
+                continue
+            normalized_text = re.sub(r"\s+", " ", post_text).strip()
+            if len(normalized_text) > 96:
+                normalized_text = f"{normalized_text[:93].rstrip()}..."
+            label = f"X post: {normalized_text}" if normalized_text else "X timeline post"
+            add_timeline_event(
+                primary_person,
+                label,
+                date=created_at,
+                event_type="social_post",
+                mention_sources=timeline_mention_sources,
+            )
 
     company_name = str(result.get("company_name") or arguments.get("company_name") or "").strip()
     company_context_attributes = []
@@ -3251,6 +4334,20 @@ def _supplemental_graph_components_from_result(
         if host:
             add_entity(host, "Domain", attributes=[f"host: {host}"])
             add_relation(cleaned, host, "HAS_DOMAIN")
+
+    ordered_time_nodes = sorted(
+        [
+            (sort_key, name)
+            for name, sort_key in time_node_sort_keys.items()
+            if isinstance(name, str) and name.strip() and isinstance(sort_key, str) and sort_key.strip()
+        ],
+        key=lambda item: (item[0], _normalize_graph_name(item[1])),
+    )
+    for index in range(len(ordered_time_nodes) - 1):
+        current_node = ordered_time_nodes[index][1]
+        next_node = ordered_time_nodes[index + 1][1]
+        if current_node != next_node:
+            add_relation(current_node, next_node, "NEXT_TIME_NODE")
 
     return list(entities_by_key.values()), list(relations_by_key.values())
 
@@ -3629,7 +4726,37 @@ def _summarize_result(
             summary = f"LinkedIn capture did not produce usable artifacts for {profile or 'profile'}: {command_issue}"
         key_facts.append({"profile": profile, "fileCount": result.get("file_count")})
         key_facts.append({"outputDir": result.get("output_dir")})
-        if profile:
+        contact_info = result.get("contact_info") if isinstance(result.get("contact_info"), dict) else {}
+        if contact_info:
+            emails = _extract_string_list(contact_info.get("emails"))
+            phones = _extract_string_list(contact_info.get("phones"))
+            websites = _extract_string_list(contact_info.get("websites"))
+            profiles = _extract_string_list(contact_info.get("profiles"))
+            overlay_url = str(contact_info.get("overlay_url") or "").strip()
+            if emails:
+                key_facts.append({"emails": emails[:10]})
+            if phones:
+                key_facts.append({"phones": phones[:10]})
+            if websites:
+                key_facts.append({"sourceUrls": websites[:10]})
+            if profiles:
+                key_facts.append({"profileUrls": profiles[:10]})
+            if overlay_url:
+                key_facts.append({"contactOverlayUrl": overlay_url})
+            if emails or phones or websites or profiles:
+                summary = (
+                    f"Captured LinkedIn HTML/OCR artifacts for {profile or 'profile'} and extracted contact signals "
+                    f"(emails={len(emails)}, phones={len(phones)}, websites={len(websites)}, profiles={len(profiles)})."
+                )
+            next_hints = _dedupe_str_list(
+                ([str(profile)] if profile else [])
+                + ([overlay_url] if overlay_url else [])
+                + emails[:10]
+                + phones[:10]
+                + websites[:10]
+                + profiles[:10]
+            )
+        elif profile:
             next_hints = [str(profile)]
         return summary, key_facts, vector_upserts, graph_upserts, next_hints
 
@@ -3651,11 +4778,17 @@ def _summarize_result(
             key_facts.append({"requestId": result.get("request_id"), "responseTime": result.get("response_time")})
         rows = result.get("extracted_results")
         if isinstance(rows, list):
-            urls = [
-                str(item.get("url")).strip()
-                for item in rows
-                if isinstance(item, dict) and isinstance(item.get("url"), str) and str(item.get("url")).strip()
-            ]
+            urls: List[str] = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                raw_url = item.get("url")
+                if not isinstance(raw_url, str):
+                    continue
+                normalized_url = _clean_url_candidate(raw_url)
+                if normalized_url.startswith(("http://", "https://")):
+                    urls.append(normalized_url)
+            urls = _dedupe_str_list(urls)
             combined_text = " ".join(
                 str(item.get("title") or "") + " " + str(item.get("extracted_text") or "")
                 for item in rows
@@ -3680,6 +4813,54 @@ def _summarize_result(
                 f"Ran {search_label} for {target_name or 'the target'} and found {len(rows)} archived result(s); "
                 f"source types include {', '.join(source_types[:4] or ['public profiles'])}."
             )
+        return summary, key_facts, vector_upserts, graph_upserts, next_hints
+
+    if tool_name in {"extract_webpage", "crawl_webpage", "map_webpage"}:
+        if tool_name == "extract_webpage":
+            action_label = "Tavily webpage extract"
+        elif tool_name == "crawl_webpage":
+            action_label = "Tavily site crawl"
+        else:
+            action_label = "Tavily site map"
+        source_url = str(result.get("url") or arguments.get("url") or "").strip()
+        summary = f"Ran {action_label} for {source_url or 'the target URL'}."
+        key_facts.append({"url": source_url or None, "outputDir": result.get("output_dir")})
+        if tool_name == "map_webpage":
+            urls = _dedupe_str_list(_extract_string_list(result.get("urls")))
+            key_facts.append({"resultsFound": result.get("results_found")})
+            if urls:
+                key_facts.append({"sourceUrls": urls[:25]})
+                next_hints = urls[:25]
+                summary = f"Mapped {len(urls)} in-scope URL(s) via Tavily for {source_url or 'the target URL'}."
+            return summary, key_facts, vector_upserts, graph_upserts, next_hints
+
+        pages = result.get("extracted_pages")
+        page_rows = [item for item in pages if isinstance(item, dict)] if isinstance(pages, list) else []
+        page_urls: List[str] = []
+        combined_text = ""
+        for page in page_rows:
+            page_url = _clean_url_candidate(str(page.get("url") or "").strip())
+            if page_url.startswith(("http://", "https://")):
+                page_urls.append(page_url)
+            combined_text += " " + str(page.get("title") or "") + " " + str(page.get("extracted_text") or "")
+        page_urls = _dedupe_str_list(page_urls)
+        related_people = _extract_related_people(combined_text, exclude_names=[str(arguments.get("target_name") or "").strip()])
+        emails = _extract_strings_from_text(combined_text, kind="email")
+        phones = _extract_phone_numbers_from_text(combined_text)
+        key_facts.append({"resultsFound": result.get("results_found")})
+        if page_urls:
+            key_facts.append({"sourceUrls": page_urls[:15]})
+        if related_people:
+            key_facts.append({"relatedPeople": related_people[:10]})
+        if emails:
+            key_facts.append({"emails": emails[:10]})
+        if phones:
+            key_facts.append({"phones": phones[:10]})
+        if tool_name == "crawl_webpage":
+            next_hints = page_urls[:15]
+            summary = f"Crawled {len(page_rows)} page(s) via Tavily for {source_url or 'the target URL'}."
+        else:
+            summary = f"Extracted {len(page_rows)} page(s) via Tavily for {source_url or 'the target URL'}."
         return summary, key_facts, vector_upserts, graph_upserts, next_hints
 
     if tool_name in {"arxiv_search_and_download", "arxiv_paper_ingest"}:
@@ -5076,7 +6257,7 @@ def _extract_evidence_refs_from_arguments(tool_name: str, arguments: Dict[str, A
         if isinstance(value, str):
             try:
                 return json.loads(value)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 return None
         return value
 

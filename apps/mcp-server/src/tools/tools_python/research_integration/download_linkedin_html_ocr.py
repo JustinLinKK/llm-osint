@@ -19,11 +19,14 @@ Requirements:
 """
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urlparse
 
 
 def load_env_file():
@@ -49,6 +52,161 @@ def load_env_file():
 
 
 load_env_file()
+
+
+EMAIL_IN_TEXT_REGEX = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+PHONE_IN_TEXT_REGEX = re.compile(r"(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]){2,}\d{2,4}")
+PHONE_DATEISH_REGEX = re.compile(r"^\d{4}\s*[-/]\s*\d{4}$")
+
+
+def dedupe_strings(values):
+    seen = set()
+    output = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        lowered = text.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        output.append(text)
+    return output
+
+
+def is_valid_phone_candidate(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if PHONE_DATEISH_REGEX.fullmatch(compact):
+        return False
+    digits = re.sub(r"\D", "", compact)
+    return 7 <= len(digits) <= 15
+
+
+def classify_http_link(href):
+    text = str(href or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return "", ""
+    parsed = urlparse(text)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    normalized = f"{parsed.scheme.lower()}://{host}{path}".rstrip("/")
+    if not normalized:
+        return "", ""
+
+    # Keep only genuine profile-style links from LinkedIn; drop nav pages.
+    if host.endswith("linkedin.com"):
+        segments = [segment for segment in path.split("/") if segment]
+        if (
+            (len(segments) == 2 and segments[0] in {"in", "pub"})
+            or (len(segments) == 1 and segments[0].startswith("in-"))
+        ):
+            return "profile", normalized
+        return "", ""
+    if host in {"x.com", "twitter.com", "github.com", "gitlab.com", "scholar.google.com"}:
+        return "profile", normalized
+    return "website", normalized
+
+
+def extract_contact_info(page):
+    """Extract contact fields from LinkedIn contact overlay page."""
+    contact = {
+        "emails": [],
+        "phones": [],
+        "websites": [],
+        "profiles": [],
+        "sections": [],
+    }
+
+    body_text = ""
+    try:
+        body_text = page.locator("body").inner_text(timeout=8000)
+    except Exception:
+        body_text = ""
+
+    if body_text:
+        contact["emails"] = dedupe_strings([item.lower() for item in EMAIL_IN_TEXT_REGEX.findall(body_text)])
+        contact["phones"] = dedupe_strings(
+            [item for item in PHONE_IN_TEXT_REGEX.findall(body_text) if is_valid_phone_candidate(item)]
+        )
+
+    link_values = []
+    try:
+        link_locator = page.locator("a[href]")
+        link_count = min(link_locator.count(), 200)
+        for idx in range(link_count):
+            href = link_locator.nth(idx).get_attribute("href")
+            if isinstance(href, str) and href.strip():
+                link_values.append(href.strip())
+    except Exception:
+        link_values = []
+
+    for href in link_values:
+        lowered = href.casefold()
+        if lowered.startswith("mailto:"):
+            email = href.split(":", 1)[-1].strip().lower()
+            if email:
+                contact["emails"].append(email)
+            continue
+        if lowered.startswith("tel:"):
+            phone = href.split(":", 1)[-1].strip()
+            if is_valid_phone_candidate(phone):
+                contact["phones"].append(phone)
+            continue
+
+    try:
+        sections = page.locator("section.pv-contact-info__contact-type")
+        section_count = min(sections.count(), 20)
+        for idx in range(section_count):
+            section = sections.nth(idx)
+            section_text = section.inner_text(timeout=3000).strip()
+            if not section_text:
+                continue
+            lines = [line.strip() for line in section_text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            for line in lines[1:]:
+                for email in EMAIL_IN_TEXT_REGEX.findall(line):
+                    contact["emails"].append(email.lower())
+                for phone in PHONE_IN_TEXT_REGEX.findall(line):
+                    if is_valid_phone_candidate(phone):
+                        contact["phones"].append(phone)
+            section_links = []
+            try:
+                anchors = section.locator("a[href]")
+                anchor_count = min(anchors.count(), 20)
+                for a_idx in range(anchor_count):
+                    href = anchors.nth(a_idx).get_attribute("href")
+                    if isinstance(href, str) and href.strip():
+                        section_links.append(href.strip())
+            except Exception:
+                section_links = []
+            for href in section_links:
+                link_kind, normalized_href = classify_http_link(href)
+                if link_kind == "profile":
+                    contact["profiles"].append(normalized_href)
+                elif link_kind == "website":
+                    contact["websites"].append(normalized_href)
+            contact["sections"].append(
+                {
+                    "label": lines[0],
+                    "values": lines[1:8],
+                    "links": dedupe_strings(section_links)[:8],
+                }
+            )
+    except Exception:
+        pass
+
+    contact["emails"] = dedupe_strings(contact["emails"])
+    contact["phones"] = dedupe_strings(contact["phones"])
+    contact["websites"] = dedupe_strings(contact["websites"])
+    contact["profiles"] = dedupe_strings(contact["profiles"])
+    contact["sections"] = contact["sections"][:20]
+    return contact
 
 
 def get_browserbase_credentials():
@@ -253,7 +411,8 @@ def linkedin_login(page, email, password):
 def normalize_linkedin_url(profile_input):
     """Convert username or URL to full LinkedIn profile URL."""
     if profile_input.startswith("http"):
-        url = profile_input.rstrip("/")
+        url = profile_input.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        url = re.sub(r"/overlay/contact-info/?$", "", url, flags=re.IGNORECASE)
         if "/in/" not in url and "/company/" not in url:
             print("Error: Invalid LinkedIn URL. Expected /in/ or /company/ in URL.", file=sys.stderr)
             sys.exit(1)
@@ -345,6 +504,40 @@ def download_linkedin_html(profile_url, output_dir):
             print(f"✓ Profile page saved: {profile_filename}")
             print(f"  Size: {len(profile_html):,} bytes")
 
+            contact_filename = None
+            contact_json_filename = None
+            if "/in/" in profile_url:
+                contact_url = f"{profile_url}/overlay/contact-info/"
+                print(f"\n{'='*60}")
+                print(f"Navigating to contact overlay: {contact_url}")
+                print(f"{'='*60}")
+                try:
+                    page.goto(contact_url, wait_until="domcontentloaded", timeout=60000)
+                    time.sleep(4)
+                    contact_html = page.content()
+                    contact_filename = output_path / f"contact_info_{timestamp}.html"
+                    with open(contact_filename, "w", encoding="utf-8") as f:
+                        f.write(contact_html)
+                    print(f"✓ Contact overlay saved: {contact_filename}")
+                    print(f"  Size: {len(contact_html):,} bytes")
+
+                    contact_info = extract_contact_info(page)
+                    contact_info["overlay_url"] = contact_url
+                    contact_info["captured_url"] = page.url
+                    contact_info["captured_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    contact_json_filename = output_path / f"contact_info_{timestamp}.json"
+                    with open(contact_json_filename, "w", encoding="utf-8") as f:
+                        json.dump(contact_info, f, ensure_ascii=True, indent=2)
+                    print(f"✓ Contact info JSON saved: {contact_json_filename}")
+                    print(
+                        f"  Parsed signals: emails={len(contact_info.get('emails', []))}, "
+                        f"phones={len(contact_info.get('phones', []))}, "
+                        f"websites={len(contact_info.get('websites', []))}, "
+                        f"profiles={len(contact_info.get('profiles', []))}"
+                    )
+                except Exception as e:
+                    print(f"Warning: Failed to capture contact overlay ({str(e)})")
+
             # Navigate to activity page
             activity_url = get_activity_url(profile_url)
             print(f"\n{'='*60}")
@@ -378,6 +571,10 @@ def download_linkedin_html(profile_url, output_dir):
             print(f"Output directory: {output_path.absolute()}")
             print(f"  - {profile_filename.name}")
             print(f"  - {activity_filename.name}")
+            if contact_filename:
+                print(f"  - {contact_filename.name}")
+            if contact_json_filename:
+                print(f"  - {contact_json_filename.name}")
 
             return True
 

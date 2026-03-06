@@ -21,6 +21,26 @@ TECHNICAL_COMPANY_SOURCE_TOOLS = {
     "npm_author_search",
     "crates_author_search",
 }
+COMPANY_CANDIDATE_PROVIDER_BLOCKLIST = {
+    "tavily",
+    "google",
+    "duckduckgo",
+    "wikipedia",
+    "researchgate",
+    "linkedin",
+    "github",
+    "gitlab",
+}
+COMPANY_DESCRIPTOR_TERMS = {
+    "startup",
+    "stealth startup",
+    "stealth company",
+    "stealth mode",
+    "self-employed",
+    "self employed",
+    "independent",
+    "confidential",
+}
 
 
 @dataclass(frozen=True)
@@ -53,6 +73,39 @@ def _extract_fact_value(receipt: ReceiptLike, key: str) -> Any:
     return None
 
 
+def _normalize_company_candidate(name: str) -> str | None:
+    candidate = " ".join(str(name or "").strip().split()).strip(" -,:;")
+    if len(candidate) < 3:
+        return None
+    lowered = candidate.casefold()
+    if lowered in COMPANY_DESCRIPTOR_TERMS:
+        return None
+    if lowered in COMPANY_CANDIDATE_PROVIDER_BLOCKLIST:
+        return None
+    tokens = [token.casefold() for token in candidate.split()]
+    if tokens and tokens[0] in COMPANY_CANDIDATE_PROVIDER_BLOCKLIST and len(tokens) <= 2:
+        return None
+    if lowered in {"tavily research", "tavily person search", "google serp person search"}:
+        return None
+    return candidate
+
+
+def _extract_descriptor_company_signals(receipt: ReceiptLike) -> List[str]:
+    descriptors: List[str] = []
+    if receipt.tool_name not in TECHNICAL_COMPANY_SOURCE_TOOLS:
+        return descriptors
+    for item in _extract_fact_list(receipt, "organizations"):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        lowered = " ".join(name.split()).casefold()
+        if lowered in COMPANY_DESCRIPTOR_TERMS or "stealth startup" in lowered:
+            descriptors.append(name)
+    return list(dict.fromkeys(descriptors))
+
+
 def _extract_company_candidates(receipt: ReceiptLike) -> List[str]:
     companies: List[str] = []
     if receipt.tool_name in TECHNICAL_COMPANY_SOURCE_TOOLS:
@@ -60,17 +113,23 @@ def _extract_company_candidates(receipt: ReceiptLike) -> List[str]:
             if isinstance(item, dict):
                 name = str(item.get("name") or "").strip()
                 if name:
-                    companies.append(name.lstrip("@"))
+                    normalized = _normalize_company_candidate(name.lstrip("@"))
+                    if normalized:
+                        companies.append(normalized)
     if receipt.tool_name == "sec_person_search":
         for item in _extract_fact_list(receipt, "companies"):
             if isinstance(item, str) and item.strip():
-                companies.append(item.strip())
+                normalized = _normalize_company_candidate(item.strip())
+                if normalized:
+                    companies.append(normalized)
     if receipt.tool_name == "company_officer_search":
         for item in _extract_fact_list(receipt, "roles"):
             if isinstance(item, dict):
                 name = str(item.get("company_name") or "").strip()
                 if name:
-                    companies.append(name)
+                    normalized = _normalize_company_candidate(name)
+                    if normalized:
+                        companies.append(normalized)
     return list(dict.fromkeys(companies))
 
 
@@ -86,8 +145,17 @@ def derive_business_follow_up_tasks(
     tasks: List[BusinessTask] = []
     notes: List[str] = []
     primary_name = primary_person_targets[:1][0] if primary_person_targets else ""
+    descriptor_notes_seen: set[str] = set()
 
     for receipt in [item for item in receipts if item.ok]:
+        for descriptor in _extract_descriptor_company_signals(receipt):
+            key = descriptor.casefold()
+            if key in descriptor_notes_seen:
+                continue
+            descriptor_notes_seen.add(key)
+            notes.append(
+                f"Employment signal uses descriptor '{descriptor}' without a resolvable legal company name; defer filing-level lookups until company identity is confirmed."
+            )
         for company_name in _extract_company_candidates(receipt)[:5]:
             add_task_if_new(
                 tasks,

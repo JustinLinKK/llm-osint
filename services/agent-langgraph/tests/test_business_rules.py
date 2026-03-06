@@ -37,6 +37,52 @@ def test_business_rules_queue_open_corporates_from_github_org() -> None:
     assert any(task.tool_name == "open_corporates_search" and task.payload["company_name"] == "Acme" for task in tasks)
 
 
+def test_business_rules_skip_provider_like_company_names() -> None:
+    receipt = ReceiptStub(
+        run_id="run-1",
+        tool_name="github_identity_search",
+        ok=True,
+        summary="Noisy org labels found.",
+        key_facts=[
+            {"organizations": [{"name": "Tavily", "url": "https://example.com/tavily", "relation": "member"}]},
+            {"organizations": [{"name": "Google", "url": "https://example.com/google", "relation": "member"}]},
+        ],
+    )
+
+    tasks, _, _ = derive_business_follow_up_tasks(
+        run_id="run-1",
+        receipts=[receipt],
+        primary_person_targets=["Ada Lovelace"],
+        iteration=0,
+        dedupe_store={},
+    )
+
+    assert not any(task.tool_name == "open_corporates_search" for task in tasks)
+
+
+def test_business_rules_note_unresolved_stealth_startup_descriptor() -> None:
+    receipt = ReceiptStub(
+        run_id="run-1",
+        tool_name="github_identity_search",
+        ok=True,
+        summary="Employment descriptor found.",
+        key_facts=[
+            {"organizations": [{"name": "Stealth Startup", "url": "", "relation": "member"}]},
+        ],
+    )
+
+    tasks, _, notes = derive_business_follow_up_tasks(
+        run_id="run-1",
+        receipts=[receipt],
+        primary_person_targets=["Ada Lovelace"],
+        iteration=0,
+        dedupe_store={},
+    )
+
+    assert not any(task.tool_name == "open_corporates_search" for task in tasks)
+    assert any("descriptor" in note.lower() and "stealth startup" in note.lower() for note in notes)
+
+
 def test_business_rules_queue_company_filing_after_company_resolution() -> None:
     receipt = ReceiptStub(
         run_id="run-1",

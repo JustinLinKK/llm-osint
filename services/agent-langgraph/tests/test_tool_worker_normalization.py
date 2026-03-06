@@ -234,6 +234,8 @@ def test_graph_ids_are_stable_across_runs(monkeypatch) -> None:
 
     first = tool_worker_graph._stable_graph_node_id("run-1", "Person", "Ada Lovelace")
     second = tool_worker_graph._stable_graph_node_id("run-2", "Person", "Ada Lovelace")
+    canonical_first = tool_worker_graph._canonical_graph_node_id("Person", "Ada Lovelace")
+    canonical_second = tool_worker_graph._canonical_graph_node_id("Person", "Ada Lovelace")
     snippet_first = tool_worker_graph._stable_snippet_entity_id(
         "run-1",
         "google_serp_person_search",
@@ -247,7 +249,8 @@ def test_graph_ids_are_stable_across_runs(monkeypatch) -> None:
         "Ada Lovelace profile summary",
     )
 
-    assert first == second
+    assert first != second
+    assert canonical_first == canonical_second
     assert snippet_first == snippet_second
 
 
@@ -309,6 +312,36 @@ def test_merge_key_fact_lists_preserves_tool_specific_and_llm_facts(monkeypatch)
     assert {"publications": [{"title": "Paper A"}]} in merged
     assert {"source_urls": ["https://github.com/FrederickPi"]} in merged
     assert {"uncertainties": ["limited directory visibility"]} in merged
+
+
+def test_summarize_linkedin_contact_overlay_emits_contact_signals(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    summary, key_facts, _vector_upserts, _graph_upserts, next_hints = tool_worker_graph._summarize_result(
+        "linkedin_download_html_ocr",
+        {"profile": "https://www.linkedin.com/in/frederick-pi-40a668181"},
+        {
+            "profile": "https://www.linkedin.com/in/frederick-pi-40a668181",
+            "file_count": 3,
+            "output_dir": "/tmp/linkedin_html",
+            "contact_info": {
+                "overlay_url": "https://www.linkedin.com/in/frederick-pi-40a668181/overlay/contact-info/",
+                "emails": ["frederick.pi@example.com"],
+                "phones": ["+1 555-0101"],
+                "websites": ["https://frederickpi.dev"],
+                "profiles": ["https://github.com/FrederickPi1969"],
+            },
+        },
+        True,
+    )
+
+    assert "contact signals" in summary
+    assert {"emails": ["frederick.pi@example.com"]} in key_facts
+    assert {"phones": ["+1 555-0101"]} in key_facts
+    assert {"sourceUrls": ["https://frederickpi.dev"]} in key_facts
+    assert {"profileUrls": ["https://github.com/FrederickPi1969"]} in key_facts
+    assert "frederick.pi@example.com" in next_hints
+    assert "https://github.com/FrederickPi1969" in next_hints
 
 
 def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_graph(monkeypatch) -> None:
@@ -566,3 +599,224 @@ def test_build_graph_construction_batches_emits_management_and_staff_histories(m
     assert "HAS_EXPERIENCE" in relation_types
     assert "HAS_ROLE" in relation_types
     assert "HOLDS_ROLE" in relation_types
+
+
+def test_build_graph_construction_batches_emits_unified_topic_kinds(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="github_identity_search",
+        arguments={"person_name": "Ada Lovelace"},
+        result={
+            "canonical_name": "Ada Lovelace",
+            "skills": ["Python", "Graph modeling"],
+            "hobbies": ["chess"],
+            "interests": ["history of computing"],
+            "candidates": [
+                {
+                    "name": "Grace Hopper",
+                    "skills": ["COBOL"],
+                    "interests": ["compiler design"],
+                }
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    relation_types = {relation["rel_type"] for relation in relations}
+    assert "HAS_SKILL_TOPIC" in relation_types
+    assert "HAS_HOBBY_TOPIC" in relation_types
+    assert "HAS_INTEREST_TOPIC" in relation_types
+
+    assert any(
+        entity["type"] == "Topic"
+        and entity["canonical_name"] == "Python"
+        and any(str(attr).strip() == "topic_kind: skill" for attr in entity.get("attributes", []))
+        for entity in entities
+    )
+    assert any(
+        entity["type"] == "Topic"
+        and entity["canonical_name"] == "chess"
+        and any(str(attr).strip() == "topic_kind: hobby" for attr in entity.get("attributes", []))
+        for entity in entities
+    )
+    assert any(
+        entity["type"] == "Topic"
+        and entity["canonical_name"] == "history of computing"
+        and any(str(attr).strip() == "topic_kind: interest" for attr in entity.get("attributes", []))
+        for entity in entities
+    )
+
+
+def test_build_graph_construction_batches_emits_timeline_mentions_and_time_nodes(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="x_get_user_posts_api",
+        arguments={"person_name": "Ada Lovelace", "username": "ada"},
+        result={
+            "username": "ada",
+            "result": {
+                "tweets": [
+                    {"text": "Joined ACME Labs", "created_at": "2023-01-10T09:00:00Z"},
+                    {"text": "Started PhD at Example University", "created_at": "2024-03-18T11:30:00Z"},
+                ]
+            },
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    relation_types = {relation["rel_type"] for relation in relations}
+    assert "MENTIONS_TIMELINE_EVENT" in relation_types
+    assert "IN_TIME_NODE" in relation_types
+    assert "NEXT_TIME_NODE" in relation_types
+
+    assert any(entity["type"] == "TimelineEvent" for entity in entities)
+    assert any(entity["type"] == "TimeNode" for entity in entities)
+
+
+def test_normalize_search_result_extracts_typed_profile_facts(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    normalized = tool_worker_graph._normalize_tool_result_for_graph(
+        "tavily_person_search",
+        {"target_name": "Anthology Xinyu Pi"},
+        {
+            "target_name": "Anthology Xinyu Pi",
+            "query": "Anthology Xinyu Pi",
+            "extracted_results": [
+                {
+                    "url": "https://openreview.net/profile?id=~Xinyu_Pi1",
+                    "title": "Xinyu Pi | OpenReview",
+                    "extracted_text": (
+                        "Xinyu Pi PhD student, CSE, University of California, San Diego (ucsd.edu) "
+                        "2023 – 2028 PhD Advisor Zhiting Hu Suggest Name Emails"
+                    ),
+                },
+                {
+                    "url": "https://scholar.google.com/citations?user=UPtuhT4AAAAJ&hl=en",
+                    "title": "Xinyu Pi · UC San Diego · Verified email at ucsd.edu · Computational Cognitive Science",
+                    "extracted_text": "",
+                },
+                {
+                    "url": "https://www.linkedin.com/in/frederick-pi-40a668181",
+                    "title": "Frederick Pi | LinkedIn",
+                    "extracted_text": "builds next-generation AI agents to accelerate innovations and productions",
+                },
+            ],
+        },
+    )
+
+    assert normalized["canonical_name"] == "Xinyu Pi"
+    assert normalized["resolved_primary_person"] == "Xinyu Pi"
+    assert any(item["title"] == "PhD student" for item in normalized["roles"])
+    assert any(item["institution"] == "University of California, San Diego" for item in normalized["education"])
+    assert any(item["name"] == "Zhiting Hu" for item in normalized["advisors"])
+    assert any(item["url"] == "https://scholar.google.com/citations?user=UPtuhT4AAAAJ&hl=en" for item in normalized["external_links"])
+    assert any(item["name"] == "University of California, San Diego" for item in normalized["organizations"])
+    assert "Computational Cognitive Science" in normalized["topics"]
+
+
+def test_build_graph_construction_batches_normalizes_noisy_search_queries(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="tavily_person_search",
+        arguments={"target_name": "Anthology Xinyu Pi"},
+        result={
+            "target_name": "Anthology Xinyu Pi",
+            "query": "Anthology Xinyu Pi",
+            "extracted_results": [
+                {
+                    "url": "https://openreview.net/profile?id=~Xinyu_Pi1",
+                    "title": "Xinyu Pi | OpenReview",
+                    "extracted_text": (
+                        "Xinyu Pi PhD student, CSE, University of California, San Diego (ucsd.edu) "
+                        "2023 – 2028 PhD Advisor Zhiting Hu Suggest Name Emails"
+                    ),
+                },
+                {
+                    "url": "https://scholar.google.com/citations?user=UPtuhT4AAAAJ&hl=en",
+                    "title": "Xinyu Pi · UC San Diego · Verified email at ucsd.edu · Computational Cognitive Science",
+                    "extracted_text": "",
+                },
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert any(entity["type"] == "Person" and entity["canonical_name"] == "Xinyu Pi" for entity in entities)
+    assert not any(entity["canonical_name"] == "Anthology Xinyu Pi" for entity in entities)
+    assert not any(entity["canonical_name"] == "Suggest Name Emails" for entity in entities)
+    assert len(
+        [
+            entity
+            for entity in entities
+            if entity["type"] == "Institution" and entity["canonical_name"] == "University of California, San Diego"
+        ]
+    ) == 1
+    assert any(entity["type"] == "Experience" and "University of California, San Diego" in entity["canonical_name"] for entity in entities)
+    assert any(entity["type"] == "EducationalCredential" and "University of California, San Diego" in entity["canonical_name"] for entity in entities)
+    assert "ADVISED_BY" in {relation["rel_type"] for relation in relations}
+
+
+def test_build_graph_construction_batches_skips_non_person_noise_queries(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, _relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="tavily_person_search",
+        arguments={"target_name": "Suggest Name Emails"},
+        result={
+            "target_name": "Suggest Name Emails",
+            "query": "Suggest Name Emails",
+            "extracted_results": [
+                {
+                    "url": "https://sitechecker.pro/email-name-generator/",
+                    "title": "Professional Email Name Generator",
+                    "extracted_text": "The Professional Email Name Generator quickly creates unique email suggestions.",
+                }
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert not any(entity["type"] == "Person" for entity in entities)
+
+
+def test_normalize_linkedin_result_emits_contact_and_profile_facts(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    normalized = tool_worker_graph._normalize_tool_result_for_graph(
+        "linkedin_download_html_ocr",
+        {"profile": "https://www.linkedin.com/in/frederick-pi-40a668181"},
+        {
+            "profile": "https://www.linkedin.com/in/frederick-pi-40a668181",
+            "contact_info": {
+                "overlay_url": "https://www.linkedin.com/in/frederick-pi-40a668181/overlay/contact-info/",
+                "emails": ["frederick.pi@example.com"],
+                "phones": ["+1 555-0101"],
+                "websites": ["https://frederickpi.dev"],
+                "profiles": ["https://github.com/FrederickPi1969"],
+            },
+            "extracted_pages": [
+                {
+                    "file": "/tmp/linkedin/profile.html",
+                    "extracted_text": (
+                        "Frederick Pi builds next-generation AI agents to accelerate innovations and productions "
+                        "at Stealth Startup. La Jolla Shores, CA"
+                    ),
+                }
+            ],
+        },
+    )
+
+    assert normalized["canonical_name"] == "Frederick Pi"
+    assert normalized["headline"].startswith("builds next-generation AI agents")
+    assert any(item["type"] == "email" and item["value"] == "frederick.pi@example.com" for item in normalized["contact_signals"])
+    assert any(item["type"] == "location" and item["value"] == "La Jolla Shores, CA" for item in normalized["contact_signals"])
+    assert any(item["url"] == "https://github.com/FrederickPi1969" for item in normalized["external_links"])
+    assert any(item["name"] == "Stealth Startup" for item in normalized["organizations"])

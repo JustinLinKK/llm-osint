@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -26,6 +27,14 @@ from orchestrator.business_graph import build_business_graph_entities
 from orchestrator.coverage import coverage_led_stop_condition, empty_coverage_ledger
 from orchestrator.technical_graph import build_technical_graph_entities
 from orchestrator.rules.technical_rules import derive_technical_follow_up_tasks
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 logger = get_logger(__name__)
 STAGE1_MAX_TOOLS_PER_ITERATION = max(
@@ -53,6 +62,39 @@ STAGE1_MIN_ITERATIONS = max(
 SOURCE_FOLLOW_UP_MAX_TASKS = max(
     1, int(os.getenv("STAGE1_SOURCE_FOLLOW_UP_MAX_TASKS", "6"))
 )
+STAGE1_ENABLE_GRAPH_CONTEXT = _env_flag("STAGE1_ENABLE_GRAPH_CONTEXT", True)
+STAGE1_GRAPH_SEARCH_QUERY_LIMIT = max(
+    1, int(os.getenv("STAGE1_GRAPH_SEARCH_QUERY_LIMIT", "4"))
+)
+STAGE1_GRAPH_ENTITY_LIMIT = max(
+    1, int(os.getenv("STAGE1_GRAPH_ENTITY_LIMIT", "4"))
+)
+STAGE1_GRAPH_NEIGHBOR_DEPTH = max(
+    1, min(2, int(os.getenv("STAGE1_GRAPH_NEIGHBOR_DEPTH", "1")))
+)
+STAGE1_GRAPH_NEIGHBOR_LIMIT = max(
+    1, int(os.getenv("STAGE1_GRAPH_NEIGHBOR_LIMIT", "120"))
+)
+STAGE1_SOCIAL_TIMELINE_MAX_FAILURES = max(
+    1, int(os.getenv("STAGE1_SOCIAL_TIMELINE_MAX_FAILURES", "2"))
+)
+STAGE1_BLUEPRINT_ENABLED = _env_flag("STAGE1_BLUEPRINT_ENABLED", True)
+STAGE1_BLUEPRINT_CONTRACT_PATH = os.getenv(
+    "STAGE1_BLUEPRINT_CONTRACT_PATH",
+    "/workspaces/llm-osint/schemas/stage1_graph_blueprint_contract.v1.json",
+).strip()
+STAGE1_BLUEPRINT_ENFORCEMENT = (
+    os.getenv("STAGE1_BLUEPRINT_ENFORCEMENT", "balanced").strip().lower() or "balanced"
+)
+STAGE1_EVIDENCE_MIN_URLS = max(
+    1, int(os.getenv("STAGE1_EVIDENCE_MIN_URLS", "6"))
+)
+STAGE1_EVIDENCE_MIN_DOMAINS = max(
+    1, int(os.getenv("STAGE1_EVIDENCE_MIN_DOMAINS", "3"))
+)
+STAGE1_EVIDENCE_MIN_OBJECT_REFS = max(
+    1, int(os.getenv("STAGE1_EVIDENCE_MIN_OBJECT_REFS", "2"))
+)
 
 URL_REGEX = re.compile(r"https?://[^\s\]]+")
 EMAIL_REGEX = re.compile(
@@ -60,7 +102,7 @@ EMAIL_REGEX = re.compile(
 PLACEHOLDER_EMAIL_REGEX = re.compile(r"^error-[^@]*@duckduckgo\.com$", re.IGNORECASE)
 DOMAIN_REGEX = re.compile(
     r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}\b", re.IGNORECASE)
-USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9_]{3,32})")
+USERNAME_REGEX = re.compile(r"(?<!\w)@([A-Za-z0-9](?:[A-Za-z0-9_.-]{1,62}[A-Za-z0-9])?)")
 PHONE_REGEX = re.compile(
     r"(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]){2,}\d{2,4}"
 )
@@ -73,6 +115,49 @@ CAPITALIZED_NAME_REGEX = re.compile(r"\b[A-Z][a-z]+(?:[\s-]+[A-Z][a-z]+){0,3}\b"
 PERSON_HINT_REGEX = re.compile(
     r"(?i)\b(?:investigate|investigation(?:\s+into)?|profile|research|look\s+into|find\s+info\s+on|osint(?:\s+on)?)\b[:\s-]*([A-Za-z][A-Za-z'\s-]{1,79})"
 )
+USERNAME_URL_PROFILE_HOSTS = {
+    "github.com",
+    "gitlab.com",
+    "huggingface.co",
+    "kaggle.com",
+    "reddit.com",
+    "x.com",
+    "twitter.com",
+}
+USERNAME_URL_RESERVED_SEGMENTS = {
+    "about",
+    "blog",
+    "company",
+    "contact",
+    "directory",
+    "docs",
+    "explore",
+    "features",
+    "help",
+    "home",
+    "in",
+    "jobs",
+    "join",
+    "login",
+    "marketplace",
+    "new",
+    "notifications",
+    "org",
+    "orgs",
+    "organizations",
+    "pricing",
+    "pub",
+    "search",
+    "settings",
+    "signup",
+    "site",
+    "sponsors",
+    "support",
+    "topics",
+    "trending",
+    "user",
+    "users",
+}
 DERIVED_DOMAIN_RECON_BLOCKLIST = {
     "aclanthology.org",
     "acs.org",
@@ -184,6 +269,108 @@ PERSON_CANDIDATE_BREAKWORDS = {
     "look",
     "into",
 }
+RELATED_PERSON_REJECT_TOKENS = {
+    "none",
+    "null",
+    "unknown",
+    "na",
+    "n/a",
+    "publication",
+    "publications",
+    "record",
+    "records",
+    "result",
+    "results",
+    "source",
+    "sources",
+    "search",
+    "research",
+    "profile",
+    "profiles",
+    "candidate",
+    "candidates",
+    "tavily",
+    "google",
+    "serp",
+    "duckduckgo",
+    "github",
+    "gitlab",
+    "linkedin",
+}
+RELATED_PERSON_NOISY_CONTEXT_TOKENS = {
+    "address",
+    "advisor",
+    "advisors",
+    "anthology",
+    "availability",
+    "checker",
+    "composer",
+    "emails",
+    "extension",
+    "generator",
+    "gmail",
+    "ideas",
+    "install",
+    "joined",
+    "name",
+    "names",
+    "navigator",
+    "position",
+    "professional",
+    "ranked",
+    "registration",
+    "reply",
+    "sales",
+    "scholar",
+    "semantic",
+    "suggest",
+    "tweet",
+    "updated",
+}
+RELATED_PERSON_NOISY_PHRASE_HINTS = (
+    "suggest name emails",
+    "suggest position advisors",
+    "name generator",
+    "gmail composer",
+    "reply tweet use",
+    "install extension try",
+    "last updated",
+    "in this post",
+)
+RELATED_ORG_PROVIDER_BLOCKLIST = {
+    "tavily",
+    "google",
+    "duckduckgo",
+    "wikipedia",
+    "researchgate",
+    "linkedin",
+    "github",
+    "gitlab",
+}
+RELATED_ORG_GENERIC_TOKENS = {
+    "search",
+    "research",
+    "result",
+    "results",
+    "source",
+    "sources",
+    "profile",
+    "profiles",
+    "person",
+    "people",
+    "public",
+    "web",
+}
+RELATED_ORG_DESCRIPTOR_TERMS = {
+    "startup",
+    "stealth startup",
+    "stealth company",
+    "stealth mode",
+    "self-employed",
+    "self employed",
+    "independent",
+    "confidential",
+}
 RELATED_TOPIC_STOPWORDS = {
     "about",
     "company",
@@ -240,6 +427,282 @@ RELATED_TOPIC_SINGLE_TOKEN_STOPWORDS = {
     "topic",
     "topics",
 }
+GRAPH_PERSON_LABEL_HINTS = {
+    "person",
+    "personprofile",
+    "researcher",
+}
+GRAPH_ORG_LABEL_HINTS = {
+    "organization",
+    "organizationprofile",
+    "company",
+    "codeorganization",
+    "domain",
+}
+GRAPH_IDENTITY_LABEL_HINTS = {
+    "person",
+    "personprofile",
+    "organization",
+    "organizationprofile",
+    "company",
+    "domain",
+    "contactpoint",
+    "registryaccount",
+    "directorrole",
+}
+GRAPH_EVIDENCE_LABEL_HINTS = {
+    "article",
+    "document",
+    "archivedpage",
+    "corporatefiling",
+    "timelineevent",
+}
+GRAPH_RELATIONSHIP_TYPES = {
+    "ASSOCIATE_OF",
+    "COAUTHORED_WITH",
+    "COLLABORATED_WITH",
+    "COLLEAGUE_OF",
+    "WORKS_AT",
+    "MEMBER_OF",
+    "AFFILIATED_WITH",
+    "OFFICER_OF",
+    "DIRECTOR_OF",
+    "ADVISED_BY",
+    "MENTORED_BY",
+}
+GRAPH_TIMELINE_RELATION_TYPES = {
+    "APPEARS_IN_ARCHIVE",
+    "FILED",
+    "HAS_TIMELINE_EVENT",
+    "MENTIONS_TIMELINE_EVENT",
+    "PUBLISHED_PACKAGE",
+}
+GRAPH_TOPIC_RELATION_TYPES = {
+    "HAS_TOPIC",
+    "HAS_SKILL_TOPIC",
+    "HAS_HOBBY_TOPIC",
+    "HAS_INTEREST_TOPIC",
+    "RESEARCHES",
+    "FOCUSES_ON",
+}
+GRAPH_TIME_NODE_RELATION_TYPES = {
+    "IN_TIME_NODE",
+    "NEXT_TIME_NODE",
+}
+GRAPH_RELATED_IDENTITY_RELATION_TYPES = {
+    "HAS_ALIAS",
+    "HAS_CONTACT_POINT",
+    "HAS_CONTACT",
+    "HAS_EMAIL",
+    "HAS_PHONE",
+    "HAS_HANDLE",
+    "HAS_PROFILE",
+    "IDENTIFIED_AS",
+    "MAINTAINS",
+}
+GRAPH_TIMELINE_MENTION_RELATION_TYPES = {"MENTIONS_TIMELINE_EVENT"}
+SOCIAL_TIMELINE_TOOL_NAMES = {"x_get_user_posts_api", "linkedin_download_html_ocr"}
+
+_BLUEPRINT_CONTRACT_CACHE: Dict[str, Any] | None = None
+_BLUEPRINT_CONTRACT_LOGGED = False
+
+
+def _default_stage1_blueprint_contract() -> Dict[str, Any]:
+    return {
+        "version": "stage1_graph_blueprint_contract.v1",
+        "topic_model": "unified_topic",
+        "topic_kinds": [
+            "skill",
+            "hobby",
+            "interest",
+            "research",
+            "industry",
+            "language",
+            "domain",
+            "community",
+        ],
+        "required_slots_balanced": [
+            "primary_anchor_node",
+            "identity_surface",
+            "related_identity_surface",
+            "relationship_surface",
+            "timeline_surface",
+            "timeline_mention_surface",
+            "time_node_surface",
+            "topic_surface",
+            "evidence_surface",
+        ],
+        "optional_slots": [
+            "claim_risk_surface",
+            "education_full_fanout",
+            "employment_full_fanout",
+            "publication_full_fanout",
+            "related_person_profile_depth",
+        ],
+        "entity_types": [
+            "Person",
+            "Organization",
+            "Institution",
+            "ContactPoint",
+            "Website",
+            "Domain",
+            "Email",
+            "Phone",
+            "Handle",
+            "Experience",
+            "EducationalCredential",
+            "Affiliation",
+            "Role",
+            "Publication",
+            "Document",
+            "Conference",
+            "Repository",
+            "Project",
+            "Topic",
+            "TimelineEvent",
+            "TimeNode",
+            "Occupation",
+            "OrganizationProfile",
+            "ImageObject",
+        ],
+        "relation_types": [
+            "HAS_PROFILE",
+            "HAS_DOCUMENT",
+            "HAS_HANDLE",
+            "HAS_EMAIL",
+            "HAS_PHONE",
+            "HAS_CONTACT_POINT",
+            "HAS_DOMAIN",
+            "HAS_CREDENTIAL",
+            "HAS_EXPERIENCE",
+            "HAS_AFFILIATION",
+            "HAS_TIMELINE_EVENT",
+            "HAS_OCCUPATION",
+            "HAS_IMAGE",
+            "HAS_ORGANIZATION_PROFILE",
+            "HAS_ROLE",
+            "HOLDS_ROLE",
+            "WORKS_AT",
+            "STUDIED_AT",
+            "AFFILIATED_WITH",
+            "MEMBER_OF",
+            "ISSUED_BY",
+            "OFFICER_OF",
+            "DIRECTOR_OF",
+            "FOUNDED",
+            "COAUTHORED_WITH",
+            "ADVISED_BY",
+            "COLLEAGUE_OF",
+            "COLLABORATED_WITH",
+            "PUBLISHED",
+            "PUBLISHED_IN",
+            "MAINTAINS",
+            "USES_LANGUAGE",
+            "KNOWS_LANGUAGE",
+            "RESEARCHES",
+            "FOCUSES_ON",
+            "HAS_TOPIC",
+            "HAS_SKILL_TOPIC",
+            "HAS_HOBBY_TOPIC",
+            "HAS_INTEREST_TOPIC",
+            "MENTIONS_TIMELINE_EVENT",
+            "IN_TIME_NODE",
+            "NEXT_TIME_NODE",
+            "ABOUT",
+            "FILED",
+            "APPEARS_IN_ARCHIVE",
+            "MENTIONS",
+            "RELATED_TO",
+        ],
+    }
+
+
+def _coerce_string_list(value: Any, fallback: List[str]) -> List[str]:
+    if not isinstance(value, list):
+        return list(fallback)
+    items = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+    return items if items else list(fallback)
+
+
+def _normalize_stage1_blueprint_contract(raw: Any) -> Dict[str, Any]:
+    default = _default_stage1_blueprint_contract()
+    if not isinstance(raw, dict):
+        return default
+    normalized = dict(default)
+    normalized["version"] = str(raw.get("version") or default["version"]).strip() or default["version"]
+    topic_model = str(raw.get("topic_model") or default["topic_model"]).strip() or default["topic_model"]
+    normalized["topic_model"] = topic_model if topic_model == "unified_topic" else default["topic_model"]
+    for key in (
+        "topic_kinds",
+        "required_slots_balanced",
+        "optional_slots",
+        "entity_types",
+        "relation_types",
+    ):
+        normalized[key] = _coerce_string_list(raw.get(key), default[key])
+    return normalized
+
+
+def _load_stage1_blueprint_contract() -> Dict[str, Any]:
+    global _BLUEPRINT_CONTRACT_CACHE
+    global _BLUEPRINT_CONTRACT_LOGGED
+    if _BLUEPRINT_CONTRACT_CACHE is not None:
+        return _BLUEPRINT_CONTRACT_CACHE
+
+    contract = _default_stage1_blueprint_contract()
+    status = "default"
+    source = "builtin_default"
+    error = ""
+    path = STAGE1_BLUEPRINT_CONTRACT_PATH
+
+    if STAGE1_BLUEPRINT_ENABLED:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            contract = _normalize_stage1_blueprint_contract(raw)
+            status = "loaded"
+            source = "file"
+        except Exception as exc:
+            status = "fallback_default"
+            source = "builtin_default"
+            error = str(exc)
+    else:
+        status = "disabled"
+        source = "disabled"
+
+    contract["_status"] = {
+        "enabled": STAGE1_BLUEPRINT_ENABLED,
+        "status": status,
+        "source": source,
+        "path": path,
+        "error": error,
+        "enforcement": STAGE1_BLUEPRINT_ENFORCEMENT,
+    }
+    _BLUEPRINT_CONTRACT_CACHE = contract
+
+    if not _BLUEPRINT_CONTRACT_LOGGED:
+        if error:
+            logger.warning(
+                "Stage1 blueprint contract fallback engaged",
+                extra={
+                    "status": status,
+                    "path": path,
+                    "enforcement": STAGE1_BLUEPRINT_ENFORCEMENT,
+                    "error": error,
+                },
+            )
+        else:
+            logger.info(
+                "Stage1 blueprint contract initialized",
+                extra={
+                    "status": status,
+                    "path": path,
+                    "enforcement": STAGE1_BLUEPRINT_ENFORCEMENT,
+                    "version": contract.get("version"),
+                },
+            )
+        _BLUEPRINT_CONTRACT_LOGGED = True
+    return contract
 
 
 class ToolPlanItem(BaseModel):
@@ -278,6 +741,9 @@ class PlannerState(TypedDict):
     relationship_task_dedupe: Dict[str, int]
     depth_task_dedupe: Dict[str, int]
     coverage_ledger: Dict[str, bool]
+    evidence_quality_ok: bool
+    evidence_quality_stats: Dict[str, int]
+    graph_state_snapshot: Dict[str, Any]
 
 
 @dataclass
@@ -291,6 +757,9 @@ class PlannerResult:
     noteboard: List[str]
     next_stage: str
     coverage_ledger: Dict[str, bool]
+    evidence_quality_ok: bool
+    evidence_quality_stats: Dict[str, int]
+    graph_state_snapshot: Dict[str, Any]
 
 
 def build_planner_graph(
@@ -329,6 +798,9 @@ def build_planner_graph(
             "relationship_task_dedupe": {},
             "depth_task_dedupe": {},
             "coverage_ledger": empty_coverage_ledger(),
+            "evidence_quality_ok": False,
+            "evidence_quality_stats": {"source_urls": 0, "source_domains": 0, "object_refs": 0},
+            "graph_state_snapshot": _empty_graph_state_snapshot(),
         }
 
     def plan_tools(state: PlannerState) -> PlannerState:
@@ -347,6 +819,11 @@ def build_planner_graph(
         person_targets = _extract_person_targets_from_state(state)
         primary_person_targets = _extract_primary_person_targets(state)
         related_person_targets = [item for item in person_targets if item not in set(primary_person_targets)]
+        graph_state_snapshot = _normalize_graph_state_snapshot(
+            state.get("graph_state_snapshot", {})
+        )
+        if _graph_snapshot_needs_refresh_for_plan(graph_state_snapshot):
+            graph_state_snapshot = _derive_graph_state_snapshot(mcp_client, state)
 
         tool_catalog = [
             # ————————————————————————————————
@@ -355,12 +832,28 @@ def build_planner_graph(
             # ————————————————————————————————
 
             {
-                "name": "fetch_url",
-                "description": "Utility: fetch URL & return raw HTTP response.",
-                "type": "utility",
-                "confidence": 0.9,
-                "category": ["http", "fetch"],
-                "args": {"runId": "uuid", "url": "string"},
+                "name": "extract_webpage",
+                "description": "Core: extract webpage text via Tavily with advanced depth, plain-text output, and chunked relevance filtering.",
+                "type": "web_extract",
+                "confidence": 0.88,
+                "category": ["tavily", "extract", "web"],
+                "args": {"runId": "uuid", "url": "string", "query": "string", "chunks_per_source": "int"},
+            },
+            {
+                "name": "crawl_webpage",
+                "description": "Core: crawl a site via Tavily to collect multiple relevant in-scope pages before lower-level fallbacks.",
+                "type": "web_crawl",
+                "confidence": 0.82,
+                "category": ["tavily", "crawl", "web"],
+                "args": {"runId": "uuid", "url": "string", "instructions": "string", "format": "string"},
+            },
+            {
+                "name": "map_webpage",
+                "description": "Core: map a site via Tavily to discover relevant in-scope URLs before targeted extraction.",
+                "type": "web_map",
+                "confidence": 0.8,
+                "category": ["tavily", "map", "web"],
+                "args": {"runId": "uuid", "url": "string", "instructions": "string"},
             },
             {
                 "name": "osint_maigret_username",
@@ -820,6 +1313,7 @@ def build_planner_graph(
                     state.get("noteboard_sections", {}),
                     state.get("rationale", ""),
                     state.get("queued_tasks", []),
+                    graph_state_snapshot,
                 )
                 result = llm.plan_tools(
                     prompt,
@@ -844,6 +1338,19 @@ def build_planner_graph(
                 rationale = "LLM planning failed, using heuristic URL extraction."
 
         current_fetch_urls = _select_fetch_batch(pending_urls, visited_urls)
+        extract_focus_target = ""
+        if primary_person_targets:
+            extract_focus_target = primary_person_targets[0]
+        else:
+            raw_inputs = state.get("inputs", [])
+            if isinstance(raw_inputs, list):
+                for item in raw_inputs:
+                    if isinstance(item, str) and item.strip():
+                        extract_focus_target = item.strip()
+                        break
+        if not extract_focus_target:
+            extract_focus_target = str(state.get("prompt") or "").strip()
+        extract_focus_query = _tavily_extract_query(extract_focus_target)
 
         plan: List[ToolPlanItem] = list(llm_plan)
         queued_tasks = list(state.get("queued_tasks", []))
@@ -868,15 +1375,22 @@ def build_planner_graph(
                 remaining_queued_tasks.append(task)
         if current_fetch_urls:
             rationale = rationale or (
-                f"Fetching {len(current_fetch_urls)} page(s) from the crawl frontier and following internal links within scope."
+                f"Extracting {len(current_fetch_urls)} in-scope page(s) from the crawl frontier with Tavily before lower-level fetch fallbacks."
             )
 
         for url in current_fetch_urls:
             plan.append(
                 ToolPlanItem(
-                    tool="fetch_url",
-                    arguments={"runId": state["run_id"], "url": url},
-                    rationale=f"Fetch URL from crawl frontier for evidence collection: {url}",
+                    tool="extract_webpage",
+                    arguments={
+                        "runId": state["run_id"],
+                        "url": url,
+                        "query": extract_focus_query,
+                        "chunks_per_source": 5,
+                        "extract_depth": "advanced",
+                        "format": "text",
+                    },
+                    rationale=f"Extract in-scope page text via Tavily for evidence collection: {url}",
                 )
             )
             plan.append(
@@ -915,7 +1429,11 @@ def build_planner_graph(
                             rationale=f"Core baseline: profile username metadata with Maigret: {username}",
                         )
                     )
-                if not _receipt_has_value(state, "x_get_user_posts_api", {"username": username}):
+                if _should_schedule_social_timeline_tool(
+                    state,
+                    "x_get_user_posts_api",
+                    {"runId": state["run_id"], "username": username, "max_results": 10},
+                ):
                     plan.append(
                         ToolPlanItem(
                             tool="x_get_user_posts_api",
@@ -941,7 +1459,11 @@ def build_planner_graph(
                     )
 
             for profile in linkedin_profiles:
-                if not _receipt_has_value(state, "linkedin_download_html_ocr", {"profile": profile}):
+                if _should_schedule_social_timeline_tool(
+                    state,
+                    "linkedin_download_html_ocr",
+                    {"runId": state["run_id"], "profile": profile},
+                ):
                     plan.append(
                         ToolPlanItem(
                             tool="linkedin_download_html_ocr",
@@ -1002,6 +1524,19 @@ def build_planner_graph(
                                 "max_results": 5,
                             },
                             rationale=f"Use Tavily search to discover GitHub account/profile evidence before repo-native GitHub resolution for: {target_name}",
+                        )
+                    )
+                scholar_query = _google_scholar_profile_query(target_name)
+                if not _receipt_has_argument_signature(
+                    state,
+                    "google_serp_person_search",
+                    {"target_name": scholar_query, "max_results": 10},
+                ):
+                    plan.append(
+                        ToolPlanItem(
+                            tool="google_serp_person_search",
+                            arguments={"runId": state["run_id"], "target_name": scholar_query, "max_results": 10},
+                            rationale=f"Search Google Scholar profile candidates via SERP for: {target_name}",
                         )
                     )
                 if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
@@ -1103,6 +1638,19 @@ def build_planner_graph(
                                 "max_results": 5,
                             },
                             rationale=f"Discover GitHub account/profile evidence for related person before repo-native GitHub resolution: {target_name}",
+                        )
+                    )
+                scholar_query = _google_scholar_profile_query(target_name)
+                if not _receipt_has_argument_signature(
+                    state,
+                    "google_serp_person_search",
+                    {"target_name": scholar_query, "max_results": 8},
+                ):
+                    plan.append(
+                        ToolPlanItem(
+                            tool="google_serp_person_search",
+                            arguments={"runId": state["run_id"], "target_name": scholar_query, "max_results": 8},
+                            rationale=f"Search Google Scholar profile candidates for related person: {target_name}",
                         )
                     )
                 if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
@@ -1236,7 +1784,11 @@ def build_planner_graph(
                             rationale=f"Expand social/profile coverage for discovered username pivot: {username}",
                         )
                     )
-                if not _receipt_has_value(state, "x_get_user_posts_api", {"username": username}):
+                if _should_schedule_social_timeline_tool(
+                    state,
+                    "x_get_user_posts_api",
+                    {"runId": state["run_id"], "username": username, "max_results": 10},
+                ):
                     plan.append(
                         ToolPlanItem(
                             tool="x_get_user_posts_api",
@@ -1262,7 +1814,11 @@ def build_planner_graph(
                     )
 
             for profile in linkedin_profiles[:6]:
-                if not _receipt_has_value(state, "linkedin_download_html_ocr", {"profile": profile}):
+                if _should_schedule_social_timeline_tool(
+                    state,
+                    "linkedin_download_html_ocr",
+                    {"runId": state["run_id"], "profile": profile},
+                ):
                     plan.append(
                         ToolPlanItem(
                             tool="linkedin_download_html_ocr",
@@ -1273,7 +1829,10 @@ def build_planner_graph(
 
         plan = _dedupe_tool_plan(plan)
         plan = _filter_completed_tool_plan(state, plan)
-        plan = _prioritize_tool_plan(state, plan)
+        plan = _prioritize_tool_plan(
+            {**state, "graph_state_snapshot": graph_state_snapshot},
+            plan,
+        )
         uncapped_count = len(plan)
         if len(plan) > STAGE1_MAX_TOOLS_PER_ITERATION:
             plan = plan[:STAGE1_MAX_TOOLS_PER_ITERATION]
@@ -1298,6 +1857,7 @@ def build_planner_graph(
             "rationale": rationale,
             "enough_info": enough_info,
             "queued_tasks": remaining_queued_tasks,
+            "graph_state_snapshot": graph_state_snapshot,
         }
 
     def explain_plan(state: PlannerState) -> PlannerState:
@@ -1405,7 +1965,7 @@ def build_planner_graph(
             note = _format_receipt_note(receipt)
             if note:
                 _append_noteboard_item(noteboard_sections, "evidence", note)
-            if receipt.tool_name == "fetch_url":
+            if receipt.tool_name in {"fetch_url", "extract_webpage", "crawl_webpage", "map_webpage"}:
                 source_url = _extract_fetch_receipt_url(receipt)
                 if source_url:
                     visited_urls.append(source_url)
@@ -1416,6 +1976,28 @@ def build_planner_graph(
                 discovered = _normalize_crawl_url(hint)
                 if discovered:
                     discovered_urls.append(discovered)
+
+        social_retry_status = _social_timeline_retry_status({**state, "tool_receipts": all_receipts})
+        for tool_name in sorted(SOCIAL_TIMELINE_TOOL_NAMES):
+            tool_status = social_retry_status.get(tool_name)
+            if not isinstance(tool_status, dict):
+                continue
+            failures = int(tool_status.get("failures", 0) or 0)
+            exhausted = bool(tool_status.get("exhausted", False))
+            if failures <= 0:
+                continue
+            if exhausted:
+                _append_noteboard_item(
+                    noteboard_sections,
+                    "gaps",
+                    f"{tool_name} failed {failures} time(s); retry cap reached ({STAGE1_SOCIAL_TIMELINE_MAX_FAILURES}), planner will stop re-queuing this pivot.",
+                )
+            else:
+                _append_noteboard_item(
+                    noteboard_sections,
+                    "gaps",
+                    f"{tool_name} failure observed ({failures}/{STAGE1_SOCIAL_TIMELINE_MAX_FAILURES}); planner may retry with remaining budget.",
+                )
 
         visited_urls = _dedupe(visited_urls + current_fetch_urls)
         filtered_discovered_urls = _filter_discovered_urls(
@@ -1428,10 +2010,21 @@ def build_planner_graph(
             _append_noteboard_item(
                 noteboard_sections,
                 "frontier",
-                f"Discovered {len(filtered_discovered_urls)} in-scope internal URL(s) for follow-up fetch."
+                f"Discovered {len(filtered_discovered_urls)} in-scope internal URL(s) for follow-up extraction."
             )
 
         primary_person_targets = _extract_primary_person_targets(state)
+        if not primary_person_targets:
+            primary_person_targets = _extract_person_targets_from_state(state)
+        extract_target = ""
+        raw_inputs = state.get("inputs", [])
+        if isinstance(raw_inputs, list):
+            for item in raw_inputs:
+                if isinstance(item, str) and item.strip():
+                    extract_target = item.strip()
+                    break
+        if not extract_target:
+            extract_target = str(state.get("prompt") or "").strip()
         entity_resolution_follow_up_tasks, archive_identity_task_dedupe, entity_resolution_notes = _derive_entity_resolution_follow_up_tasks(
             run_id=state["run_id"],
             receipts=all_receipts,
@@ -1624,6 +2217,7 @@ def build_planner_graph(
             run_id=state["run_id"],
             receipts=all_receipts,
             primary_person_targets=primary_person_targets,
+            extract_target=extract_target,
             iteration=state.get("iteration", 0),
             dedupe_store=archive_identity_task_dedupe,
         )
@@ -1679,6 +2273,35 @@ def build_planner_graph(
             )
         _extend_noteboard_items(noteboard_sections, "depth_candidates", depth_notes)
 
+        graph_state_snapshot = _derive_graph_state_snapshot(
+            mcp_client,
+            {
+                **state,
+                "tool_receipts": all_receipts,
+                "noteboard": _flatten_noteboard_sections(noteboard_sections),
+                "noteboard_sections": noteboard_sections,
+                "coverage_ledger": state.get("coverage_ledger", empty_coverage_ledger()),
+            },
+        )
+        _extend_noteboard_items(
+            noteboard_sections,
+            "graph_judgment",
+            _graph_snapshot_note_lines(graph_state_snapshot),
+        )
+        emit_run_event(
+            state["run_id"],
+            "GRAPH_SNAPSHOT_UPDATED",
+            {
+                "status": graph_state_snapshot.get("status"),
+                "blueprint_contract_status": graph_state_snapshot.get("blueprint_contract_status"),
+                "blueprint_contract_version": graph_state_snapshot.get("blueprint_contract_version"),
+                "blueprint_enforcement": graph_state_snapshot.get("blueprint_enforcement"),
+                "profile_focus": graph_state_snapshot.get("profile_focus"),
+                "resolved_entity_count": len(graph_state_snapshot.get("resolved_entity_ids", [])),
+                "missing_slots": graph_state_snapshot.get("missing_slots", []),
+            },
+        )
+
         noteboard_sections = _trim_noteboard_sections(noteboard_sections)
         noteboard = _flatten_noteboard_sections(noteboard_sections)
         coverage_ledger = _derive_coverage_ledger(
@@ -1716,13 +2339,19 @@ def build_planner_graph(
             "relationship_task_dedupe": relationship_task_dedupe,
             "depth_task_dedupe": depth_task_dedupe,
             "coverage_ledger": coverage_ledger,
+            "graph_state_snapshot": graph_state_snapshot,
         }
 
     def decide_stop_or_refine(state: PlannerState) -> PlannerState:
         iteration = state.get("iteration", 0) + 1
         coverage_ledger = _derive_coverage_ledger(state)
         coverage_ok = coverage_led_stop_condition(coverage_ledger)
+        evidence_quality_ok, evidence_quality_note, evidence_quality_stats = _evidence_quality_stop_condition(state)
         depth_ok = _planner_has_sufficient_related_entity_depth(state)
+        graph_state_snapshot = _normalize_graph_state_snapshot(
+            state.get("graph_state_snapshot", {})
+        )
+        graph_ok, graph_note = _graph_stop_gate(state, graph_state_snapshot)
         has_pending_follow_up = bool(state.get("queued_tasks", []))
         noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
         scorecard = _format_coverage_scorecard(coverage_ledger)
@@ -1735,6 +2364,10 @@ def build_planner_graph(
             coverage_ok = False
             if hard_anchor_note:
                 _append_noteboard_item(noteboard_sections, "gaps", hard_anchor_note)
+        if not graph_ok and graph_note:
+            _append_noteboard_item(noteboard_sections, "gaps", graph_note)
+        if not evidence_quality_ok and evidence_quality_note:
+            _append_noteboard_item(noteboard_sections, "gaps", evidence_quality_note)
 
         min_iterations_reached = iteration >= min(
             state.get("max_iterations", 1),
@@ -1745,11 +2378,16 @@ def build_planner_graph(
             or (
                 min_iterations_reached
                 and ((not state.get("tool_plan")) and not has_pending_follow_up)
+                and coverage_ok
+                and evidence_quality_ok
+                and graph_ok
             )
             or (
                 min_iterations_reached
                 and coverage_ok
+                and evidence_quality_ok
                 and depth_ok
+                and graph_ok
                 and not has_pending_follow_up
             )
         )
@@ -1772,6 +2410,9 @@ def build_planner_graph(
             "noteboard": noteboard,
             "noteboard_sections": noteboard_sections,
             "coverage_ledger": coverage_ledger,
+            "evidence_quality_ok": evidence_quality_ok,
+            "evidence_quality_stats": evidence_quality_stats,
+            "graph_state_snapshot": graph_state_snapshot,
         }
 
     def should_continue(state: PlannerState) -> str:
@@ -1849,6 +2490,9 @@ def run_planner(
             "relationship_task_dedupe": {},
             "depth_task_dedupe": {},
             "coverage_ledger": empty_coverage_ledger(),
+            "evidence_quality_ok": False,
+            "evidence_quality_stats": {"source_urls": 0, "source_domains": 0, "object_refs": 0},
+            "graph_state_snapshot": _empty_graph_state_snapshot(),
         }
 
         final_state = graph.compile().invoke(state)
@@ -1864,6 +2508,11 @@ def run_planner(
             noteboard=final_state.get("noteboard", []),
             next_stage=final_state.get("next_stage", "stage1"),
             coverage_ledger=final_state.get("coverage_ledger", empty_coverage_ledger()),
+            evidence_quality_ok=bool(final_state.get("evidence_quality_ok", False)),
+            evidence_quality_stats=final_state.get("evidence_quality_stats", {"source_urls": 0, "source_domains": 0, "object_refs": 0}),
+            graph_state_snapshot=_normalize_graph_state_snapshot(
+                final_state.get("graph_state_snapshot", {})
+            ),
         )
     finally:
         mcp_client.close()
@@ -1888,8 +2537,54 @@ def _extract_domains(text: str) -> List[str]:
     return DOMAIN_REGEX.findall(text or "")
 
 
+def _is_likely_username(value: str) -> bool:
+    candidate = str(value or "").strip().lstrip("@")
+    if len(candidate) < 3 or len(candidate) > 63:
+        return False
+    lowered = candidate.casefold()
+    if lowered in USERNAME_URL_RESERVED_SEGMENTS:
+        return False
+    if lowered.startswith(("-", ".")) or lowered.endswith(("-", ".")):
+        return False
+    if lowered.count("..") or lowered.count("--"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{1,61}[A-Za-z0-9])?", candidate))
+
+
+def _extract_username_from_profile_url(url: str) -> str | None:
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host not in USERNAME_URL_PROFILE_HOSTS:
+        return None
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        return None
+
+    candidate = ""
+    if host == "reddit.com":
+        if len(path_parts) >= 2 and path_parts[0].casefold() == "user":
+            candidate = path_parts[1]
+    else:
+        candidate = path_parts[0]
+
+    normalized = candidate.strip().lstrip("@")
+    if not _is_likely_username(normalized):
+        return None
+    return normalized
+
+
 def _extract_usernames(text: str) -> List[str]:
-    return USERNAME_REGEX.findall(text or "")
+    candidates: List[str] = []
+    for item in USERNAME_REGEX.findall(text or ""):
+        if _is_likely_username(item):
+            candidates.append(item)
+    for url in _extract_urls(text):
+        from_url = _extract_username_from_profile_url(url)
+        if from_url:
+            candidates.append(from_url)
+    return _dedupe(candidates)
 
 
 def _extract_phone_numbers(text: str) -> List[str]:
@@ -1907,6 +2602,23 @@ def _tavily_github_query(target: str) -> str:
     if not normalized:
         return "Find the public GitHub profile or account for this target."
     return f"Find the public GitHub profile, account, or repositories associated with {normalized}.".strip()
+
+
+def _tavily_extract_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return "Extract the sections of this page that contain the strongest identity, biography, affiliation, relationship, contact, and timeline evidence."
+    return (
+        f"Extract the sections of this page most relevant to {normalized}, especially identity, biography, affiliation, "
+        "relationship, contact, and timeline evidence."
+    )
+
+
+def _google_scholar_profile_query(target: str) -> str:
+    normalized = " ".join(str(target or "").split()).strip()
+    if not normalized:
+        return "site:scholar.google.com/citations"
+    return f'site:scholar.google.com/citations "{normalized}"'
 
 
 def _looks_like_dateish_phone_candidate(value: str) -> bool:
@@ -2078,7 +2790,13 @@ def _extract_related_person_targets_from_receipts(state: PlannerState) -> List[s
             for key, value in fact.items():
                 if key not in interesting_keys:
                     continue
-                candidates.extend(_extract_person_targets_from_mixed_value(value))
+                candidates.extend(
+                    _extract_person_targets_from_mixed_value(
+                        value,
+                        source_key=key,
+                        source_tool=receipt.tool_name,
+                    )
+                )
     return _dedupe(candidates)
 
 
@@ -2159,7 +2877,22 @@ def _normalize_related_org_name(value: str) -> str | None:
     if len(candidate) < 3:
         return None
     lowered = candidate.casefold()
+    if lowered in RELATED_ORG_DESCRIPTOR_TERMS:
+        return None
     if lowered in PERSON_CANDIDATE_STOPWORDS:
+        return None
+    tokens = [token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z'-]*", candidate)]
+    if not tokens:
+        return None
+    if (
+        tokens[0] in RELATED_ORG_PROVIDER_BLOCKLIST
+        and len(tokens) <= 2
+        and (len(tokens) == 1 or tokens[1] in {"research", "search", "person", "results", "sources", "profile"})
+    ):
+        return None
+    if lowered in {"tavily research", "tavily person search", "google serp person search"}:
+        return None
+    if tokens and all(token in RELATED_ORG_GENERIC_TOKENS for token in tokens):
         return None
     org_markers = (
         "university",
@@ -2242,6 +2975,16 @@ def _extract_topic_targets_from_mixed_value(value: Any) -> List[str]:
             "subject",
             "subjects",
             "skills",
+            "skill_set",
+            "technical_skills",
+            "technicalSkills",
+            "hobbies",
+            "hobby",
+            "interests",
+            "interest",
+            "personal_interests",
+            "personalInterests",
+            "extracurriculars",
             "methods_keywords",
             "abstract_keywords",
             "categories",
@@ -2316,7 +3059,13 @@ def _rank_related_entity_candidates(
         "research_areas": "RESEARCHES",
         "focus": "FOCUSES_ON",
         "industry": "FOCUSES_ON",
-        "skills": "HAS_TOPIC",
+        "skills": "HAS_SKILL_TOPIC",
+        "skill_set": "HAS_SKILL_TOPIC",
+        "technical_skills": "HAS_SKILL_TOPIC",
+        "hobbies": "HAS_HOBBY_TOPIC",
+        "interests": "HAS_INTEREST_TOPIC",
+        "personal_interests": "HAS_INTEREST_TOPIC",
+        "extracurriculars": "HAS_INTEREST_TOPIC",
         "publications": "HAS_TOPIC",
         "papers": "HAS_TOPIC",
         "records": "HAS_TOPIC",
@@ -2362,7 +3111,11 @@ def _rank_related_entity_candidates(
                 values = fact.get(key)
                 items = values if isinstance(values, list) else [values]
                 for item in items:
-                    for name in _extract_person_targets_from_mixed_value(item):
+                    for name in _extract_person_targets_from_mixed_value(
+                        item,
+                        source_key=key,
+                        source_tool=receipt.tool_name,
+                    ):
                         if name.casefold() in primary_people:
                             continue
                         _register_candidate(
@@ -2401,7 +3154,7 @@ def _rank_related_entity_candidates(
                             rel_type=rel_type,
                             receipt=receipt,
                             value=item,
-                            score=2 if key in {"topics", "research_interests", "field_keywords", "research_areas", "publications", "papers", "candidates"} else 1,
+                            score=2 if key in {"topics", "research_interests", "field_keywords", "research_areas", "skills", "skill_set", "technical_skills", "publications", "papers", "candidates"} else 1,
                         )
             for url in _fact_urls(fact):
                 domain = _domain_from_url(url)
@@ -2436,13 +3189,62 @@ def _rank_related_entity_candidates(
     return limited
 
 
-def _extract_person_targets_from_mixed_value(value: Any) -> List[str]:
+def _is_related_person_candidate(
+    value: str,
+    *,
+    source_key: str,
+    source_tool: str,
+) -> bool:
+    candidate = " ".join(str(value or "").strip().split()).strip(" -,:;|")
+    if len(candidate) < 3:
+        return False
+    tokens = [token.casefold() for token in candidate.split() if token]
+    if len(tokens) < 2 or len(tokens) > 4:
+        return False
+    if any(token in RELATED_PERSON_REJECT_TOKENS for token in tokens):
+        return False
+    if any(token in RELATED_ORG_PROVIDER_BLOCKLIST for token in tokens):
+        return False
+    if not all(re.fullmatch(r"[A-Za-z][A-Za-z'-]*", token) for token in candidate.split()):
+        return False
+    if source_key in {"relatedPeople", "authors", "coauthors"} and source_tool in {
+        "tavily_research",
+        "tavily_person_search",
+        "google_serp_person_search",
+        "person_search",
+    }:
+        joined = " ".join(tokens)
+        if any(phrase in joined for phrase in ("source types", "public web", "search results")):
+            return False
+        if source_key == "relatedPeople":
+            if any(phrase in joined for phrase in RELATED_PERSON_NOISY_PHRASE_HINTS):
+                return False
+            noisy_hits = sum(1 for token in tokens if token in RELATED_PERSON_NOISY_CONTEXT_TOKENS)
+            if noisy_hits >= 2:
+                return False
+    return True
+
+
+def _extract_person_targets_from_mixed_value(
+    value: Any,
+    *,
+    source_key: str = "",
+    source_tool: str = "",
+) -> List[str]:
     candidates: List[str] = []
     if isinstance(value, str):
-        candidates.extend(extract_person_targets(value))
+        for name in extract_person_targets(value):
+            if _is_related_person_candidate(name, source_key=source_key, source_tool=source_tool):
+                candidates.append(name)
     elif isinstance(value, list):
         for item in value:
-            candidates.extend(_extract_person_targets_from_mixed_value(item))
+            candidates.extend(
+                _extract_person_targets_from_mixed_value(
+                    item,
+                    source_key=source_key,
+                    source_tool=source_tool,
+                )
+            )
     elif isinstance(value, dict):
         for key in (
             "name",
@@ -2457,7 +3259,9 @@ def _extract_person_targets_from_mixed_value(value: Any) -> List[str]:
         ):
             item = value.get(key)
             if isinstance(item, str):
-                candidates.extend(extract_person_targets(item))
+                for name in extract_person_targets(item):
+                    if _is_related_person_candidate(name, source_key=source_key or key, source_tool=source_tool):
+                        candidates.append(name)
     return _dedupe(candidates)
 
 
@@ -2537,6 +3341,64 @@ def _receipt_has_argument_signature(state: PlannerState, tool_name: str, expecte
         ):
             return True
     return False
+
+
+def _matching_tool_receipts(
+    state: PlannerState,
+    tool_name: str,
+    expected: Dict[str, Any],
+) -> List[ToolReceipt]:
+    if not expected:
+        return [receipt for receipt in state.get("tool_receipts", []) if receipt.tool_name == tool_name]
+    expected_signature = tool_argument_signature(tool_name, expected)
+    expected_semantic = _tool_plan_dedupe_key(tool_name, expected)
+    matches: List[ToolReceipt] = []
+    for receipt in state.get("tool_receipts", []):
+        if receipt.tool_name != tool_name:
+            continue
+        receipt_args = receipt.arguments if isinstance(receipt.arguments, dict) else {}
+        if receipt.argument_signature and receipt.argument_signature == expected_signature:
+            matches.append(receipt)
+            continue
+        if receipt_args and tool_argument_signature(tool_name, receipt_args) == expected_signature:
+            matches.append(receipt)
+            continue
+        if receipt_args and _tool_plan_dedupe_key(tool_name, receipt_args) == expected_semantic:
+            matches.append(receipt)
+    return matches
+
+
+def _should_schedule_social_timeline_tool(
+    state: PlannerState,
+    tool_name: str,
+    arguments: Dict[str, Any],
+) -> bool:
+    matches = _matching_tool_receipts(state, tool_name, arguments)
+    if any(receipt.ok for receipt in matches):
+        return False
+    failed_attempts = sum(1 for receipt in matches if not receipt.ok)
+    return failed_attempts < STAGE1_SOCIAL_TIMELINE_MAX_FAILURES
+
+
+def _social_timeline_retry_status(state: PlannerState) -> Dict[str, Any]:
+    status: Dict[str, Any] = {
+        "max_failures": STAGE1_SOCIAL_TIMELINE_MAX_FAILURES,
+        "all_exhausted": False,
+    }
+    exhausted_flags: List[bool] = []
+    for tool_name in sorted(SOCIAL_TIMELINE_TOOL_NAMES):
+        receipts = [receipt for receipt in state.get("tool_receipts", []) if receipt.tool_name == tool_name]
+        success = any(receipt.ok for receipt in receipts)
+        failures = sum(1 for receipt in receipts if not receipt.ok)
+        exhausted = (not success) and failures >= STAGE1_SOCIAL_TIMELINE_MAX_FAILURES
+        status[tool_name] = {
+            "success": success,
+            "failures": failures,
+            "exhausted": exhausted,
+        }
+        exhausted_flags.append(exhausted)
+    status["all_exhausted"] = bool(exhausted_flags) and all(exhausted_flags)
+    return status
 
 
 def _planner_has_minimum_person_coverage(state: PlannerState) -> bool:
@@ -2753,6 +3615,65 @@ def _derive_coverage_ledger(state: PlannerState) -> Dict[str, bool]:
     return ledger
 
 
+def _evidence_quality_stop_condition(state: PlannerState) -> tuple[bool, str, Dict[str, int]]:
+    receipts = [receipt for receipt in state.get("tool_receipts", []) if receipt.ok]
+    source_urls: set[str] = set()
+    source_domains: set[str] = set()
+    object_ref_like_count = 0
+
+    for receipt in receipts:
+        for text in [receipt.summary, json.dumps(receipt.arguments, ensure_ascii=False)]:
+            if not isinstance(text, str):
+                continue
+            for url in _extract_urls(text):
+                cleaned = str(url or "").strip()
+                if not cleaned:
+                    continue
+                source_urls.add(cleaned)
+                host = _domain_from_url(cleaned)
+                if host:
+                    source_domains.add(host)
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            serialized = json.dumps(fact, ensure_ascii=False, default=str)
+            for url in _extract_urls(serialized):
+                cleaned = str(url or "").strip()
+                if not cleaned:
+                    continue
+                source_urls.add(cleaned)
+                host = _domain_from_url(cleaned)
+                if host:
+                    source_domains.add(host)
+            object_ref = fact.get("objectRef") if isinstance(fact.get("objectRef"), dict) else None
+            if object_ref and (
+                (object_ref.get("bucket") and object_ref.get("objectKey"))
+                or object_ref.get("documentId")
+            ):
+                object_ref_like_count += 1
+        object_ref_like_count += len([doc for doc in receipt.document_ids if isinstance(doc, str) and doc.strip()])
+
+    ok = (
+        len(source_urls) >= STAGE1_EVIDENCE_MIN_URLS
+        and len(source_domains) >= STAGE1_EVIDENCE_MIN_DOMAINS
+        and object_ref_like_count >= STAGE1_EVIDENCE_MIN_OBJECT_REFS
+    )
+    stats = {
+        "source_urls": len(source_urls),
+        "source_domains": len(source_domains),
+        "object_refs": object_ref_like_count,
+    }
+    if ok:
+        return True, "", stats
+    note = (
+        "Evidence quality gate: need "
+        f"urls>={STAGE1_EVIDENCE_MIN_URLS}, domains>={STAGE1_EVIDENCE_MIN_DOMAINS}, "
+        f"object_refs>={STAGE1_EVIDENCE_MIN_OBJECT_REFS}; "
+        f"observed urls={stats['source_urls']}, domains={stats['source_domains']}, object_refs={stats['object_refs']}."
+    )
+    return False, note, stats
+
+
 def _coverage_gaps_from_ledger(ledger: Dict[str, bool]) -> List[str]:
     label_map = {
         "identity": "identity anchors",
@@ -2783,6 +3704,652 @@ def _format_coverage_scorecard(ledger: Dict[str, bool]) -> str:
     parts = [f"{key}={'yes' if ledger.get(key, False) else 'no'}" for key in ordered_keys]
     satisfied = sum(1 for key in ordered_keys if ledger.get(key, False))
     return f"Coverage scorecard {satisfied}/{len(ordered_keys)}: " + "; ".join(parts)
+
+
+def _empty_graph_state_snapshot() -> Dict[str, Any]:
+    contract = _load_stage1_blueprint_contract()
+    contract_status = contract.get("_status", {}) if isinstance(contract, dict) else {}
+    return {
+        "enabled": STAGE1_ENABLE_GRAPH_CONTEXT,
+        "blueprint_enabled": bool(contract_status.get("enabled", STAGE1_BLUEPRINT_ENABLED)),
+        "blueprint_enforcement": str(contract_status.get("enforcement", STAGE1_BLUEPRINT_ENFORCEMENT)),
+        "blueprint_contract_version": str(contract.get("version", "")),
+        "blueprint_contract_status": str(contract_status.get("status", "default")),
+        "blueprint_contract_path": str(contract_status.get("path", STAGE1_BLUEPRINT_CONTRACT_PATH)),
+        "blueprint_contract_error": str(contract_status.get("error", "")),
+        "blueprint_required_slots": list(contract.get("required_slots_balanced", [])),
+        "generated": False,
+        "status": "uninitialized",
+        "profile_focus": "unknown",
+        "query_signature": "",
+        "query_terms": [],
+        "resolved_entity_ids": [],
+        "node_label_counts": {},
+        "relation_type_counts": {},
+        "coverage_slots": {},
+        "missing_slots": [],
+        "planner_hints": [],
+        "errors": [],
+        "generated_at_iteration": -1,
+    }
+
+
+def _normalize_graph_state_snapshot(raw: Any) -> Dict[str, Any]:
+    snapshot = _empty_graph_state_snapshot()
+    if not isinstance(raw, dict):
+        return snapshot
+    snapshot["enabled"] = bool(raw.get("enabled", snapshot["enabled"]))
+    snapshot["blueprint_enabled"] = bool(raw.get("blueprint_enabled", snapshot["blueprint_enabled"]))
+    snapshot["blueprint_enforcement"] = str(
+        raw.get("blueprint_enforcement", snapshot["blueprint_enforcement"])
+        or snapshot["blueprint_enforcement"]
+    ).strip()
+    snapshot["blueprint_contract_version"] = str(
+        raw.get("blueprint_contract_version", snapshot["blueprint_contract_version"])
+        or snapshot["blueprint_contract_version"]
+    ).strip()
+    snapshot["blueprint_contract_status"] = str(
+        raw.get("blueprint_contract_status", snapshot["blueprint_contract_status"])
+        or snapshot["blueprint_contract_status"]
+    ).strip()
+    snapshot["blueprint_contract_path"] = str(
+        raw.get("blueprint_contract_path", snapshot["blueprint_contract_path"])
+        or snapshot["blueprint_contract_path"]
+    ).strip()
+    snapshot["blueprint_contract_error"] = str(
+        raw.get("blueprint_contract_error", snapshot["blueprint_contract_error"])
+        or snapshot["blueprint_contract_error"]
+    ).strip()
+    snapshot["generated"] = bool(raw.get("generated", snapshot["generated"]))
+    snapshot["status"] = str(raw.get("status", snapshot["status"]) or snapshot["status"]).strip()
+    snapshot["profile_focus"] = str(raw.get("profile_focus", snapshot["profile_focus"]) or snapshot["profile_focus"]).strip()
+    snapshot["query_signature"] = str(raw.get("query_signature", "") or "").strip()
+    for key in ("query_terms", "resolved_entity_ids", "missing_slots", "planner_hints", "errors", "blueprint_required_slots"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            snapshot[key] = [str(item).strip() for item in value if str(item).strip()]
+    for key in ("node_label_counts", "relation_type_counts", "coverage_slots"):
+        value = raw.get(key)
+        if isinstance(value, dict):
+            snapshot[key] = dict(value)
+    try:
+        snapshot["generated_at_iteration"] = int(raw.get("generated_at_iteration", -1))
+    except Exception:
+        snapshot["generated_at_iteration"] = -1
+    return snapshot
+
+
+def _graph_snapshot_needs_refresh_for_plan(snapshot: Dict[str, Any]) -> bool:
+    normalized = _normalize_graph_state_snapshot(snapshot)
+    if not normalized.get("enabled", False):
+        return False
+    if not normalized.get("generated", False):
+        return True
+    status = str(normalized.get("status", "")).strip().lower()
+    return status in {"uninitialized", "stale"}
+
+
+def _pick_list(payload: Any, keys: List[str]) -> List[Any]:
+    if not isinstance(payload, dict):
+        return []
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _pick_dict(payload: Any, keys: List[str]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _pick_str(payload: Any, keys: List[str]) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                return cleaned
+    return None
+
+
+def _graph_error_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload.strip()
+    if isinstance(payload, dict):
+        if isinstance(payload.get("error"), str):
+            return str(payload.get("error")).strip()
+        nested_error = payload.get("error")
+        if isinstance(nested_error, dict):
+            for key in ("message", "detail", "error"):
+                value = nested_error.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        for key in ("message", "detail", "text"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return str(payload)[:200].strip()
+
+
+def _graph_entity_id_from_payload(payload: Dict[str, Any]) -> str:
+    direct = _pick_str(payload, ["entityId", "id"])
+    if direct:
+        return direct
+    props = _pick_dict(payload, ["properties", "props"])
+    return (
+        _pick_str(
+            props,
+            ["node_id", "person_id", "org_id", "location_id", "address", "uri", "domain", "email", "name"],
+        )
+        or ""
+    )
+
+
+def _graph_query_terms_from_state(state: PlannerState) -> List[str]:
+    terms: List[str] = []
+    terms.extend(_extract_primary_person_targets(state))
+    terms.extend(_extract_related_person_targets_from_receipts(state))
+    terms.extend(_extract_related_org_targets_from_receipts(state.get("tool_receipts", [])))
+    terms.extend(_extract_domains_from_state(state))
+    terms.extend(_extract_usernames_from_state(state))
+    return _dedupe([term for term in terms if isinstance(term, str) and len(term.strip()) >= 2])[
+        :STAGE1_GRAPH_SEARCH_QUERY_LIMIT
+    ]
+
+
+def _graph_increment_count(counter: Dict[str, int], key: str) -> None:
+    normalized = key.strip()
+    if not normalized:
+        return
+    counter[normalized] = int(counter.get(normalized, 0)) + 1
+
+
+def _graph_focus_from_state(state: PlannerState, label_counts: Dict[str, int]) -> str:
+    primary_targets = _extract_primary_person_targets(state)
+    if primary_targets:
+        return "person"
+    if _extract_domains_from_state(state):
+        return "organization"
+    if _extract_related_org_targets_from_receipts(state.get("tool_receipts", [])):
+        return "organization"
+    person_score = sum(
+        count for label, count in label_counts.items() if label.strip().casefold() in GRAPH_PERSON_LABEL_HINTS
+    )
+    org_score = sum(
+        count for label, count in label_counts.items() if label.strip().casefold() in GRAPH_ORG_LABEL_HINTS
+    )
+    if person_score > org_score:
+        return "person"
+    if org_score > person_score:
+        return "organization"
+    return "unknown"
+
+
+def _graph_coverage_slots(
+    *,
+    profile_focus: str,
+    label_counts: Dict[str, int],
+    relation_counts: Dict[str, int],
+    resolved_entity_ids: List[str],
+) -> Dict[str, bool]:
+    contract = _load_stage1_blueprint_contract()
+    normalized_labels = {label.strip().casefold() for label in label_counts}
+    relation_keys = {key.strip().upper() for key in relation_counts}
+    has_person_label = bool(normalized_labels & GRAPH_PERSON_LABEL_HINTS)
+    has_org_label = bool(normalized_labels & GRAPH_ORG_LABEL_HINTS)
+    has_identity_label = bool(normalized_labels & GRAPH_IDENTITY_LABEL_HINTS)
+    has_evidence_label = bool(normalized_labels & GRAPH_EVIDENCE_LABEL_HINTS)
+    person_label_count = sum(
+        int(count)
+        for label, count in label_counts.items()
+        if label.strip().casefold() in GRAPH_PERSON_LABEL_HINTS
+    )
+    has_relationship_rel = bool(relation_keys & GRAPH_RELATIONSHIP_TYPES)
+    has_secondary_people = person_label_count >= 2 or has_relationship_rel
+    has_related_identity_rel = bool(
+        relation_keys & GRAPH_RELATED_IDENTITY_RELATION_TYPES
+    )
+    has_timeline_rel = bool(relation_keys & GRAPH_TIMELINE_RELATION_TYPES)
+    has_timeline_mention_rel = bool(relation_keys & GRAPH_TIMELINE_MENTION_RELATION_TYPES)
+    has_time_node_rel = bool(relation_keys & GRAPH_TIME_NODE_RELATION_TYPES)
+    has_topic_rel = bool(relation_keys & GRAPH_TOPIC_RELATION_TYPES)
+    has_timeline_label = any(
+        token in normalized_labels
+        for token in {"timelineevent", "publication", "experience", "credential", "archivedpage", "corporatefiling"}
+    )
+    has_topic_label = "topic" in normalized_labels
+    has_time_node_label = "timenode" in normalized_labels
+
+    if profile_focus == "person":
+        primary_anchor_node = bool(resolved_entity_ids) and has_person_label
+    elif profile_focus == "organization":
+        primary_anchor_node = bool(resolved_entity_ids) and has_org_label
+    else:
+        primary_anchor_node = bool(resolved_entity_ids)
+
+    slots = {
+        "primary_anchor_node": primary_anchor_node,
+        "identity_surface": has_identity_label
+        or bool(relation_keys & {"HAS_PROFILE", "HAS_CONTACT", "HAS_ALIAS", "IDENTIFIED_AS"}),
+        "related_identity_surface": (not has_secondary_people) or has_related_identity_rel,
+        "relationship_surface": has_relationship_rel,
+        "timeline_surface": has_timeline_label or has_timeline_rel,
+        "timeline_mention_surface": has_timeline_mention_rel,
+        "time_node_surface": has_time_node_label or has_time_node_rel,
+        "topic_surface": has_topic_label or has_topic_rel,
+        "evidence_surface": has_evidence_label
+        or bool(relation_keys & {"APPEARS_IN_ARCHIVE", "FILED", "HAS_EVIDENCE"}),
+    }
+    required_slots = [
+        str(item).strip()
+        for item in contract.get("required_slots_balanced", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    for slot in required_slots:
+        slots.setdefault(slot, False)
+    return slots
+
+
+def _graph_missing_slot_label(slot: str) -> str:
+    mapping = {
+        "primary_anchor_node": "primary anchor node",
+        "identity_surface": "identity surface",
+        "related_identity_surface": "related-person identity surface",
+        "relationship_surface": "relationship surface",
+        "timeline_surface": "timeline/history surface",
+        "timeline_mention_surface": "timeline-mention surface",
+        "time_node_surface": "time-node surface",
+        "topic_surface": "topic surface",
+        "evidence_surface": "evidence-linked surface",
+    }
+    return mapping.get(slot, slot.replace("_", " "))
+
+
+def _graph_planner_hints(profile_focus: str, missing_slots: List[str]) -> List[str]:
+    slot_set = {item.strip().lower() for item in missing_slots if item.strip()}
+    hints: List[str] = []
+    if "primary_anchor_node" in slot_set:
+        if profile_focus == "organization":
+            hints.append(
+                "Missing graph slot primary anchor node: prioritize `open_corporates_search`, `domain_whois_search`, `tavily_research`."
+            )
+        else:
+            hints.append(
+                "Missing graph slot primary anchor node: prioritize `tavily_person_search`, `tavily_research`, `person_search`."
+            )
+    if "identity_surface" in slot_set:
+        hints.append(
+            "Missing graph slot identity surface: prioritize `alias_variant_generator`, `github_identity_search`, `institution_directory_search`."
+        )
+    if "related_identity_surface" in slot_set:
+        hints.append(
+            "Missing graph slot related-person identity surface: prioritize `tavily_person_search`, `github_identity_search`, `institution_directory_search`, `personal_site_search` for secondary person nodes."
+        )
+    if "relationship_surface" in slot_set:
+        hints.append(
+            "Missing graph slot relationship surface: prioritize `coauthor_graph_search`, `org_staff_page_search`, `shared_contact_pivot_search`."
+        )
+    if "timeline_surface" in slot_set:
+        hints.append(
+            "Missing graph slot timeline/history surface: prioritize `wayback_fetch_url`, `historical_bio_diff`, `arxiv_search_and_download`."
+        )
+    if "timeline_mention_surface" in slot_set:
+        hints.append(
+            "Missing graph slot timeline-mention surface: prioritize `linkedin_download_html_ocr`, `x_get_user_posts_api`, `tavily_research`."
+        )
+    if "time_node_surface" in slot_set:
+        hints.append(
+            "Missing graph slot time-node surface: prioritize tools with dated events (`linkedin_download_html_ocr`, `x_get_user_posts_api`, `arxiv_search_and_download`, `wayback_fetch_url`)."
+        )
+    if "topic_surface" in slot_set:
+        hints.append(
+            "Missing graph slot topic surface: prioritize `github_identity_search`, `person_search`, `arxiv_search_and_download`, `tavily_research`."
+        )
+    if "evidence_surface" in slot_set:
+        hints.append(
+            "Missing graph slot evidence-linked surface: prioritize `extract_webpage`, `crawl_webpage`, `tavily_research`, `wayback_fetch_url`."
+        )
+    return _dedupe(hints)[:7]
+
+
+def _derive_graph_state_snapshot(
+    mcp_client: McpClientProtocol,
+    state: PlannerState,
+) -> Dict[str, Any]:
+    snapshot = _empty_graph_state_snapshot()
+    contract = _load_stage1_blueprint_contract()
+    contract_status = contract.get("_status", {}) if isinstance(contract, dict) else {}
+    snapshot["enabled"] = STAGE1_ENABLE_GRAPH_CONTEXT
+    snapshot["blueprint_enabled"] = bool(contract_status.get("enabled", STAGE1_BLUEPRINT_ENABLED))
+    snapshot["blueprint_enforcement"] = str(contract_status.get("enforcement", STAGE1_BLUEPRINT_ENFORCEMENT))
+    snapshot["blueprint_contract_version"] = str(contract.get("version", ""))
+    snapshot["blueprint_contract_status"] = str(contract_status.get("status", "default"))
+    snapshot["blueprint_contract_path"] = str(contract_status.get("path", STAGE1_BLUEPRINT_CONTRACT_PATH))
+    snapshot["blueprint_contract_error"] = str(contract_status.get("error", ""))
+    snapshot["blueprint_required_slots"] = [
+        str(item).strip()
+        for item in contract.get("required_slots_balanced", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    snapshot["generated_at_iteration"] = int(state.get("iteration", 0))
+    query_terms = _graph_query_terms_from_state(state)
+    snapshot["query_terms"] = query_terms
+    snapshot["query_signature"] = "|".join(item.casefold() for item in query_terms)
+    if not STAGE1_ENABLE_GRAPH_CONTEXT:
+        snapshot["status"] = "disabled"
+        snapshot["generated"] = True
+        return snapshot
+    if not hasattr(mcp_client, "call_tool"):
+        snapshot.update(
+            {
+                "generated": True,
+                "status": "tool_unavailable",
+                "errors": ["graph context client missing call_tool"],
+            }
+        )
+        return snapshot
+
+    label_counts: Dict[str, int] = {}
+    relation_counts: Dict[str, int] = {}
+    resolved_entity_ids: List[str] = []
+    errors: List[str] = []
+
+    if not query_terms:
+        profile_focus = _graph_focus_from_state(state, label_counts)
+        coverage_slots = _graph_coverage_slots(
+            profile_focus=profile_focus,
+            label_counts=label_counts,
+            relation_counts=relation_counts,
+            resolved_entity_ids=resolved_entity_ids,
+        )
+        snapshot.update(
+            {
+                "generated": True,
+                "status": "no_queries",
+                "profile_focus": profile_focus,
+                "node_label_counts": label_counts,
+                "relation_type_counts": relation_counts,
+                "resolved_entity_ids": resolved_entity_ids,
+                "coverage_slots": coverage_slots,
+                "missing_slots": [slot for slot, ok in coverage_slots.items() if not ok],
+                "planner_hints": _graph_planner_hints(
+                    profile_focus,
+                    [slot for slot, ok in coverage_slots.items() if not ok],
+                ),
+            }
+        )
+        return snapshot
+
+    tool_unavailable = False
+    for query in query_terms:
+        result = mcp_client.call_tool(
+            "graph_search_entities",
+            {
+                "runId": state.get("run_id"),
+                "scope": "run",
+                "query": query,
+                "limit": max(10, STAGE1_GRAPH_ENTITY_LIMIT * 4),
+            },
+        )
+        if not result.ok:
+            error_text = _graph_error_text(result.content)
+            if error_text:
+                errors.append(error_text)
+            lowered = error_text.casefold()
+            if "unknown tool" in lowered or "not found" in lowered:
+                tool_unavailable = True
+                break
+            continue
+        for entity in _pick_list(result.content, ["entities", "results", "items"])[: max(20, STAGE1_GRAPH_ENTITY_LIMIT * 6)]:
+            if not isinstance(entity, dict):
+                continue
+            entity_id = _graph_entity_id_from_payload(entity)
+            if entity_id:
+                resolved_entity_ids = _dedupe(resolved_entity_ids + [entity_id])
+            for label in _pick_list(entity, ["labels"]):
+                if isinstance(label, str):
+                    _graph_increment_count(label_counts, label)
+            props = _pick_dict(entity, ["properties", "props"])
+            entity_type = _pick_str(entity, ["type"]) or _pick_str(props, ["type", "entity_type"])
+            if entity_type:
+                _graph_increment_count(label_counts, entity_type)
+
+    if tool_unavailable:
+        snapshot.update(
+            {
+                "generated": True,
+                "status": "tool_unavailable",
+                "errors": _dedupe(errors)[:3],
+            }
+        )
+        return snapshot
+
+    for entity_id in resolved_entity_ids[:STAGE1_GRAPH_ENTITY_LIMIT]:
+        entity_result = mcp_client.call_tool(
+            "graph_get_entity",
+            {"runId": state.get("run_id"), "scope": "run", "entityId": entity_id},
+        )
+        if entity_result.ok:
+            for label in _pick_list(entity_result.content, ["labels"]):
+                if isinstance(label, str):
+                    _graph_increment_count(label_counts, label)
+            props = _pick_dict(entity_result.content, ["properties", "props"])
+            entity_type = _pick_str(entity_result.content, ["type"]) or _pick_str(props, ["type", "entity_type"])
+            if entity_type:
+                _graph_increment_count(label_counts, entity_type)
+        else:
+            error_text = _graph_error_text(entity_result.content)
+            if error_text:
+                errors.append(error_text)
+
+        neighbor_result = mcp_client.call_tool(
+            "graph_neighbors",
+            {
+                "runId": state.get("run_id"),
+                "scope": "run",
+                "entityId": entity_id,
+                "depth": STAGE1_GRAPH_NEIGHBOR_DEPTH,
+            },
+        )
+        if not neighbor_result.ok:
+            error_text = _graph_error_text(neighbor_result.content)
+            if error_text:
+                errors.append(error_text)
+            continue
+        neighbors = _pick_list(neighbor_result.content, ["neighbors", "entities", "items"])
+        for neighbor in neighbors[:STAGE1_GRAPH_NEIGHBOR_LIMIT]:
+            if not isinstance(neighbor, dict):
+                continue
+            for label in _pick_list(neighbor, ["labels"]):
+                if isinstance(label, str):
+                    _graph_increment_count(label_counts, label)
+            props = _pick_dict(neighbor, ["properties", "props"])
+            entity_type = _pick_str(neighbor, ["type"]) or _pick_str(props, ["type", "entity_type"])
+            if entity_type:
+                _graph_increment_count(label_counts, entity_type)
+            for rel_type in _pick_list(neighbor, ["relTypes", "rel_types", "relationshipTypes"]):
+                if isinstance(rel_type, str):
+                    _graph_increment_count(relation_counts, rel_type.strip().upper())
+
+    profile_focus = _graph_focus_from_state(state, label_counts)
+    coverage_slots = _graph_coverage_slots(
+        profile_focus=profile_focus,
+        label_counts=label_counts,
+        relation_counts=relation_counts,
+        resolved_entity_ids=resolved_entity_ids,
+    )
+    missing_slots = [slot for slot, ok in coverage_slots.items() if not ok]
+    status = "ready" if (resolved_entity_ids or label_counts or relation_counts) else "no_matches"
+    snapshot.update(
+        {
+            "generated": True,
+            "status": status,
+            "profile_focus": profile_focus,
+            "resolved_entity_ids": resolved_entity_ids[:STAGE1_GRAPH_ENTITY_LIMIT],
+            "node_label_counts": dict(sorted(label_counts.items(), key=lambda item: item[1], reverse=True)[:12]),
+            "relation_type_counts": dict(sorted(relation_counts.items(), key=lambda item: item[1], reverse=True)[:12]),
+            "coverage_slots": coverage_slots,
+            "missing_slots": missing_slots,
+            "planner_hints": _graph_planner_hints(profile_focus, missing_slots),
+            "errors": _dedupe(errors)[:3],
+        }
+    )
+    return snapshot
+
+
+def _graph_snapshot_prompt_lines(snapshot: Dict[str, Any] | None) -> List[str]:
+    normalized = _normalize_graph_state_snapshot(snapshot or {})
+    blueprint_status = str(normalized.get("blueprint_contract_status", "")).strip() or "default"
+    blueprint_version = str(normalized.get("blueprint_contract_version", "")).strip() or "unknown"
+    blueprint_enforcement = str(normalized.get("blueprint_enforcement", "")).strip() or "balanced"
+    blueprint_line = (
+        f"Stage1 blueprint contract: status={blueprint_status}, version={blueprint_version}, enforcement={blueprint_enforcement}."
+    )
+    blueprint_error = str(normalized.get("blueprint_contract_error", "")).strip()
+    required_slots = [
+        str(item).strip()
+        for item in normalized.get("blueprint_required_slots", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    if not normalized.get("enabled", False):
+        return [blueprint_line]
+    status = str(normalized.get("status", "")).strip().lower()
+    if status == "tool_unavailable":
+        lines = [
+            blueprint_line,
+            "Graph context tools unavailable; falling back to receipt-driven planning.",
+        ]
+        if blueprint_error:
+            lines.append(f"Blueprint contract load warning: {blueprint_error}.")
+        return lines
+    focus = str(normalized.get("profile_focus", "unknown")).strip() or "unknown"
+    ids = normalized.get("resolved_entity_ids", []) if isinstance(normalized.get("resolved_entity_ids", []), list) else []
+    query_terms = normalized.get("query_terms", []) if isinstance(normalized.get("query_terms", []), list) else []
+    lines = [
+        blueprint_line,
+        f"Graph focus={focus}; resolved entity anchors={len(ids)}; graph-query pivots={', '.join(query_terms[:3]) or 'none'}.",
+    ]
+    if required_slots:
+        lines.append("Blueprint required slots: " + ", ".join(required_slots[:9]) + ".")
+    if blueprint_error:
+        lines.append(f"Blueprint contract load warning: {blueprint_error}.")
+    label_counts = normalized.get("node_label_counts", {})
+    if isinstance(label_counts, dict) and label_counts:
+        preview = ", ".join(
+            [
+                f"{key}:{int(value) if isinstance(value, (int, float)) else 0}"
+                for key, value in list(label_counts.items())[:4]
+                if isinstance(key, str)
+            ]
+        )
+        if preview:
+            lines.append(f"Graph node labels: {preview}.")
+    relation_counts = normalized.get("relation_type_counts", {})
+    if isinstance(relation_counts, dict) and relation_counts:
+        preview = ", ".join(
+            [
+                f"{key}:{int(value) if isinstance(value, (int, float)) else 0}"
+                for key, value in list(relation_counts.items())[:4]
+                if isinstance(key, str)
+            ]
+        )
+        if preview:
+            lines.append(f"Graph relation types: {preview}.")
+    missing_slots = [
+        _graph_missing_slot_label(str(item))
+        for item in normalized.get("missing_slots", [])
+        if isinstance(item, str) and item.strip()
+    ]
+    if missing_slots:
+        lines.append("Missing graph slots: " + ", ".join(missing_slots[:5]) + ".")
+    for hint in normalized.get("planner_hints", [])[:2]:
+        if isinstance(hint, str) and hint.strip():
+            lines.append(hint.strip())
+    return _dedupe(lines)
+
+
+def _graph_snapshot_note_lines(snapshot: Dict[str, Any]) -> List[str]:
+    lines = _graph_snapshot_prompt_lines(snapshot)
+    return lines[:5]
+
+
+def _graph_stop_gate(state: PlannerState, snapshot: Dict[str, Any]) -> tuple[bool, str]:
+    normalized = _normalize_graph_state_snapshot(snapshot)
+    if not normalized.get("enabled", False):
+        return True, ""
+    status = str(normalized.get("status", "")).strip().lower()
+    if status in {"disabled", "tool_unavailable", "uninitialized"}:
+        return True, ""
+    if not normalized.get("query_terms"):
+        return True, ""
+    if not normalized.get("blueprint_enabled", STAGE1_BLUEPRINT_ENABLED):
+        return True, ""
+
+    missing_slots = {
+        str(item).strip().lower()
+        for item in normalized.get("missing_slots", [])
+        if isinstance(item, str) and item.strip()
+    }
+    if not missing_slots:
+        return True, ""
+
+    enforcement = str(normalized.get("blueprint_enforcement", STAGE1_BLUEPRINT_ENFORCEMENT)).strip().lower()
+    if enforcement in {"off", "none", "disabled"}:
+        return True, ""
+
+    required = {
+        str(item).strip().lower()
+        for item in normalized.get("blueprint_required_slots", [])
+        if isinstance(item, str) and str(item).strip()
+    }
+    if not required:
+        required = {
+            "primary_anchor_node",
+            "identity_surface",
+            "related_identity_surface",
+            "relationship_surface",
+            "timeline_surface",
+            "timeline_mention_surface",
+            "time_node_surface",
+            "topic_surface",
+            "evidence_surface",
+        }
+    if enforcement in {"minimal", "core"}:
+        required = {"primary_anchor_node", "identity_surface", "relationship_surface", "evidence_surface"}
+
+    social_retry_status = _social_timeline_retry_status(state)
+    waived_slots: set[str] = set()
+    if social_retry_status.get("all_exhausted", False):
+        waived_slots.update({"timeline_mention_surface", "time_node_surface"})
+
+    blockers = [
+        slot for slot in required
+        if slot in missing_slots and slot not in waived_slots
+    ]
+    if not blockers:
+        return True, ""
+    if waived_slots:
+        return (
+            False,
+            f"Graph judgment gate ({enforcement}): missing "
+            + ", ".join(_graph_missing_slot_label(slot) for slot in blockers)
+            + f". (waived after social retry exhaustion: {', '.join(sorted(waived_slots))})",
+        )
+    return (
+        False,
+        f"Graph judgment gate ({enforcement}): missing "
+        + ", ".join(_graph_missing_slot_label(slot) for slot in blockers)
+        + ".",
+    )
 
 
 def _fact_list(receipt: ToolReceipt, *keys: str) -> List[Any]:
@@ -2996,6 +4563,7 @@ def _derive_source_follow_up_tasks(
     run_id: str,
     receipts: List[ToolReceipt],
     primary_person_targets: List[str],
+    extract_target: str,
     iteration: int,
     dedupe_store: Dict[str, int],
 ):
@@ -3056,10 +4624,17 @@ def _derive_source_follow_up_tasks(
             ranked_candidates.append(
                 (
                     score,
-                    "fetch_url",
-                    {"runId": run_id, "url": url},
+                    "extract_webpage",
+                    {
+                        "runId": run_id,
+                        "url": url,
+                        "query": _tavily_extract_query(primary_name or extract_target or url),
+                        "chunks_per_source": 5,
+                        "extract_depth": "advanced",
+                        "format": "text",
+                    },
                     priority,
-                    f"Source expansion: fetch cited official/company/institutional source for direct evidence and same-host crawl expansion: {url}",
+                    f"Source expansion: extract cited official/company/institutional source with Tavily for direct evidence collection: {url}",
                 )
             )
 
@@ -3069,7 +4644,7 @@ def _derive_source_follow_up_tasks(
     for candidate in ranked_candidates:
         _, tool_name, payload, _, _ = candidate
         candidate_url = ""
-        if tool_name == "fetch_url":
+        if tool_name == "extract_webpage":
             candidate_url = str(payload.get("url") or "")
         elif tool_name == "arxiv_paper_ingest":
             candidate_url = str(payload.get("pdf_url") or payload.get("paper_url") or "")
@@ -3816,11 +5391,15 @@ def _plan_item_priority(state: PlannerState, item: ToolPlanItem) -> int:
         # Broad discovery
         "tavily_research": 90,
         "tavily_person_search": 88,
+        "extract_webpage": 84,
+        "crawl_webpage": 78,
+        "map_webpage": 74,
         "person_search": 75,
         "google_serp_person_search": 70,
         # Primary profiles / identity anchors
         "linkedin_download_html_ocr": 72,
         "github_identity_search": 70,
+        "username_permutation_search": 67,
         "institution_directory_search": 68,
         # Relationships (often missing in early runs)
         "coauthor_graph_search": 66,
@@ -3856,14 +5435,115 @@ def _plan_item_priority(state: PlannerState, item: ToolPlanItem) -> int:
     if looks_academic:
         if tool_name in {"arxiv_search_and_download", "semantic_scholar_search", "orcid_search", "dblp_author_search"}:
             base += 70
-    if gaps.get("aliases", False) and tool_name in {"alias_variant_generator"}:
+    if gaps.get("aliases", False) and tool_name in {"alias_variant_generator", "username_permutation_search"}:
         base += 25
+    if gaps.get("code_presence", False) and tool_name in {
+        "username_permutation_search",
+        "github_identity_search",
+        "gitlab_identity_search",
+        "package_registry_search",
+    }:
+        base += 18
     if gaps.get("contacts", False) and tool_name in {"arxiv_search_and_download", "institution_directory_search", "contact_page_extractor"}:
         base += 15
     if gaps.get("relationships", False) and tool_name in {"coauthor_graph_search", "org_staff_page_search", "shared_contact_pivot_search"}:
         base += 15
     if gaps.get("history", False) and tool_name in {"tavily_research", "person_search"}:
         base += 10
+
+    graph_snapshot = _normalize_graph_state_snapshot(
+        state.get("graph_state_snapshot", {})
+    )
+    graph_missing = {
+        str(item).strip().lower()
+        for item in graph_snapshot.get("missing_slots", [])
+        if str(item).strip()
+    }
+    if "primary_anchor_node" in graph_missing:
+        if tool_name in {
+            "tavily_research",
+            "tavily_person_search",
+            "person_search",
+            "open_corporates_search",
+            "domain_whois_search",
+        }:
+            base += 20
+    if "identity_surface" in graph_missing:
+        if tool_name in {
+            "alias_variant_generator",
+            "github_identity_search",
+            "institution_directory_search",
+            "domain_whois_search",
+            "personal_site_search",
+        }:
+            base += 12
+    if "related_identity_surface" in graph_missing:
+        if tool_name in {
+            "tavily_person_search",
+            "person_search",
+            "github_identity_search",
+            "institution_directory_search",
+            "personal_site_search",
+        }:
+            base += 14
+    if "relationship_surface" in graph_missing:
+        if tool_name in {
+            "coauthor_graph_search",
+            "org_staff_page_search",
+            "shared_contact_pivot_search",
+            "company_officer_search",
+            "board_member_overlap_search",
+        }:
+            base += 18
+    if "timeline_surface" in graph_missing:
+        if tool_name in {
+            "wayback_fetch_url",
+            "wayback_domain_timeline_search",
+            "historical_bio_diff",
+            "arxiv_search_and_download",
+            "company_filing_search",
+        }:
+            base += 12
+    if "timeline_mention_surface" in graph_missing:
+        if tool_name in {
+            "linkedin_download_html_ocr",
+            "x_get_user_posts_api",
+            "tavily_research",
+        }:
+            base += 16
+    if "time_node_surface" in graph_missing:
+        if tool_name in {
+            "linkedin_download_html_ocr",
+            "x_get_user_posts_api",
+            "arxiv_search_and_download",
+            "wayback_fetch_url",
+            "historical_bio_diff",
+            "company_filing_search",
+        }:
+            base += 14
+    if "topic_surface" in graph_missing:
+        if tool_name in {
+            "github_identity_search",
+            "person_search",
+            "arxiv_search_and_download",
+            "tavily_research",
+            "tavily_person_search",
+        }:
+            base += 14
+    if "evidence_surface" in graph_missing:
+        if tool_name in {
+            "extract_webpage",
+            "crawl_webpage",
+            "tavily_research",
+            "google_serp_person_search",
+            "wayback_fetch_url",
+        }:
+            base += 10
+
+    if tool_name == "username_permutation_search":
+        username = str((item.arguments or {}).get("username") or "").strip()
+        if "." in username or "-" in username:
+            base += 10
 
     return base
 
@@ -3929,7 +5609,7 @@ def _tool_plan_dedupe_key(tool_name: str, arguments: Dict[str, Any]) -> str:
         return None
 
     semantic_value: str | None = None
-    if tool_name in {"fetch_url", "wayback_fetch_url"}:
+    if tool_name in {"fetch_url", "wayback_fetch_url", "extract_webpage", "crawl_webpage", "map_webpage"}:
         semantic_value = url_key("url")
     elif tool_name in {"osint_whatweb_target"}:
         semantic_value = url_key("target")
@@ -4031,7 +5711,7 @@ def _is_empty_argument_value(value: Any) -> bool:
 def _fetch_urls_from_plan(plan: List[ToolPlanItem]) -> List[str]:
     fetch_urls: List[str] = []
     for item in plan:
-        if item.tool != "fetch_url":
+        if item.tool not in {"extract_webpage", "crawl_webpage", "map_webpage"}:
             continue
         url = item.arguments.get("url")
         if isinstance(url, str):
@@ -4051,6 +5731,8 @@ def json_like(value: Dict[str, Any]) -> str:
 def _format_receipt_note(receipt: ToolReceipt) -> str | None:
     if not receipt.ok:
         return None
+    if receipt.tool_name in {"extract_webpage", "crawl_webpage", "map_webpage"} and receipt.document_ids:
+        return f"Extracted web evidence → document {receipt.document_ids[0]}"
     if receipt.tool_name == "fetch_url" and receipt.document_ids:
         return f"Fetched content → document {receipt.document_ids[0]}"
     if receipt.tool_name == "ingest_text" and receipt.document_ids:
@@ -4073,6 +5755,7 @@ def _empty_noteboard_sections() -> Dict[str, List[str]]:
         "gaps": [],
         "follow_ups": [],
         "depth_candidates": [],
+        "graph_judgment": [],
     }
 
 
@@ -4119,6 +5802,7 @@ def _flatten_noteboard_sections(sections: Dict[str, List[str]]) -> List[str]:
         ("gaps", "Gaps"),
         ("follow_ups", "Follow-Ups"),
         ("depth_candidates", "Depth Candidates"),
+        ("graph_judgment", "Graph Judgment"),
     ]
     flattened: List[str] = []
     normalized = _normalize_noteboard_sections(sections)
@@ -4140,9 +5824,10 @@ def _inject_noteboard(
     sections: Dict[str, List[str]] | None = None,
     current_iteration_reasoning: str = "",
     queued_tasks: List[Dict[str, Any]] | None = None,
+    graph_state_snapshot: Dict[str, Any] | None = None,
 ) -> str:
     normalized_sections = _normalize_noteboard_sections(sections or {})
-    if not notes and not any(normalized_sections.values()) and not current_iteration_reasoning.strip() and not queued_tasks:
+    if not notes and not any(normalized_sections.values()) and not current_iteration_reasoning.strip() and not queued_tasks and not graph_state_snapshot:
         return prompt
 
     evidence_lines = normalized_sections.get("evidence", [])
@@ -4150,6 +5835,7 @@ def _inject_noteboard(
     gap_lines = normalized_sections.get("gaps", [])
     follow_up_lines = normalized_sections.get("follow_ups", [])
     depth_lines = normalized_sections.get("depth_candidates", [])
+    graph_lines = normalized_sections.get("graph_judgment", [])
 
     if not any(normalized_sections.values()):
         fallback_sections = _derive_legacy_noteboard_sections(notes)
@@ -4158,6 +5844,7 @@ def _inject_noteboard(
         gap_lines = fallback_sections["gaps"]
         follow_up_lines = fallback_sections["follow_ups"]
         depth_lines = fallback_sections["depth_candidates"]
+        graph_lines = fallback_sections["graph_judgment"]
 
     todo_lines: List[str] = []
     for task in (queued_tasks or [])[:8]:
@@ -4178,6 +5865,7 @@ def _inject_noteboard(
             line = f"{line}: {reason}"
         todo_lines.append(line)
     todo_lines = _dedupe(follow_up_lines + todo_lines)[:8]
+    graph_lines = _dedupe(graph_lines + _graph_snapshot_prompt_lines(graph_state_snapshot))[:8]
 
     noteboard_lines = [
         "Noteboard",
@@ -4193,6 +5881,9 @@ def _inject_noteboard(
         "",
         "Depth candidates worth expanding:",
         *([f"- {item}" for item in depth_lines] or ["- none yet"]),
+        "",
+        "Graph snapshot and judgment:",
+        *([f"- {item}" for item in graph_lines] or ["- none yet"]),
         "",
         "Current iteration reasoning:",
         current_iteration_reasoning.strip() or "No prior iteration reasoning recorded yet.",
@@ -4220,10 +5911,14 @@ def _derive_legacy_noteboard_sections(notes: List[str]) -> Dict[str, List[str]]:
             _append_noteboard_item(sections, "follow_ups", text[13:])
         elif lower.startswith("[depth candidates] "):
             _append_noteboard_item(sections, "depth_candidates", text[19:])
+        elif lower.startswith("[graph judgment] "):
+            _append_noteboard_item(sections, "graph_judgment", text[17:])
         elif "queued" in lower:
             _append_noteboard_item(sections, "follow_ups", text)
         elif "depth candidate" in lower:
             _append_noteboard_item(sections, "depth_candidates", text)
+        elif "graph snapshot" in lower or "missing graph slot" in lower:
+            _append_noteboard_item(sections, "graph_judgment", text)
         elif "discovered" in lower or "frontier" in lower:
             _append_noteboard_item(sections, "frontier", text)
         else:

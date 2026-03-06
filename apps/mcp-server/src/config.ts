@@ -7,6 +7,12 @@ const __dirname = dirname(__filename);
 const repoRoot = resolve(__dirname, "../../..");
 dotenv.config({ path: resolve(repoRoot, ".env") });
 
+function envBool(name: string, fallback = false): boolean {
+  const raw = process.env[name];
+  if (raw == null) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+}
+
 export const cfg = {
   paths: {
     repoRoot,
@@ -30,6 +36,9 @@ export const cfg = {
       "openai/text-embedding-3-small",
     timeoutMs: Math.max(1000, Number(process.env.EMBEDDING_TIMEOUT_MS ?? "180000")),
     queryTimeoutMs: Math.max(1000, Number(process.env.EMBEDDING_QUERY_TIMEOUT_MS ?? "60000")),
+    maxAttempts: Math.max(1, Number(process.env.EMBEDDING_MAX_ATTEMPTS ?? "3")),
+    retryDelayMs: Math.max(100, Number(process.env.EMBEDDING_RETRY_DELAY_MS ?? "750")),
+    fallbackToOpenRouter: envBool("EMBEDDING_FALLBACK_TO_OPENROUTER", false),
   },
 
   openrouter: {

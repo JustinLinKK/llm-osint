@@ -623,15 +623,32 @@ def test_planner_review_receipts_queues_source_followups_from_search_results(mon
     updated = planner_review_receipts(state)
     queued_tools = [(item["tool_name"], item["payload"]) for item in updated["queued_tasks"]]
 
-    assert ("fetch_url", {"runId": "run-1", "url": "https://www.example.edu/people/ada-lovelace"}) in queued_tools
+    assert (
+        "extract_webpage",
+        {
+            "runId": "run-1",
+            "url": "https://www.example.edu/people/ada-lovelace",
+            "query": (
+                "Extract the sections of this page most relevant to Ada Lovelace, especially identity, "
+                "biography, affiliation, relationship, contact, and timeline evidence."
+            ),
+            "chunks_per_source": 5,
+            "extract_depth": "advanced",
+            "format": "text",
+        },
+    ) in queued_tools
     assert (
         "arxiv_paper_ingest",
         {"runId": "run-1", "paper_url": "https://arxiv.org/abs/1234.5678", "author_hint": "Ada Lovelace"},
     ) in queued_tools
-    assert not any(payload.get("url") == "https://en.wikipedia.org/wiki/Ada_Lovelace" for tool, payload in queued_tools if tool == "fetch_url")
+    assert not any(
+        payload.get("url") == "https://en.wikipedia.org/wiki/Ada_Lovelace"
+        for tool, payload in queued_tools
+        if tool == "extract_webpage"
+    )
 
 
-def test_planner_review_receipts_adds_fetched_host_to_allowed_hosts(monkeypatch) -> None:
+def test_planner_review_receipts_adds_extracted_host_to_allowed_hosts(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
     graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
     planner_review_receipts = graph.nodes["planner_review_receipts"]
@@ -649,11 +666,11 @@ def test_planner_review_receipts_adds_fetched_host_to_allowed_hosts(monkeypatch)
         "latest_tool_receipts": [
             ReceiptStub(
                 run_id="run-1",
-                tool_name="fetch_url",
+                tool_name="extract_webpage",
                 ok=True,
-                summary="Fetched URL.",
+                summary="Extracted URL.",
                 arguments={"runId": "run-1", "url": "https://www.acme.com/about"},
-                key_facts=[{"finalUrl": "https://www.acme.com/about"}],
+                key_facts=[{"url": "https://www.acme.com/about"}],
                 next_hints=["https://www.acme.com/team"],
             )
         ],
@@ -838,16 +855,75 @@ def test_planner_review_receipts_filters_low_signal_source_followups(monkeypatch
     }
 
     updated = planner_review_receipts(state)
-    fetch_payloads = [
+    extract_payloads = [
         item["payload"]
         for item in updated["queued_tasks"]
-        if item["tool_name"] == "fetch_url"
+        if item["tool_name"] == "extract_webpage"
     ]
 
-    assert {"runId": "run-1", "url": "https://example.edu/people/frederick-pi"} in fetch_payloads
-    assert {"runId": "run-1", "url": "https://wordunscrambler.net/unscramble/notpi"} not in fetch_payloads
-    assert {"runId": "run-1", "url": "https://github.com/USPS"} not in fetch_payloads
-    assert {"runId": "run-1", "url": "https://www.usps.com/"} not in fetch_payloads
+    expected_payload = next(
+        payload
+        for payload in extract_payloads
+        if payload.get("url") == "https://example.edu/people/frederick-pi"
+    )
+    assert expected_payload["chunks_per_source"] == 5
+    assert expected_payload["extract_depth"] == "advanced"
+    assert expected_payload["format"] == "text"
+    assert "Frederick Xinyu Pi" in expected_payload["query"]
+    assert not any(payload.get("url") == "https://wordunscrambler.net/unscramble/notpi" for payload in extract_payloads)
+    assert not any(payload.get("url") == "https://github.com/USPS" for payload in extract_payloads)
+    assert not any(payload.get("url") == "https://www.usps.com/" for payload in extract_payloads)
+
+
+def test_plan_tools_uses_tavily_extract_for_crawl_frontier(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    monkeypatch.setattr(planner_graph, "emit_run_event", lambda *args, **kwargs: None)
+
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    plan_tools = graph.nodes["plan_tools"]
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "seed_urls": ["https://www.example.edu/people/ada-lovelace"],
+        "pending_urls": ["https://www.example.edu/people/ada-lovelace"],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": ["example.edu"],
+        "tool_plan": [],
+        "latest_tool_receipts": [],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 2,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    planned = plan_tools(state)
+
+    assert any(
+        item.tool == "extract_webpage"
+        and item.arguments.get("url") == "https://www.example.edu/people/ada-lovelace"
+        and item.arguments.get("chunks_per_source") == 5
+        and item.arguments.get("extract_depth") == "advanced"
+        and item.arguments.get("format") == "text"
+        for item in planned["tool_plan"]
+    )
+    assert not any(item.tool == "fetch_url" for item in planned["tool_plan"])
 
 
 def test_plan_tools_uses_tavily_github_search_before_github_identity_search(monkeypatch) -> None:
@@ -897,3 +973,222 @@ def test_plan_tools_uses_tavily_github_search_before_github_identity_search(monk
         for item in tavily_items
     )
     assert github_items == []
+
+
+def test_graph_planner_hints_cover_topic_and_timeline_mentions(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    hints = planner_graph._graph_planner_hints(
+        "person",
+        ["topic_surface", "timeline_mention_surface"],
+    )
+    joined = " ".join(hints).lower()
+    assert "github_identity_search" in joined
+    assert "x_get_user_posts_api" in joined
+    assert "linkedin_download_html_ocr" in joined
+
+
+def test_graph_stop_gate_blocks_when_balanced_required_slot_missing(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    ok, note = planner_graph._graph_stop_gate(
+        {},
+        {
+            "enabled": True,
+            "status": "ready",
+            "query_terms": ["Ada Lovelace"],
+            "missing_slots": ["time_node_surface", "topic_surface"],
+            "blueprint_enabled": True,
+            "blueprint_enforcement": "balanced",
+            "blueprint_required_slots": ["time_node_surface", "topic_surface"],
+        },
+    )
+
+    assert ok is False
+    assert "time-node surface" in note
+
+
+def test_graph_stop_gate_allows_fallback_when_graph_tools_unavailable(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    ok, note = planner_graph._graph_stop_gate(
+        {},
+        {
+            "enabled": True,
+            "status": "tool_unavailable",
+            "query_terms": ["Ada Lovelace"],
+            "missing_slots": ["time_node_surface"],
+            "blueprint_enabled": True,
+            "blueprint_enforcement": "balanced",
+            "blueprint_required_slots": ["time_node_surface"],
+        },
+    )
+
+    assert ok is True
+    assert note == ""
+
+
+def test_plan_item_priority_boosts_topic_surface_gap_tools(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    state = {
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "tool_receipts": [],
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+        "graph_state_snapshot": {
+            "missing_slots": ["topic_surface"],
+        },
+        "queued_tasks": [],
+    }
+    high = planner_graph._plan_item_priority(
+        state,
+        planner_graph.ToolPlanItem(
+            tool="github_identity_search",
+            arguments={"runId": "run-1", "person_name": "Ada Lovelace"},
+            rationale="",
+        ),
+    )
+    low = planner_graph._plan_item_priority(
+        state,
+        planner_graph.ToolPlanItem(
+            tool="sanctions_watchlist_search",
+            arguments={"runId": "run-1", "person_name": "Ada Lovelace"},
+            rationale="",
+        ),
+    )
+    assert high > low
+
+
+def test_plan_item_priority_prefers_username_permutation_when_code_gap_open(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    coverage = planner_graph.empty_coverage_ledger()
+    for key in list(coverage.keys()):
+        coverage[key] = True
+    coverage["code_presence"] = False
+    coverage["aliases"] = False
+
+    state = {
+        "prompt": "Investigate Ada Lovelace",
+        "inputs": ["Ada Lovelace"],
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "tool_receipts": [],
+        "coverage_ledger": coverage,
+        "graph_state_snapshot": {
+            "missing_slots": [],
+        },
+        "queued_tasks": [],
+    }
+
+    username_priority = planner_graph._plan_item_priority(
+        state,
+        planner_graph.ToolPlanItem(
+            tool="username_permutation_search",
+            arguments={"runId": "run-1", "username": "xinyu.pi"},
+            rationale="",
+        ),
+    )
+    tavily_priority = planner_graph._plan_item_priority(
+        state,
+        planner_graph.ToolPlanItem(
+            tool="tavily_research",
+            arguments={"runId": "run-1", "input": "Ada Lovelace"},
+            rationale="",
+        ),
+    )
+
+    assert username_priority > tavily_priority
+
+
+def test_social_timeline_retry_cap_blocks_further_scheduling(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    state = {
+        "tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="x_get_user_posts_api",
+                ok=False,
+                summary="x_get_user_posts_api failed.",
+                arguments={"runId": "run-1", "username": "ada", "max_results": 10},
+                argument_signature=planner_graph.tool_argument_signature(
+                    "x_get_user_posts_api",
+                    {"runId": "run-1", "username": "ada", "max_results": 10},
+                ),
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="x_get_user_posts_api",
+                ok=False,
+                summary="x_get_user_posts_api failed again.",
+                arguments={"runId": "run-1", "username": "ada", "max_results": 10},
+                argument_signature=planner_graph.tool_argument_signature(
+                    "x_get_user_posts_api",
+                    {"runId": "run-1", "username": "ada", "max_results": 10},
+                ),
+            ),
+        ]
+    }
+
+    should_schedule = planner_graph._should_schedule_social_timeline_tool(
+        state,
+        "x_get_user_posts_api",
+        {"runId": "run-1", "username": "ada", "max_results": 10},
+    )
+    assert should_schedule is False
+
+
+def test_graph_stop_gate_waives_social_timeline_slots_after_retry_exhaustion(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    state = {
+        "tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="x_get_user_posts_api",
+                ok=False,
+                summary="x_get_user_posts_api failed.",
+                arguments={"runId": "run-1", "username": "ada", "max_results": 10},
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="x_get_user_posts_api",
+                ok=False,
+                summary="x_get_user_posts_api failed again.",
+                arguments={"runId": "run-1", "username": "ada", "max_results": 10},
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="linkedin_download_html_ocr",
+                ok=False,
+                summary="linkedin_download_html_ocr failed.",
+                arguments={"runId": "run-1", "profile": "https://linkedin.com/in/ada"},
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="linkedin_download_html_ocr",
+                ok=False,
+                summary="linkedin_download_html_ocr failed again.",
+                arguments={"runId": "run-1", "profile": "https://linkedin.com/in/ada"},
+            ),
+        ]
+    }
+
+    ok, note = planner_graph._graph_stop_gate(
+        state,
+        {
+            "enabled": True,
+            "status": "ready",
+            "query_terms": ["Ada Lovelace"],
+            "missing_slots": ["timeline_mention_surface", "time_node_surface"],
+            "blueprint_enabled": True,
+            "blueprint_enforcement": "balanced",
+            "blueprint_required_slots": ["timeline_mention_surface", "time_node_surface"],
+        },
+    )
+    assert ok is True
+    assert note == ""

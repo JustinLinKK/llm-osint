@@ -46,6 +46,36 @@ function normalizeNeo4jValue(value: unknown): unknown {
   return value;
 }
 
+function buildRunTaggedPredicate(alias: string, options?: { allowExternalContext?: boolean }): string {
+  const externalContextClause = options?.allowExternalContext
+    ? ` OR ($scope = 'hybrid' AND coalesce(${alias}.external_context, false) = true)`
+    : "";
+  return `(
+    coalesce(${alias}.run_id, '') = $runId
+    OR ${alias}.evidence_document_id IN $documentIds
+    OR any(docId IN coalesce(${alias}.evidence_document_ids, []) WHERE docId IN $documentIds)
+    OR coalesce(${alias}.evidence_object_key, '') CONTAINS $runId
+    OR any(ref IN coalesce(${alias}.evidence_object_keys, []) WHERE toString(ref) CONTAINS $runId)${externalContextClause}
+  )`;
+}
+
+function applyScopedRunId<T extends { properties: Record<string, unknown> }>(
+  items: T[],
+  runId: string,
+  scope: string
+): T[] {
+  if (scope !== "run") return items;
+  return items.map((item) => ({
+    ...item,
+    properties: item.properties.run_id
+      ? item.properties
+      : {
+          ...item.properties,
+          run_id: runId,
+        },
+  }));
+}
+
 function buildStage2Markdown(finalReport?: string | null, evidenceAppendix?: string | null): string | null {
   const parts = [finalReport?.trim(), evidenceAppendix?.trim()].filter(
     (value): value is string => Boolean(value)
@@ -506,6 +536,7 @@ app.get("/runs/:runId/graph", async (req, reply) => {
     nodeOffset?: string;
     edgeLimit?: string;
     edgeOffset?: string;
+    scope?: string;
   };
 
   const nodeLimit = parsePositiveInt(query.nodeLimit, 80, 400);
@@ -516,6 +547,8 @@ app.get("/runs/:runId/graph", async (req, reply) => {
   const fetchEdgeLimit = Math.min(Math.max(edgeLimit * 4, 600), 1600);
   const fetchNodeLimitInt = neo4j.int(fetchNodeLimit);
   const fetchEdgeLimitInt = neo4j.int(fetchEdgeLimit);
+  const requestedScope = String(query.scope ?? "run").trim().toLowerCase();
+  const scope = requestedScope === "global" || requestedScope === "hybrid" ? requestedScope : "run";
 
   const runRes = await pool.query(`SELECT prompt, title FROM runs WHERE run_id = $1 LIMIT 1`, [runId]);
   const runPrompt = String(runRes.rows[0]?.prompt ?? "");
@@ -525,6 +558,7 @@ app.get("/runs/:runId/graph", async (req, reply) => {
   if (!documentIds.length) {
     return {
       runId,
+      scope,
       nodes: [],
       edges: [],
       page: {
@@ -537,24 +571,41 @@ app.get("/runs/:runId/graph", async (req, reply) => {
 
   const session = neo4jDriver.session();
   try {
-    const edgeResult = await session.run(
-      `MATCH (a)-[r]->(b)
-       WHERE r.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR a.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(a.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR b.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
-       WITH DISTINCT a, r, b
-       ORDER BY coalesce(r.rel_type, type(r)), elementId(r)
-       LIMIT $edgeLimit
-      RETURN elementId(r) AS id,
-              elementId(a) AS source,
-              elementId(b) AS target,
-              coalesce(r.rel_type, type(r)) AS type,
-              properties(r) AS props`,
-      { documentIds, edgeLimit: fetchEdgeLimitInt }
-    );
+    const runTaggedEdgePredicate = buildRunTaggedPredicate("r");
+    const runTaggedSourcePredicate = buildRunTaggedPredicate("a", { allowExternalContext: true });
+    const runTaggedTargetPredicate = buildRunTaggedPredicate("b", { allowExternalContext: true });
+    const runTaggedNodePredicate = buildRunTaggedPredicate("n", { allowExternalContext: true });
+    const edgeQuery =
+      scope === "global"
+        ? `MATCH (a)-[r]->(b)
+           WHERE r.evidence_document_id IN $documentIds
+              OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
+              OR a.evidence_document_id IN $documentIds
+              OR any(docId IN coalesce(a.evidence_document_ids, []) WHERE docId IN $documentIds)
+              OR b.evidence_document_id IN $documentIds
+              OR any(docId IN coalesce(b.evidence_document_ids, []) WHERE docId IN $documentIds)
+           WITH DISTINCT a, r, b
+           ORDER BY coalesce(r.rel_type, type(r)), elementId(r)
+           LIMIT $edgeLimit
+          RETURN elementId(r) AS id,
+                  elementId(a) AS source,
+                  elementId(b) AS target,
+                  coalesce(r.rel_type, type(r)) AS type,
+                  properties(r) AS props`
+        : `MATCH (a)-[r]->(b)
+           WHERE coalesce(r.rel_type, type(r)) <> 'SAME_CANONICAL_AS'
+             AND ${runTaggedEdgePredicate}
+             AND ${runTaggedSourcePredicate}
+             AND ${runTaggedTargetPredicate}
+           WITH DISTINCT a, r, b
+           ORDER BY coalesce(r.rel_type, type(r)), elementId(r)
+           LIMIT $edgeLimit
+          RETURN elementId(r) AS id,
+                  elementId(a) AS source,
+                  elementId(b) AS target,
+                  coalesce(r.rel_type, type(r)) AS type,
+                  properties(r) AS props`;
+    const edgeResult = await session.run(edgeQuery, { runId, scope, documentIds, edgeLimit: fetchEdgeLimitInt });
 
     const rawEdges = edgeResult.records.map((record) => ({
         id: String(record.get("id")),
@@ -564,23 +615,29 @@ app.get("/runs/:runId/graph", async (req, reply) => {
         properties: normalizeNeo4jValue(record.get("props")) as Record<string, unknown>
       }));
 
-    const nodeResult = await session.run(
-      `MATCH (n)
-       WHERE n.evidence_document_id IN $documentIds
-          OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
-          OR EXISTS {
-            MATCH (n)-[r]-(m)
-            WHERE r.evidence_document_id IN $documentIds
-               OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
-               OR m.evidence_document_id IN $documentIds
-               OR any(docId IN coalesce(m.evidence_document_ids, []) WHERE docId IN $documentIds)
-          }
-       WITH DISTINCT n
-       ORDER BY coalesce(n.canonical_name, n.node_id, elementId(n))
-       LIMIT $nodeLimit
-       RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
-      { documentIds, nodeLimit: fetchNodeLimitInt }
-    );
+    const nodeQuery =
+      scope === "global"
+        ? `MATCH (n)
+           WHERE n.evidence_document_id IN $documentIds
+              OR any(docId IN coalesce(n.evidence_document_ids, []) WHERE docId IN $documentIds)
+              OR EXISTS {
+                MATCH (n)-[r]-(m)
+                WHERE r.evidence_document_id IN $documentIds
+                   OR any(docId IN coalesce(r.evidence_document_ids, []) WHERE docId IN $documentIds)
+                   OR m.evidence_document_id IN $documentIds
+                   OR any(docId IN coalesce(m.evidence_document_ids, []) WHERE docId IN $documentIds)
+              }
+           WITH DISTINCT n
+           ORDER BY coalesce(n.canonical_name, n.node_id, elementId(n))
+           LIMIT $nodeLimit
+           RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`
+        : `MATCH (n)
+           WHERE ${runTaggedNodePredicate}
+           WITH DISTINCT n
+           ORDER BY coalesce(n.canonical_name, n.node_id, elementId(n))
+           LIMIT $nodeLimit
+           RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`;
+    const nodeResult = await session.run(nodeQuery, { runId, scope, documentIds, nodeLimit: fetchNodeLimitInt });
 
     const rawNodes = nodeResult.records.map((record) => ({
       id: String(record.get("id")),
@@ -596,11 +653,18 @@ app.get("/runs/:runId/graph", async (req, reply) => {
     );
 
     if (missingEndpointIds.length > 0) {
-      const missingNodeResult = await session.run(
-        `MATCH (n)
+      const missingNodeQuery =
+        scope === "global"
+          ? `MATCH (n)
          WHERE elementId(n) IN $nodeIds
-         RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`,
-        { nodeIds: missingEndpointIds }
+         RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`
+          : `MATCH (n)
+         WHERE elementId(n) IN $nodeIds
+           AND ${runTaggedNodePredicate}
+         RETURN elementId(n) AS id, labels(n) AS labels, properties(n) AS props`;
+      const missingNodeResult = await session.run(
+        missingNodeQuery,
+        { nodeIds: missingEndpointIds, runId, scope, documentIds }
       );
 
       for (const record of missingNodeResult.records) {
@@ -624,10 +688,14 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       edgeOffset
     });
 
+    const scopedNodes = applyScopedRunId(projection.nodes, runId, scope);
+    const scopedEdges = applyScopedRunId(projection.edges, runId, scope);
+
     return {
       runId,
-      nodes: projection.nodes,
-      edges: projection.edges,
+      scope,
+      nodes: scopedNodes,
+      edges: scopedEdges,
       page: {
         nodes: { limit: nodeLimit, offset: nodeOffset, total: projection.totalNodes },
         edges: { limit: edgeLimit, offset: edgeOffset, total: projection.totalEdges }

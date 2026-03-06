@@ -202,6 +202,7 @@ export function registerIngestText(server: McpServer) {
 
         const sha256 = crypto.createHash("sha256").update(text).digest("hex");
         const sourceDomain = sourceUrl ? new URL(sourceUrl).hostname : null;
+        const retrievedAt = new Date().toISOString();
 
         let documentId: string | null = null;
         const existing = await pool.query(
@@ -317,6 +318,9 @@ export function registerIngestText(server: McpServer) {
               char_start: chunk.charStart,
               char_end: chunk.charEnd,
               source_type: "text",
+              source_url: sourceUrl ?? null,
+              source_domain: sourceDomain ?? null,
+              retrieved_at: retrievedAt,
               content_type: "text/plain",
               title: title ?? null,
               section_title: chunk.sectionTitle,

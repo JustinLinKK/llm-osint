@@ -145,14 +145,29 @@ class OpenRouterLLM:
 
         try:
             data = self._post_json_with_wall_clock_timeout(payload, timeout)
-            content = (
+            content: Any = (
                 data.get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "{}")
             )
+            if content is None:
+                # Some providers occasionally return a null content field; keep this retryable.
+                return {"_retryable_error": "empty_content"}
+            if isinstance(content, list):
+                parts: List[str] = []
+                for item in content:
+                    if isinstance(item, str):
+                        parts.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text")
+                        if isinstance(text, str):
+                            parts.append(text)
+                content = "\n".join(parts).strip() or "{}"
+            elif not isinstance(content, str):
+                content = str(content)
             try:
                 parsed = json.loads(content)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 parsed = {}
 
             if run_id:

@@ -1,3 +1,4 @@
+import report_helpers
 from report_helpers import (
     assemble_final_report,
     build_coverage_ledger,
@@ -281,3 +282,11 @@ def test_pack_evidence_accepts_graph_backed_rows_and_rejects_unbacked_rows() -> 
     assert len(packed) == 1
     assert packed[0].db_source == "graph"
     assert packed[0].graph_ref["entityId"] == "ent_123"
+
+
+def test_report_related_people_filter_rejects_none_publications_phrase() -> None:
+    assert report_helpers._related_people_from_value("None Publications") == []
+
+
+def test_report_related_org_filter_rejects_provider_labels() -> None:
+    assert report_helpers._normalize_related_org_candidate("Tavily research") is None

@@ -67,6 +67,7 @@ Python-backed research tools:
 
 - default runtime exposes research-integration tools such as `person_search`, `x_get_user_posts_api`, `linkedin_download_html_ocr`, `google_serp_person_search`, and `arxiv_search_and_download`
 - OSINT runtime exposes curated wrappers such as `osint_maigret_username`, `osint_amass_domain`, `osint_whatweb_target`, `osint_exiftool_extract`, and related preset tools
+- normal web evidence collection should prefer Tavily-backed tools first (`tavily_research`, `tavily_person_search`, `extract_webpage`, `crawl_webpage`, `map_webpage`); treat `fetch_url` as a fallback utility rather than the default path
 
 ## Behavior
 

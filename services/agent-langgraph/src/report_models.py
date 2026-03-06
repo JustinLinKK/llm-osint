@@ -37,10 +37,13 @@ class EvidenceRefModel(BaseModel):
     document_id: str | None = None
     snippet: str
     source_url: str | None = None
+    source_url_unavailable_reason: str | None = None
     title: str | None = None
     domain: str | None = None
     retrieved_at: str | None = None
     content_hash: str | None = None
+    relevance_score: float | None = None
+    evidence_object_key: str | None = None
     source_type: str = "web"
     score: float | None = None
     db_source: str = "vector"
