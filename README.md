@@ -15,7 +15,7 @@ LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a St
 - `infra/db/migrations`: Postgres schema migrations
 
 ## Current runtime flow
-
+![alt text](public/Flow.png)
 1. `POST /runs` creates a run.
 2. The API autostarts `services/agent-langgraph/src/run_planner.py`.
 3. The API passes `--run-stage2`, so successful API-launched runs execute Stage 1 and then Stage 2 by default.
