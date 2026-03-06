@@ -146,3 +146,4 @@ apps/mcp-server/tmp/
 apps/mcp-server/logs/
 services/agent-langgraph/logs/
 person_search_seen_urls.txt
+result_benchmark/
