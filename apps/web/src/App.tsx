@@ -176,6 +176,7 @@ const RUNS_STORAGE_KEY = "osint-ui-runs";
 const API_BASE = "/api";
 const FINISHED_RUN_STATUS = new Set(["done", "failed", "cancelled"]);
 const FINISHED_REPORT_STATUS = new Set(["ready", "failed"]);
+const MIN_GROUPED_LAYOUT_MEMBERS = 4;
 
 function loadRuns(): RunSummary[] {
   try {
@@ -359,7 +360,9 @@ function groupedPresetPositions(
   const positions = new Map<string, { x: number; y: number }>();
   positions.set(rootNodeId, { x: 0, y: 0 });
 
-  const activeGroups = GRAPH_GROUP_ORDER.filter((group) => (groupMembers.get(group)?.length ?? 0) > 0);
+  const activeGroups = GRAPH_GROUP_ORDER.filter(
+    (group) => (groupMembers.get(group)?.length ?? 0) >= MIN_GROUPED_LAYOUT_MEMBERS
+  );
   if (!activeGroups.length) return positions;
 
   const groupRadius = Math.max(230, 170 + activeGroups.length * 22);
@@ -703,13 +706,13 @@ export default function App() {
     const finalNodeIds = new Set([...limitedNodes, ...connectedNodes]);
     const hasGraphRoot = Boolean(graphEgoNode && finalNodeIds.has(graphEgoNode));
     const rootNodeId = hasGraphRoot ? graphEgoNode : "";
-    const groupedMode = graphLayoutName === "grouped" && hasGraphRoot;
+    const wantsGroupedMode = graphLayoutName === "grouped" && hasGraphRoot;
     const sortedNodeIds = Array.from(finalNodeIds).sort((left, right) =>
       (graphNodeMap.get(left)?.display ?? left).localeCompare(graphNodeMap.get(right)?.display ?? right)
     );
 
     const groupMembers = new Map<GraphGroupName, string[]>();
-    if (groupedMode && rootNodeId) {
+    if (wantsGroupedMode && rootNodeId) {
       for (const nodeId of sortedNodeIds) {
         if (nodeId === rootNodeId) continue;
         const node = graphNodeMap.get(nodeId);
@@ -721,7 +724,10 @@ export default function App() {
       }
     }
 
-    const activeGroups = GRAPH_GROUP_ORDER.filter((group) => (groupMembers.get(group)?.length ?? 0) > 0);
+    const activeGroups = GRAPH_GROUP_ORDER.filter(
+      (group) => (groupMembers.get(group)?.length ?? 0) >= MIN_GROUPED_LAYOUT_MEMBERS
+    );
+    const groupedMode = wantsGroupedMode && activeGroups.length > 0;
     const groupedPositions =
       groupedMode && rootNodeId ? groupedPresetPositions(rootNodeId, sortedNodeIds, groupMembers) : new Map<string, { x: number; y: number }>();
 
@@ -826,6 +832,9 @@ export default function App() {
     if (!finalNodeIds.size) warnings.push("No nodes match current filters.");
     else if (candidateNodes.size > graphNodeLimit) warnings.push(`Filtered node set truncated by node limit: ${graphNodeLimit}.`);
     if (graphLayoutName === "grouped" && !hasGraphRoot) warnings.push("Grouped layout requires a root/ego node.");
+    if (wantsGroupedMode && hasGraphRoot && !groupedMode) {
+      warnings.push(`Grouped layout hidden because no visual group has at least ${MIN_GROUPED_LAYOUT_MEMBERS} members.`);
+    }
 
     return {
       elements,

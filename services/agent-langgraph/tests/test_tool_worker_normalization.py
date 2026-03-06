@@ -370,10 +370,8 @@ def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_gr
                 {"name": "Stealth Startup", "relation": "member", "summary": "Applied AI startup.", "industry": "artificial intelligence"},
             ],
             "repositories": [
-                {"name": "logos", "url": "https://github.com/xinyu/logos", "language": "Python"},
+                {"name": "logos", "url": "https://github.com/xinyu/logos"},
             ],
-            "top_languages": ["Python", "TypeScript"],
-            "spoken_languages": ["English"],
             "topics": ["Large Language Models", "Logical Reasoning"],
             "publications": [
                 {
@@ -416,8 +414,6 @@ def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_gr
     assert any(entity["type"] == "Repository" and entity["canonical_name"] == "logos" for entity in entities)
     assert any(entity["type"] == "Website" and entity["canonical_name"] == "GitHub profile for Xinyu Pi" for entity in entities)
     assert not any(entity["type"] == "Website" and entity["canonical_name"] == "https://github.com/jerrydwelly" for entity in entities)
-    assert any(entity["type"] == "Language" and entity["canonical_name"] == "Python" for entity in entities)
-    assert any(entity["type"] == "Language" and entity["canonical_name"] == "English" for entity in entities)
     assert any(entity["type"] == "Topic" and entity["canonical_name"] == "Large Language Models" for entity in entities)
     assert any(entity["type"] == "Publication" and entity["canonical_name"] == "Reasoning Like Program Executors" for entity in entities)
     assert any(entity["type"] == "Role" and entity["canonical_name"] == "PhD student at University of California, San Diego" for entity in entities)
@@ -438,8 +434,6 @@ def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_gr
     assert "HAS_ROLE" in relation_types
     assert "ISSUED_BY" in relation_types
     assert "MAINTAINS" in relation_types
-    assert "USES_LANGUAGE" in relation_types
-    assert "KNOWS_LANGUAGE" in relation_types
     assert "RESEARCHES" in relation_types
     assert "PUBLISHED" in relation_types
     assert "PUBLISHED_IN" in relation_types
@@ -820,3 +814,31 @@ def test_normalize_linkedin_result_emits_contact_and_profile_facts(monkeypatch) 
     assert any(item["type"] == "location" and item["value"] == "La Jolla Shores, CA" for item in normalized["contact_signals"])
     assert any(item["url"] == "https://github.com/FrederickPi1969" for item in normalized["external_links"])
     assert any(item["name"] == "Stealth Startup" for item in normalized["organizations"])
+
+
+def test_extract_related_people_from_search_rows_filters_generic_geo_snippet(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    rows = [
+        {
+            "url": "https://en.wikipedia.org/wiki/United_Kingdom",
+            "title": "United Kingdom - Wikipedia",
+            "extracted_text": "The United Kingdom is a constitutional monarchy and a member of NATO and the United Nations.",
+        }
+    ]
+
+    assert tool_worker_graph._extract_related_people_from_search_rows(rows, "Frederick Pi") == []
+
+
+def test_extract_related_people_from_search_rows_excludes_primary_aliases_from_noisy_query(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    rows = [
+        {
+            "url": "https://medium.com/@frederickpi/ai-skills",
+            "title": "Frederick Pi - Medium",
+            "extracted_text": "Frederick Pi writes about AI skills. Cookie consent and GDPR settings are shown on this page.",
+        }
+    ]
+
+    assert tool_worker_graph._extract_related_people_from_search_rows(rows, "Cookie Consent Frederick Pi") == []

@@ -102,7 +102,6 @@ def test_github_identity_search_direct_username(monkeypatch) -> None:
     assert result["profile_url"] == "https://github.com/ada"
     assert result["username"] == "ada"
     assert result["repo_count"] == 2
-    assert result["top_languages"] == ["Python"]
     assert result["organizations"][0]["name"] == "analytical-engines"
     assert any(item["value"] == "ada@example.com" for item in result["contact_signals"])
 
@@ -220,9 +219,6 @@ def test_gitlab_identity_search_direct_username(monkeypatch) -> None:
     assert result["stable_id"] == "gitlab:7"
     assert result["profile_url"] == "https://gitlab.com/ada"
     assert result["repo_count"] == 1
-    assert result["top_languages"] == ["Python"]
-
-
 def test_npm_author_search_extracts_repo_urls(monkeypatch) -> None:
     monkeypatch.setattr(
         "technical.npm_author_search.http_json_request",
@@ -279,7 +275,7 @@ def test_crates_author_search_extracts_crate_repo(monkeypatch) -> None:
 
     assert result["stable_id"] == "crates:10"
     assert result["publications"][0]["name"] == "engine"
-    assert result["repositories"][0]["language"] == "Rust"
+    assert result["repositories"][0]["name"] == "engine"
 
 
 def test_wayback_fetch_url_parses_snapshots(monkeypatch) -> None:

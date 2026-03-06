@@ -470,6 +470,78 @@ def test_normalize_related_org_name_rejects_tool_provider_labels(monkeypatch) ->
     assert planner_graph._normalize_related_org_name("Google SERP person search") is None
 
 
+def test_heuristic_related_candidate_adjudication_classifies_location_noise_and_handle(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    primary_context = {"primary_targets": ["Xinyu Pi"], "domains": [], "organizations": [], "publication_titles": [], "urls": []}
+
+    united_kingdom = planner_graph._heuristic_related_candidate_adjudication(
+        {
+            "entity_name": "United Kingdom",
+            "entity_type": "person",
+            "supporting_tools": ["tavily_research"],
+            "domains": ["wikipedia.org"],
+            "urls": ["https://en.wikipedia.org/wiki/United_Kingdom"],
+        },
+        primary_context,
+    )
+    cookie_noise = planner_graph._heuristic_related_candidate_adjudication(
+        {
+            "entity_name": "Cookie Consent Frederick Pi",
+            "entity_type": "person",
+            "supporting_tools": ["tavily_research"],
+            "domains": ["medium.com"],
+            "urls": ["https://medium.com/@frederickpi/ai-skills"],
+        },
+        primary_context,
+    )
+    vatsim_handle = planner_graph._heuristic_related_candidate_adjudication(
+        {
+            "entity_name": "VATSIM-UK",
+            "entity_type": "person",
+            "supporting_tools": ["github_identity_search"],
+            "domains": ["github.com"],
+            "urls": ["https://github.com/VATSIM-UK"],
+        },
+        primary_context,
+    )
+
+    assert united_kingdom["entity_type"] == "location"
+    assert not united_kingdom["expandable"]
+    assert cookie_noise["entity_type"] == "noise"
+    assert not cookie_noise["expandable"]
+    assert vatsim_handle["entity_type"] == "handle"
+    assert not vatsim_handle["expandable"]
+
+
+def test_heuristic_related_candidate_adjudication_defers_common_name_without_anchor_overlap(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    primary_context = {
+        "primary_targets": ["Xinyu Pi"],
+        "domains": ["ucsd.edu", "illinois.edu"],
+        "organizations": ["University of California, San Diego"],
+        "publication_titles": [],
+        "urls": ["https://cse.ucsd.edu/people/xinyu-pi"],
+    }
+
+    yan_gao = planner_graph._heuristic_related_candidate_adjudication(
+        {
+            "entity_name": "Yan Gao",
+            "entity_type": "person",
+            "supporting_tools": ["tavily_research", "tavily_person_search"],
+            "domains": ["mcw.edu", "theorg.com", "icmab.es"],
+            "urls": [
+                "https://www.mcw.edu/departments/biostatistics/faculty/yan-gao",
+                "https://theorg.com/org/flower-labs/org-chart/yan-gao",
+            ],
+        },
+        primary_context,
+    )
+
+    assert yan_gao["entity_type"] == "person"
+    assert not yan_gao["expandable"]
+    assert "anchor" in yan_gao["reason"].lower() or "divergent" in yan_gao["reason"].lower()
+
+
 def test_filter_completed_tool_plan_skips_successful_semantic_repeats(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 

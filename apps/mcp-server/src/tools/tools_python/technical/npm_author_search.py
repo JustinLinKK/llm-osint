@@ -83,7 +83,7 @@ def run(input_data: Dict[str, Any]) -> Dict[str, Any]:
         publications.append(publication)
         external_links.append({"type": "npm_package", "url": publication["url"]})
         if repo_url:
-            repositories.append({"name": package_name, "url": repo_url, "language": None, "updated_at": package.get("date")})
+            repositories.append({"name": package_name, "url": repo_url, "updated_at": package.get("date")})
             external_links.append({"type": "repository", "url": repo_url})
         evidence.append(
             build_evidence(

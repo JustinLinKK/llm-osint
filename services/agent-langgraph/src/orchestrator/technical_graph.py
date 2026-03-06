@@ -26,7 +26,7 @@ def build_technical_graph_entities(tool_name: str, arguments: Dict[str, Any], re
         return []
 
     properties: Dict[str, Any] = {"platform": result.get("platform")}
-    for key in ("username", "display_name", "bio", "repo_count", "top_languages", "profile_url"):
+    for key in ("username", "display_name", "bio", "repo_count", "profile_url"):
         value = result.get(key)
         if value not in (None, "", []):
             properties[key] = value
@@ -63,7 +63,6 @@ def build_technical_graph_entities(tool_name: str, arguments: Dict[str, Any], re
             "targetProperties": {
                 "name": repo_name or repo_url,
                 "url": repo_url or None,
-                "language": repository.get("language"),
                 "updated_at": repository.get("updated_at"),
                 "platform": _repo_platform(repo_url, result.get("platform")),
             },

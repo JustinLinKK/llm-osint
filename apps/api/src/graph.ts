@@ -79,6 +79,7 @@ const ORG_TOKENS = new Set([
 ]);
 
 const ORG_STOPWORDS = new Set(["the", "of", "at", "for", "and", "in", "on", "to"]);
+const TOPIC_STOPWORDS = new Set(["a", "an", "and", "at", "for", "from", "in", "of", "on", "or", "the", "to", "with"]);
 
 function normalizeGraphText(value: string): string {
   return value
@@ -264,6 +265,21 @@ function looksLikeOrganizationName(value: string): boolean {
   return tokens.some((token) => ORG_TOKENS.has(token));
 }
 
+function looksLikeCompactTopicLabel(value: string): boolean {
+  const text = String(value ?? "").trim();
+  if (!text || isUrlLike(text) || isLikelyDomain(text) || looksLikeGraphInternalId(text)) return false;
+  if (/[.!?]/.test(text)) return false;
+  const normalized = normalizeGraphText(text);
+  const tokens = normalized.split(" ").filter(Boolean);
+  if (!tokens.length || tokens.length > 6 || text.length > 72) return false;
+  const meaningfulTokens = tokens.filter((token) => !TOPIC_STOPWORDS.has(token));
+  if (!meaningfulTokens.length) return false;
+  if (meaningfulTokens.length >= 4 && /\b(?:across|through|wide|range|public|service|resources|support|innovation)\b/.test(normalized)) {
+    return false;
+  }
+  return true;
+}
+
 function normalizeGraphEntityType(rawType: unknown): string {
   const normalized = normalizeGraphText(String(rawType ?? ""));
   const explicit: Record<string, string> = {
@@ -287,7 +303,7 @@ function normalizeGraphEntityType(rawType: unknown): string {
     image_object: "ImageObject",
     institution: "Institution",
     ip: "IP",
-    language: "Language",
+    language: "Topic",
     location: "Location",
     occupation: "Occupation",
     organizationprofile: "OrganizationProfile",
@@ -323,7 +339,7 @@ function normalizeGraphEntityType(rawType: unknown): string {
     return "OrganizationProfile";
   }
   if (normalized.includes("language kind") || normalized.includes("programming language") || normalized.includes("spoken language")) {
-    return "Language";
+    return "Topic";
   }
   if (normalized.includes("organization") || normalized.includes("company") || normalized.includes("startup")) {
     return "Organization";
@@ -371,7 +387,7 @@ function graphEntityFamily(type: string): string {
     return "digital";
   }
   if (normalized === "repository") return "repository";
-  if (normalized === "language") return "language";
+  if (normalized === "language") return "topic";
   if (normalized === "contactpoint") return "contact";
   if (normalized === "educationalcredential") return "credential";
   if (normalized === "organizationprofile") return "orgprofile";
@@ -530,6 +546,7 @@ function isNoiseNode(type: string, props: Record<string, unknown>, display: stri
   if (canonical.startsWith("snippet:")) return true;
   if (/^https?:\/\/html\.duckduckgo\.com\/html\/\?q=/i.test(canonical)) return true;
   if (type === "Snippet") return true;
+  if (type === "OrganizationProfile" && /^profile of\b/i.test(display)) return true;
   return false;
 }
 
@@ -548,7 +565,6 @@ function nodePriority(type: string): number {
     conference: 88,
     project: 86,
     repository: 82,
-    language: 81,
     topic: 80,
     organizationprofile: 79,
     award: 78,
@@ -595,7 +611,7 @@ function deriveViewMergeKeys(type: string, props: Record<string, unknown>, displ
     const normalized = normalizeGraphText(name);
     if (normalized) keys.push(`display:${family}:${normalized}`);
     const signature = graphNameSignature(name);
-    if (signature && signature !== normalized && (family === "org" || family === "publication" || family === "language")) {
+    if (signature && signature !== normalized && (family === "org" || family === "publication" || family === "topic")) {
       keys.push(`sig:${family}:${signature}`);
     }
   }
@@ -646,6 +662,69 @@ function selectPromptMatchedAlias(promptText: string, entityType: string, aliase
   return best;
 }
 
+function extractPromptTargetCandidates(prompt: string, title: string): string[] {
+  const inputs = [prompt, title].filter(Boolean);
+  const candidates: string[] = [];
+  const leadPatterns = [
+    /^(?:osint\s+)?(?:profile|report|investigation|research|analysis)\s*(?::|-)?\s*/i,
+    /^(?:who\s+is|find|lookup|look\s+up|investigate|analyze|analyse|search(?:\s+for)?)\s+/i,
+    /^(?:person|subject|target)\s*(?::|-)?\s*/i,
+    /^(?:report|profile)\s+on\s+/i,
+  ];
+
+  for (const rawInput of inputs) {
+    const cleaned = String(rawInput ?? "").replace(/\s+/g, " ").trim();
+    if (!cleaned) continue;
+    candidates.push(cleaned);
+
+    let stripped = cleaned;
+    for (const pattern of leadPatterns) {
+      stripped = stripped.replace(pattern, "").trim();
+    }
+    stripped = stripped.replace(/\s+(?:profile|report|investigation|analysis)$/i, "").trim();
+    if (stripped && stripped !== cleaned) candidates.push(stripped);
+
+    const quotedMatches = cleaned.match(/["'`][^"'`]{3,}["'`]/g) ?? [];
+    for (const match of quotedMatches) {
+      const unquoted = match.slice(1, -1).trim();
+      if (unquoted) candidates.push(unquoted);
+    }
+  }
+
+  return uniqueStrings(candidates).sort((left, right) => right.length - left.length);
+}
+
+function aliasMatchStrength(candidate: string, aliases: string[]): number {
+  const candidateNormalized = normalizeGraphText(candidate);
+  const candidateSignature = graphNameSignature(candidate);
+  if (!candidateNormalized) return 0;
+
+  let best = 0;
+  for (const alias of aliases) {
+    const aliasNormalized = normalizeGraphText(alias);
+    const aliasSignature = graphNameSignature(alias);
+    if (!aliasNormalized) continue;
+    if (aliasNormalized === candidateNormalized) {
+      best = Math.max(best, 5);
+      continue;
+    }
+    if (aliasSignature && candidateSignature && aliasSignature === candidateSignature) {
+      best = Math.max(best, 4);
+      continue;
+    }
+    if (candidateNormalized.includes(aliasNormalized) || aliasNormalized.includes(candidateNormalized)) {
+      best = Math.max(best, 3);
+      continue;
+    }
+    const aliasTokens = tokenSet(alias);
+    const candidateTokens = tokenSet(candidate);
+    if (candidateTokens.size >= 2 && [...candidateTokens].every((token) => aliasTokens.has(token))) {
+      best = Math.max(best, 2);
+    }
+  }
+  return best;
+}
+
 function buildAdjacency(edges: GraphEdgePayload[]): Map<string, Set<string>> {
   const adjacency = new Map<string, Set<string>>();
   for (const edge of edges) {
@@ -688,22 +767,48 @@ function chooseClusterType(nodes: AnnotatedNode[]): string {
     })[0]?.[0] ?? "Entity";
 }
 
+function scoreRootCandidate(
+  node: AnnotatedNode,
+  adjacency: Map<string, Set<string>>,
+  promptText: string
+): number {
+  const aliases = uniqueStrings([node.display, pickFirstString(node.properties, ["canonical_name"]), ...pickStringArray(node.properties, "alt_names")]);
+  const degree = adjacency.get(node.id)?.size ?? 0;
+  let score = degree * 12 + node.qualityScore + nodePriority(node.effectiveType);
+  if (node.effectiveType === "Person") score += 280;
+  if (promptMentionsAlias(promptText, aliases)) score += 220;
+  if (pickStringArray(node.properties, "merge_keys").some((key) => key.startsWith("name:person:"))) score += 180;
+  if (isUrlLike(node.display)) score -= 100;
+  if (node.noise) score -= 400;
+  return score;
+}
+
 function chooseRootNode(nodes: AnnotatedNode[], edges: GraphEdgePayload[], prompt: string, title: string): string | null {
   if (!nodes.length) return null;
   const adjacency = buildAdjacency(edges);
   const promptText = [prompt, title].filter(Boolean).join(" ");
+  const targetCandidates = extractPromptTargetCandidates(prompt, title);
+
+  let matchedTargetNodeId: string | null = null;
+  let matchedTargetScore = Number.NEGATIVE_INFINITY;
+  for (const node of nodes) {
+    const aliases = uniqueStrings([node.display, pickFirstString(node.properties, ["canonical_name"]), ...pickStringArray(node.properties, "alt_names")]);
+    const targetMatch = Math.max(...targetCandidates.map((candidate) => aliasMatchStrength(candidate, aliases)), 0);
+    if (targetMatch <= 0) continue;
+    let score = targetMatch * 10_000 + scoreRootCandidate(node, adjacency, promptText);
+    if (targetCandidates.some((candidate) => looksLikePersonName(candidate)) && node.effectiveType === "Person") score += 2_000;
+    if (targetCandidates.some((candidate) => looksLikeOrganizationName(candidate)) && ["Organization", "Institution"].includes(node.effectiveType)) score += 2_000;
+    if (score > matchedTargetScore) {
+      matchedTargetScore = score;
+      matchedTargetNodeId = node.id;
+    }
+  }
+  if (matchedTargetNodeId) return matchedTargetNodeId;
 
   let bestNodeId: string | null = null;
   let bestScore = Number.NEGATIVE_INFINITY;
   for (const node of nodes) {
-    const aliases = uniqueStrings([node.display, ...pickStringArray(node.properties, "alt_names")]);
-    const degree = adjacency.get(node.id)?.size ?? 0;
-    let score = degree * 12 + node.qualityScore + nodePriority(node.effectiveType);
-    if (node.effectiveType === "Person") score += 280;
-    if (promptMentionsAlias(promptText, aliases)) score += 220;
-    if (pickStringArray(node.properties, "merge_keys").some((key) => key.startsWith("name:person:"))) score += 180;
-    if (isUrlLike(node.display)) score -= 100;
-    if (node.noise) score -= 400;
+    const score = scoreRootCandidate(node, adjacency, promptText);
     if (score > bestScore) {
       bestScore = score;
       bestNodeId = node.id;
@@ -863,6 +968,7 @@ function augmentProjectedGraph(
         if (institutionNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, institutionNode.id, "ISSUED_BY");
       }
       for (const field of extractAttributeValues(node.properties, ["field"])) {
+        if (!looksLikeCompactTopicLabel(field)) continue;
         const topicNode = upsertSyntheticNode(projectedNodes, "Topic", field);
         if (topicNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, topicNode.id, "HAS_TOPIC");
       }
@@ -886,12 +992,9 @@ function augmentProjectedGraph(
     }
 
     if (node.effectiveType === "Repository" || node.effectiveType === "Project") {
-      for (const language of extractAttributeValues(node.properties, ["language"])) {
-        const languageNode = upsertSyntheticNode(projectedNodes, "Language", language, { attributes: ["language_kind: programming"] });
-        if (languageNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, languageNode.id, "USES_LANGUAGE");
-      }
       for (const topicField of extractAttributeValues(node.properties, ["topics", "topic"])) {
         for (const topic of splitDelimitedValues(topicField).slice(0, 10)) {
+          if (!looksLikeCompactTopicLabel(topic)) continue;
           const topicNode = upsertSyntheticNode(projectedNodes, "Topic", topic);
           if (topicNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, topicNode.id, "HAS_TOPIC");
         }
@@ -918,6 +1021,7 @@ function augmentProjectedGraph(
         }
       }
       for (const focusValue of extractAttributeValues(node.properties, ["focus", "industry"])) {
+        if (!looksLikeCompactTopicLabel(focusValue)) continue;
         const topicNode = upsertSyntheticNode(projectedNodes, "Topic", focusValue);
         if (topicNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, topicNode.id, "FOCUSES_ON");
       }
@@ -925,6 +1029,7 @@ function augmentProjectedGraph(
 
     if (node.effectiveType === "OrganizationProfile") {
       for (const focusValue of extractAttributeValues(node.properties, ["focus", "industry"])) {
+        if (!looksLikeCompactTopicLabel(focusValue)) continue;
         const topicNode = upsertSyntheticNode(projectedNodes, "Topic", focusValue);
         if (topicNode) upsertSyntheticEdge(projectedEdgesByKey, node.id, topicNode.id, "FOCUSES_ON");
       }

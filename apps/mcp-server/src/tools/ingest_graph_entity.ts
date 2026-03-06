@@ -333,7 +333,7 @@ function extractAttributeValues(attributes: string[], prefixes: string[]): strin
 function graphAutoAliases(entityType: string, values: string[]): string[] {
   const aliases: string[] = [];
   const family = entityType.toLowerCase();
-  const conservativeFamilies = new Set(["contactpoint", "educationalcredential", "experience", "affiliation", "timelineevent", "timenode", "occupation", "imageobject", "organizationprofile", "language"]);
+  const conservativeFamilies = new Set(["contactpoint", "educationalcredential", "experience", "affiliation", "timelineevent", "timenode", "occupation", "imageobject", "organizationprofile"]);
   const stopwords = new Set(["the", "of", "at", "for", "and", "in", "on", "to"]);
   for (const value of values) {
     const text = String(value ?? "").trim();
@@ -367,7 +367,7 @@ function graphEntityFamily(entityType: string): string {
   if (normalized === "conference") return "conference";
   if (normalized === "publication" || normalized === "document") return "publication";
   if (normalized === "repository") return "repository";
-  if (normalized === "language") return "language";
+  if (normalized === "language") return "topic";
   if (normalized === "website" || normalized === "domain" || normalized === "email" || normalized === "handle" || normalized === "phone") return "digital";
   if (normalized === "contactpoint") return "contact";
   if (normalized === "educationalcredential") return "credential";
@@ -412,7 +412,7 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
     publication: "Publication",
     repository: "Repository",
     role: "Role",
-    language: "Language",
+    language: "Topic",
     snippet: "Document",
     timelineevent: "TimelineEvent",
     timeline_event: "TimelineEvent",
@@ -433,14 +433,14 @@ function canonicalizeEntityType(entityType: string, canonicalName = "", attribut
   if (/occupation|job family|profession/.test(joined)) return "Occupation";
   if (/image object|profile image|avatar|headshot/.test(joined)) return "ImageObject";
   if (/organization profile|org profile|company overview|institution overview|school overview|lab overview|subject org/.test(joined)) return "OrganizationProfile";
-  if (/topic kind language|language kind|programming language|spoken language/.test(joined)) return "Language";
+  if (/topic kind language|language kind|programming language|spoken language/.test(joined)) return "Topic";
   if (/orcid|researcher|author|person|advisor|coauthor|employee|founder|director/.test(joined)) return "Person";
   if (/university|college|institute|school|department|lab|laboratory/.test(joined)) return "Institution";
   if (/company|organization|corp|llc|committee|agency|firm|startup/.test(joined)) return "Organization";
   if (/conference|workshop|symposium|venue/.test(joined)) return "Conference";
   if (/repository|repo/.test(joined)) return "Repository";
   if (/project|framework|initiative|program/.test(joined)) return "Project";
-  if (/programming language|spoken language/.test(joined)) return "Language";
+  if (/programming language|spoken language/.test(joined)) return "Topic";
   if (/topic|theme|keyword|method/.test(joined)) return "Topic";
   if (/award|prize|fellowship|honor/.test(joined)) return "Award";
   if (/grant|award id|nsf|nih/.test(joined)) return "Grant";
@@ -480,7 +480,6 @@ function entityTypeRank(entityType: string): number {
     role: 102,
     publication: 98,
     conference: 92,
-    language: 91,
     project: 88,
     topic: 84,
     organizationprofile: 83,
@@ -564,7 +563,7 @@ function deriveMergeKeys(
     const normalized = normalizeName(name);
     if (normalized) keys.push(`name:${family}:${normalized}`);
     const signature = graphNameSignature(name);
-    if (signature && signature !== normalized && ["org", "conference", "topic", "project", "language"].includes(family)) {
+    if (signature && signature !== normalized && ["org", "conference", "topic", "project"].includes(family)) {
       keys.push(`sig:${family}:${signature}`);
     }
   }
@@ -803,7 +802,6 @@ function deriveOsintBucket(entityType: string, names: string[], attributes: stri
   if (/(experience|credential|affiliation|occupation|timeline event|timelineevent|time node|timenode|contact point|contactpoint)/.test(joined)) return "person";
   if (/(organization profile|org profile|subject org)/.test(joined)) return "organization";
   if (/(organization|company|institution|agency|university|lab|firm|committee)/.test(joined)) return "organization";
-  if (/(language kind|programming language|spoken language)/.test(joined)) return "language";
   if (/(domain|website|hostname|repository|repo|account|username|handle|email|phone|imageobject|image object)/.test(joined)) return "digital_asset";
   if (/(location|city|country|address|region|state)/.test(joined)) return "location";
   if (/(article|paper|publication|grant|patent|conference|report)/.test(joined)) return "publication";

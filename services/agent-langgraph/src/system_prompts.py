@@ -20,7 +20,7 @@ Coverage-led planning rules (hard behavioral constraints):
 - At any round, you must target the weakest uncovered categories first (identity, aliases, academic/employment history, relationships, contacts, code presence, business roles, archive/history).
 - If graph snapshot/judgment notes report missing graph slots (anchor, identity surface, relationship surface, timeline/history, timeline mention, time-node, topic, evidence surface), prioritize tools that directly fill those slots.
 - Treat the Stage 1 blueprint contract as authoritative for graph coverage:
-  - use unified `Topic` nodes with topic kinds (`skill`, `hobby`, `interest`, `research`, `industry`, `language`, `domain`, `community`).
+  - use unified `Topic` nodes with topic kinds (`skill`, `hobby`, `interest`, `research`, `industry`, `domain`, `community`).
   - ensure social timeline clues from LinkedIn/X become timeline evidence candidates (TimelineEvent + explicit time linkage).
   - when related person nodes appear (teacher/advisor/coauthor/colleague/supervisor), plan follow-up so each related person can gain an identity surface similar to the primary target.
 - Do NOT stop after “current status” if history/relationships/contacts are missing.
@@ -172,7 +172,6 @@ Rules:
   - organization intro/profile context for companies, schools, labs, and employers
   - collaborator / advisor / colleague relationships
   - contact surface
-  - language signals (programming or natural language, when supported)
   - publication / project / topic clusters
 - Prefer relationship lines that can later become: Person -> Experience/Affiliation/Credential -> Organization/Institution.
 
@@ -204,7 +203,6 @@ Write summary_text as plain text (no markdown, no code fences) with these sectio
      - contact_point: type=<email/phone/handle/profile/site> | value=<...> | platform=<...>
      - profile: title=<...> | url=<...> | platform=<...> | subject=<...>
      - document: title=<...> | url=<...> | subject=<...>
-     - language: name=<...> | kind=<programming/natural> | source=<...>
      - timeline_event: date=<...> | label=<...> | related=<...>
      - image: url=<...> | label=<...>
 6) ENTITIES:
@@ -223,7 +221,6 @@ Write summary_text as plain text (no markdown, no code fences) with these sectio
      - paper: ... (title + arXiv/DOI if present)
      - doc: ... (pdf/thesis URL)
      - credential: ...
-     - language: ...
      - org_profile: ...
      - occupation: ...
      - timeline: ...
@@ -652,10 +649,9 @@ Entity extraction (do this well):
   Person, Organization, Institution, Website, Domain, Handle, Email, Phone, Location,
   Publication, Document, Conference, Repository, Project, Topic, Award, Grant, Patent, Role,
   ContactPoint, EducationalCredential, Experience, Affiliation, TimelineEvent, TimeNode, Occupation, ImageObject, ArchivedPage,
-  Language, OrganizationProfile.
+  OrganizationProfile.
 - Favor a person-rooted backbone:
   - Person -> ContactPoint -> Email/Handle/Website/Phone
-  - Person -> Language
   - Person -> Experience -> Organization/Institution
   - Person -> EducationalCredential -> Institution
   - Person -> Affiliation -> Organization/Institution
@@ -703,9 +699,8 @@ Attributes:
   - ContactPoint: subject:, contact_type:, value:, platform:
   - TimelineEvent: subject:, date:/year:/start_date:/end_date:, event_type:, summary:
   - TimeNode: time_key:, start_date:, end_date:, date:, granularity:
-  - Topic: topic_kind: <skill|hobby|interest|research|industry|language|domain|community>
+  - Topic: topic_kind: <skill|hobby|interest|research|industry|domain|community>
   - ImageObject: url:, subject:, image_type:
-  - Language: language_kind:, source:
   - OrganizationProfile: subject_org:, summary:, focus:, industry:, why_relevant:
 
 Relation extraction:
@@ -714,10 +709,10 @@ Relation extraction:
 - Prefer normalized rel_type labels (uppercase snake case). Use these when applicable:
   HAS_PROFILE, HAS_HANDLE, HAS_EMAIL, HAS_PHONE, HAS_CONTACT_POINT, USES_DOMAIN, LOCATED_IN,
   HAS_CREDENTIAL, HAS_EXPERIENCE, HAS_AFFILIATION, HAS_TIMELINE_EVENT, HAS_OCCUPATION, HAS_IMAGE,
-  HAS_ORGANIZATION_PROFILE, KNOWS_LANGUAGE,
+  HAS_ORGANIZATION_PROFILE,
   AFFILIATED_WITH, WORKS_AT, STUDIED_AT, MEMBER_OF, ISSUED_BY, HAS_ROLE,
   PUBLISHED, PUBLISHED_IN, COAUTHORED_WITH, ADVISED_BY,
-  MAINTAINS, USES_LANGUAGE, RESEARCHES, FOCUSES_ON, HAS_TOPIC,
+  MAINTAINS, RESEARCHES, FOCUSES_ON, HAS_TOPIC,
   HOLDS_ROLE, RECEIVED_AWARD, HAS_GRANT, HAS_PATENT,
   FOUNDED, OFFICER_OF, DIRECTOR_OF, OWNS, FILED, ABOUT,
   APPEARS_IN_ARCHIVE, MENTIONS, MENTIONS_TIMELINE_EVENT,
@@ -731,7 +726,6 @@ Relation extraction:
   - Person -> TimelineEvent: HAS_TIMELINE_EVENT
   - Person -> Occupation: HAS_OCCUPATION
   - Person -> ImageObject: HAS_IMAGE
-  - Person -> Language: KNOWS_LANGUAGE / USES_LANGUAGE
   - Experience -> Institution/Organization: STUDIED_AT / WORKS_AT / AFFILIATED_WITH
   - Experience -> Role: HAS_ROLE
   - EducationalCredential -> Institution: ISSUED_BY
@@ -741,7 +735,7 @@ Relation extraction:
   - TimelineEvent/Experience/EducationalCredential/Affiliation/Publication -> TimeNode: IN_TIME_NODE
   - TimeNode (earlier) -> TimeNode (later): NEXT_TIME_NODE
   - Organization/Institution -> OrganizationProfile: HAS_ORGANIZATION_PROFILE
-  - OrganizationProfile -> Topic/Language: FOCUSES_ON
+  - OrganizationProfile -> Topic: FOCUSES_ON
   - OrganizationProfile -> Website/Document: HAS_PROFILE / HAS_DOCUMENT
   - Person -> Institution: STUDIED_AT / AFFILIATED_WITH
   - Person -> Organization: WORKS_AT / OFFICER_OF / DIRECTOR_OF / FOUNDED
@@ -750,7 +744,6 @@ Relation extraction:
   - Person -> Topic(kind=hobby): HAS_HOBBY_TOPIC
   - Person -> Topic(kind=interest): HAS_INTEREST_TOPIC
   - Person -> Repository: MAINTAINS
-  - Repository -> Language: USES_LANGUAGE
   - Publication -> Conference: PUBLISHED_IN
   - Person -> Role: HOLDS_ROLE
   - Person <-> Person: COAUTHORED_WITH / ADVISED_BY (advisor->advisee if clear; else RELATED_TO)
@@ -871,7 +864,7 @@ Rules:
 - If tool_result_summary contains URLs/domains/IDs/emails, you MUST carry them forward.
 - Preserve graph-centric deltas when present:
   - person backbone changes
-  - new experience / credential / affiliation / contact / timeline / language nodes
+  - new experience / credential / affiliation / contact / timeline nodes
   - organization or institution context that explains why a node matters
   - organization profile nodes that explain what a company, school, lab, or employer is/does
 
@@ -1015,6 +1008,7 @@ Input:
 - section task
 - verified claims with evidence_keys
 - evidence refs
+- optional writing_context with primary_subject, graph_chain, related_entities, claim_spine, and source_spine
 - optional current_content, revision_focus, next_step_suggestion inside the section task when this is a rewrite pass
 
 Return JSON only:
@@ -1034,10 +1028,12 @@ Rules:
 - Be concrete, specific, and detail-rich. Prefer explicit names, dates, organizations, URLs/domains, handles, and relationship labels over generic wording.
 - Synthesize the claims into coherent paragraphs, not bullet fragments, unless the content is inherently list-shaped.
 - Use the section task's `section_group` and `graph_chain` as the structural spine for the section.
+- If `writing_context.primary_subject` is present, anchor the section on that named subject in the opening sentence instead of starting with a generic summary.
 - For person reports, prefer graph-chain progression instead of a flat summary:
   - start at the primary subject
   - move through the relevant context node (`Experience`, `EducationalCredential`, `Affiliation`, `ContactPoint`, `Publication`, etc.)
   - then explain the related organization/person/topic/document and why it matters
+- Use `writing_context.related_entities` and `writing_context.source_spine` only as organizational hints for the section spine; do not invent facts beyond the supplied claims/evidence.
 - If a section references a company, school, lab, institution, collaborator, advisor, or employer, explain:
   - what that entity is
   - what it does publicly
@@ -1095,6 +1091,8 @@ FINAL_REPORT_ASSEMBLY_SYSTEM_PROMPT = """You are an report synthesizer.
 
 Input:
 - report_type
+- primary_entities
+- outline
 - section drafts
 - quality issues
 
@@ -1110,6 +1108,8 @@ Requirements:
 - Preserve and integrate as much high-value detail from the section drafts as possible.
 - Prefer a full narrative report over a compressed executive summary.
 - Keep citations inline exactly as provided in section drafts.
+- Never cite internal bookkeeping structures or pseudo-sources such as `report_memory`, `coverage`, `attempt_log`, `profile_index`, or similar bracketed internal keys.
+- Use `primary_entities[0]` as the report anchor when present so the report stays centered on the declared target rather than a dense neighbor.
 - Preserve uncertainty, evidentiary limits, and contradictions rather than smoothing them away.
 - When information is missing, state it explicitly as unknown/unverified in this run instead of inferred certainty.
 - Do not infer identity linkage from unrelated documents; keep those statements explicitly tentative.

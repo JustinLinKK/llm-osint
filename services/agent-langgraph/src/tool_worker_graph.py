@@ -1345,8 +1345,6 @@ def _infer_osint_bucket(entity_type: str, canonical_name: str, attributes: List[
         return "digital_asset"
     if any(token in joined for token in ("article", "paper", "publication", "patent", "grant", "conference")):
         return "publication"
-    if any(token in joined for token in ("programming language", "spoken language", "language_kind")):
-        return "language"
     if any(token in joined for token in ("topic", "theme", "keyword", "language", "framework", "method")):
         return "topic"
     if any(token in joined for token in ("project", "initiative", "program")):
@@ -1385,7 +1383,7 @@ def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attribut
         "repository": "Repository",
         "project": "Project",
         "topic": "Topic",
-        "language": "Language",
+        "language": "Topic",
         "award": "Award",
         "grant": "Grant",
         "patent": "Patent",
@@ -1424,7 +1422,7 @@ def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attribut
     if any(token in normalized for token in ("organization profile", "org profile", "company overview", "institution overview", "school overview", "lab overview", "subject org")):
         return "OrganizationProfile"
     if "topic kind language" in normalized or "language kind" in normalized:
-        return "Language"
+        return "Topic"
     if any(token in normalized for token in ("orcid", "researcher", "author", "person", "advisor", "coauthor", "employee", "founder", "director")):
         return "Person"
     if any(token in normalized for token in ("university", "college", "institute", "school", "department", "lab", "laboratory")):
@@ -1438,7 +1436,7 @@ def _canonical_graph_entity_type(entity_type: str, canonical_name: str, attribut
     if any(token in normalized for token in ("project", "framework", "initiative", "program")):
         return "Project"
     if any(token in normalized for token in ("programming language", "spoken language")):
-        return "Language"
+        return "Topic"
     if any(token in normalized for token in ("topic", "theme", "keyword", "method")):
         return "Topic"
     if any(token in normalized for token in ("award", "prize", "fellowship", "honor")):
@@ -1592,17 +1590,9 @@ def _canonical_graph_relation_type(rel_type: str, src_type: str, dst_type: str) 
         return "HAS_GRANT"
     if dst_type == "Patent":
         return "HAS_PATENT"
-    if dst_type == "Language":
-        if src_type == "Repository":
-            return "USES_LANGUAGE"
-        if src_type == "OrganizationProfile":
-            return "FOCUSES_ON"
-        if src_type == "Person":
-            return "KNOWS_LANGUAGE"
-        return "USES_LANGUAGE"
     if dst_type == "Topic":
         if src_type == "Repository":
-            return "USES_LANGUAGE"
+            return "HAS_TOPIC"
         if src_type == "OrganizationProfile":
             return "FOCUSES_ON"
         if src_type == "Person":
@@ -1639,7 +1629,6 @@ def _graph_auto_aliases(entity_type: str, values: List[str]) -> List[str]:
         "occupation",
         "imageobject",
         "organizationprofile",
-        "language",
     }
     stopwords = {"the", "of", "at", "for", "and", "in", "on", "to"}
     for value in values:
@@ -1676,7 +1665,7 @@ def _graph_entity_family(entity_type: str) -> str:
     if normalized in {"repository"}:
         return "repository"
     if normalized == "language":
-        return "language"
+        return "topic"
     if normalized in {"website", "domain", "email", "handle", "phone"}:
         return "digital"
     if normalized == "contactpoint":
@@ -1729,7 +1718,7 @@ def _graph_entity_merge_keys(entity_type: str, canonical_name: str, alt_names: L
         if normalized:
             keys.append(f"name:{family}:{normalized}")
         signature = _graph_name_signature(name)
-        if signature and signature != normalized and family in {"org", "conference", "topic", "project", "language"}:
+        if signature and signature != normalized and family in {"org", "conference", "topic", "project"}:
             keys.append(f"sig:{family}:{signature}")
     for value in [canonical_name, *alt_names, *_graph_attribute_values(attributes, "url", "domain", "email", "handle", "username", "id", "doi", "arxiv_id")]:
         text = str(value or "").strip()
@@ -2925,23 +2914,6 @@ def _supplemental_graph_components_from_result(
             if owner_name:
                 add_relation(owner_name, topic, relation_type)
 
-    def add_language_node(language_name: str, *, kind: str = "", source: str = "") -> str | None:
-        text = str(language_name or "").strip()
-        if not text:
-            return None
-        attrs: List[str] = []
-        if kind:
-            attrs.append(f"language_kind: {kind}")
-        if source:
-            attrs.append(f"source: {source}")
-        return add_entity(text, "Language", attributes=attrs)
-
-    def add_language_context(owner_name: str | None, language_name: str, *, kind: str = "", source: str = "", relation_type: str = "KNOWS_LANGUAGE") -> str | None:
-        language_node = add_language_node(language_name, kind=kind, source=source)
-        if owner_name and language_node:
-            add_relation(owner_name, language_node, relation_type)
-        return language_node
-
     def add_organization_profile(
         org_name: str,
         *,
@@ -3511,33 +3483,14 @@ def _supplemental_graph_components_from_result(
             continue
         repo_name = str(repo.get("name") or "").strip()
         repo_url = _clean_url_candidate(str(repo.get("url") or "").strip())
-        language = str(repo.get("language") or "").strip()
         repo_attributes = [f"url: {repo_url}"] if repo_url else []
-        if language:
-            repo_attributes.append(f"language: {language}")
         if repo_name or repo_url:
             repo_id = repo_name or repo_url
             add_entity(repo_id, "Repository", attributes=repo_attributes)
             if primary_person:
                 add_relation(primary_person, repo_id, "MAINTAINS")
-            if language:
-                language_node = add_language_node(language, kind="programming", source="repository metadata")
-                if language_node:
-                    add_relation(repo_id, language_node, "USES_LANGUAGE")
             if repo_url:
                 consumed_urls.add(repo_url.lower())
-
-    for language in _extract_string_list(result.get("top_languages"))[:6]:
-        add_language_context(primary_person, language, kind="programming", source="profile top languages", relation_type="USES_LANGUAGE")
-
-    for language in _graph_unique_strings(
-        [
-            *_extract_string_list(result.get("languages"))[:8],
-            *_extract_string_list(result.get("spoken_languages"))[:8],
-            *_extract_string_list(result.get("known_languages"))[:8],
-        ]
-    ):
-        add_language_context(primary_person, language, kind="natural", source="profile language signal", relation_type="KNOWS_LANGUAGE")
 
     add_topic_bundle(
         primary_person,
@@ -4613,7 +4566,7 @@ def _summarize_result(
             )
             emails = _extract_strings_from_text(combined_text, kind="email")
             phones = _extract_phone_numbers_from_text(combined_text)
-            related_people = _extract_related_people(combined_text, exclude_names=[target_name])
+            related_people = _extract_related_people_from_search_rows(results, target_name)
             history_terms = _extract_history_markers(combined_text)
             if urls:
                 key_facts.append({"profileUrls": urls[:10]})
@@ -4794,7 +4747,7 @@ def _summarize_result(
                 for item in rows
                 if isinstance(item, dict)
             )
-            related_people = _extract_related_people(combined_text, exclude_names=[target_name])
+            related_people = _extract_related_people_from_search_rows(rows, target_name)
             emails = _extract_strings_from_text(combined_text, kind="email")
             phones = _extract_phone_numbers_from_text(combined_text)
             source_types = _extract_serp_source_types(rows)
@@ -4844,7 +4797,10 @@ def _summarize_result(
                 page_urls.append(page_url)
             combined_text += " " + str(page.get("title") or "") + " " + str(page.get("extracted_text") or "")
         page_urls = _dedupe_str_list(page_urls)
-        related_people = _extract_related_people(combined_text, exclude_names=[str(arguments.get("target_name") or "").strip()])
+        related_people = _extract_related_people_from_search_rows(
+            page_rows,
+            str(arguments.get("target_name") or "").strip(),
+        )
         emails = _extract_strings_from_text(combined_text, kind="email")
         phones = _extract_phone_numbers_from_text(combined_text)
         key_facts.append({"resultsFound": result.get("results_found")})
@@ -5175,7 +5131,7 @@ def _summarize_technical_tool_result(
         if not isinstance(item, dict):
             continue
         compact = {}
-        for key in ("name", "url", "language", "stars", "updated_at"):
+        for key in ("name", "url", "stars", "updated_at"):
             if key in item:
                 compact[key] = item.get(key)
         if compact:
@@ -6100,6 +6056,31 @@ def _extract_phone_numbers_from_text(text: Any) -> List[str]:
     )
 
 
+SEARCH_RELATED_PERSON_RELATION_REGEX = re.compile(
+    r"\b("
+    r"advisor|advisors|advisee|advisees|author|authors|coauthor|coauthors|collaborator|collaborators|"
+    r"colleague|colleagues|mentor|mentors|lab member|lab members|team member|team members|"
+    r"works with|worked with|member of|director|officer|founder"
+    r")\b",
+    re.IGNORECASE,
+)
+SEARCH_RELATED_PERSON_ANCHOR_REGEX = re.compile(
+    r"\b("
+    r"paper|papers|publication|publications|preprint|thesis|dissertation|university|lab|laboratory|"
+    r"institute|department|faculty|research|profile|biography|homepage|cv|curriculum vitae"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _target_person_aliases(target_name: str) -> List[str]:
+    aliases = extract_person_targets(target_name or "")
+    cleaned_target = str(target_name or "").strip()
+    if cleaned_target:
+        aliases.append(cleaned_target)
+    return _dedupe_str_list([item for item in aliases if item.strip()])
+
+
 def _extract_related_people(text: Any, exclude_names: List[str] | None = None) -> List[str]:
     if not isinstance(text, str) or not text.strip():
         return []
@@ -6109,6 +6090,42 @@ def _extract_related_people(text: Any, exclude_names: List[str] | None = None) -
         if name.casefold() in excluded:
             continue
         candidates.append(name)
+    return _dedupe_str_list(candidates)
+
+
+def _search_row_supports_related_person(
+    *,
+    url: str,
+    title: str,
+    text: str,
+    target_name: str,
+) -> bool:
+    blob = " ".join(part for part in (title, text) if isinstance(part, str) and part.strip())
+    if not blob:
+        return False
+    target_aliases = _target_person_aliases(target_name)
+    same_page_as_target = any(alias.lower() in blob.lower() for alias in target_aliases if alias)
+    profileish_url = bool(url and _graph_is_profileish_result_url(url, title))
+    explicit_relation = bool(SEARCH_RELATED_PERSON_RELATION_REGEX.search(blob))
+    supporting_anchor = bool(SEARCH_RELATED_PERSON_ANCHOR_REGEX.search(blob))
+    return explicit_relation or profileish_url or (same_page_as_target and supporting_anchor)
+
+
+def _extract_related_people_from_search_rows(rows: Any, target_name: str) -> List[str]:
+    if not isinstance(rows, list):
+        return []
+    excluded = _target_person_aliases(target_name)
+    candidates: List[str] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        title = str(item.get("title") or "").strip()
+        text = str(item.get("extracted_text") or item.get("snippet") or item.get("text") or "").strip()
+        if not _search_row_supports_related_person(url=url, title=title, text=text, target_name=target_name):
+            continue
+        blob = " ".join(part for part in (title, text) if part)
+        candidates.extend(_extract_related_people(blob, exclude_names=excluded)[:6])
     return _dedupe_str_list(candidates)
 
 

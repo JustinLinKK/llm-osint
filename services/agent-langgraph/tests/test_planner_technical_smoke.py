@@ -150,6 +150,35 @@ def _load_planner_graph_module(monkeypatch):
     return module
 
 
+def test_extract_primary_person_targets_prefers_canonical_receipt_identity(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    state = {
+        "prompt": "profile Xinyu Pi",
+        "inputs": [],
+        "tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="cross_platform_profile_resolver",
+                ok=True,
+                summary="Resolved canonical identity.",
+                key_facts=[
+                    {
+                        "canonical_identity": {
+                            "canonical_name": "Frederick Xinyu Pi",
+                            "aliases": ["Xinyu Pi"],
+                        }
+                    }
+                ],
+            )
+        ],
+    }
+
+    targets = planner_graph._extract_primary_person_targets(state)
+
+    assert targets[0] == "Frederick Xinyu Pi"
+
+
 def test_planner_smoke_runs_technical_followups(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 
@@ -1192,3 +1221,161 @@ def test_graph_stop_gate_waives_social_timeline_slots_after_retry_exhaustion(mon
     )
     assert ok is True
     assert note == ""
+
+
+def test_adjudicate_related_entity_candidates_uses_llm_override_for_anchored_person(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    class FakeLLM:
+        def complete_json(self, system_prompt, user_payload, temperature=0.1, timeout=None, run_id=None, operation=None):
+            assert operation == "planner.related_entity_adjudication"
+            return {
+                "candidates": [
+                    {
+                        "input_name": "Yan Gao",
+                        "canonical_name": "Yan Gao",
+                        "entity_type": "person",
+                        "confidence": 0.92,
+                        "expandable": True,
+                        "reason": "Evidence indicates a specific coauthor tied to the primary target.",
+                        "supporting_spans": ["coauthors: Xinyu Pi, Yan Gao"],
+                    }
+                ]
+            }
+
+    receipts = [
+        ReceiptStub(
+            run_id="run-1",
+            tool_name="semantic_scholar_search",
+            ok=True,
+            summary="Semantic Scholar returned Xinyu Pi at UC San Diego.",
+            key_facts=[
+                {"sourceUrls": ["https://www.semanticscholar.org/author/123", "https://cse.ucsd.edu/people/xinyu-pi"]},
+                {"organizations": ["University of California, San Diego"]},
+            ],
+        ),
+        ReceiptStub(
+            run_id="run-1",
+            tool_name="tavily_research",
+            ok=True,
+            summary="Publication snippet mentions Xinyu Pi and Yan Gao as coauthors.",
+            key_facts=[
+                {"relatedPeople": ["Yan Gao"]},
+                {"coauthors": [{"name": "Yan Gao"}, {"name": "Xinyu Pi"}]},
+                {"sourceUrls": ["https://example.edu/papers/xinyu-pi-yan-gao"]},
+            ],
+        ),
+    ]
+
+    candidates, _notes = planner_graph._adjudicate_related_entity_candidates(
+        llm=FakeLLM(),
+        run_id="run-1",
+        receipts=receipts,
+        primary_person_targets=["Xinyu Pi"],
+        candidates=[
+            {
+                "entity_name": "Yan Gao",
+                "entity_type": "person",
+                "relationship_types": ["COAUTHORED_WITH"],
+                "supporting_tools": ["tavily_research"],
+                "domains": ["example.edu"],
+                "urls": ["https://example.edu/papers/xinyu-pi-yan-gao"],
+                "mention_count": 1,
+                "score": 2,
+            }
+        ],
+    )
+
+    assert candidates[0]["entity_type"] == "person"
+    assert candidates[0]["expandable"] is True
+    assert candidates[0]["adjudication_source"] == "llm"
+
+
+def test_planner_review_receipts_defers_unanchored_secondary_people_in_simple_scholar_mode(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+    graph = planner_graph.build_planner_graph(mcp_client=object(), llm=None)
+    planner_review_receipts = graph.nodes["planner_review_receipts"]
+
+    state = {
+        "run_id": "run-1",
+        "prompt": "Investigate Xinyu Pi",
+        "inputs": ["Xinyu Pi"],
+        "seed_urls": [],
+        "pending_urls": [],
+        "current_fetch_urls": [],
+        "visited_urls": [],
+        "allowed_hosts": [],
+        "tool_plan": [],
+        "latest_tool_receipts": [
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="semantic_scholar_search",
+                ok=True,
+                summary="Semantic Scholar resolved Xinyu Pi at UC San Diego.",
+                key_facts=[
+                    {
+                        "candidates": [
+                            {
+                                "canonical_name": "Xinyu Pi",
+                                "affiliations": ["University of California, San Diego"],
+                                "evidence": [{"snippet": "Xinyu Pi, University of California, San Diego"}],
+                            }
+                        ]
+                    },
+                    {"sourceUrls": ["https://www.semanticscholar.org/author/123", "https://cse.ucsd.edu/people/xinyu-pi"]},
+                    {"organizations": ["University of California, San Diego"]},
+                ],
+            ),
+            ReceiptStub(
+                run_id="run-1",
+                tool_name="tavily_research",
+                ok=True,
+                summary="Search surfaced multiple Yan Gao profiles across unrelated institutions.",
+                arguments={"runId": "run-1", "input": "Yan Gao"},
+                key_facts=[
+                    {"relatedPeople": ["Yan Gao"]},
+                    {"coauthors": [{"name": "Yan Gao", "count": 1}]},
+                    {
+                        "sourceUrls": [
+                            "https://www.mcw.edu/departments/biostatistics/faculty/yan-gao",
+                            "https://theorg.com/org/flower-labs/org-chart/yan-gao",
+                            "https://icmab.es/researchers/yan-gao",
+                        ]
+                    },
+                ],
+            ),
+        ],
+        "rationale": "",
+        "documents_created": [],
+        "tool_receipts": [],
+        "iteration": 0,
+        "max_iterations": 3,
+        "done": False,
+        "enough_info": False,
+        "noteboard": [],
+        "noteboard_sections": planner_graph._empty_noteboard_sections(),
+        "next_stage": "stage1",
+        "queued_tasks": [],
+        "related_entity_candidates": [],
+        "academic_task_dedupe": {},
+        "technical_task_dedupe": {},
+        "business_task_dedupe": {},
+        "archive_identity_task_dedupe": {},
+        "relationship_task_dedupe": {},
+        "depth_task_dedupe": {},
+        "coverage_ledger": planner_graph.empty_coverage_ledger(),
+    }
+
+    updated = planner_review_receipts(state)
+
+    assert not any(
+        item["tool_name"] in {"tavily_research", "person_search", "github_identity_search", "tavily_person_search"}
+        and (
+            item["payload"].get("input") == "Yan Gao"
+            or item["payload"].get("name") == "Yan Gao"
+            or item["payload"].get("person_name") == "Yan Gao"
+            or item["payload"].get("target_name") == "Yan Gao"
+        )
+        for item in updated["queued_tasks"]
+    )
+    assert any("simple scholar mode" in item.lower() for item in updated["noteboard_sections"]["depth_candidates"])

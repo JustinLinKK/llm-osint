@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
@@ -90,7 +89,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], projects: Lis
 
     repo_items: List[Dict[str, Any]] = []
     org_items: List[Dict[str, Any]] = []
-    language_counter: Counter[str] = Counter()
     for project in projects[:10]:
         project_url = str(project.get("web_url") or "").strip()
         path_with_namespace = str(project.get("path_with_namespace") or "").strip()
@@ -106,14 +104,10 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], projects: Lis
                     "relation": "namespace_member",
                 }
             )
-        language = str(project.get("language") or "").strip()
-        if language:
-            language_counter[language] += 1
         repo_items.append(
             {
                 "name": path_with_namespace,
                 "url": project_url,
-                "language": language or None,
                 "description": clean_text(project.get("description"), max_len=160),
                 "stars": project.get("star_count"),
                 "updated_at": project.get("last_activity_at"),
@@ -147,7 +141,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], projects: Lis
             "display_name": display_name,
             "bio": bio,
             "repo_count": len(repo_items),
-            "top_languages": [name for name, _ in language_counter.most_common(5)],
         }
     )
     return validate_result_shape(result)

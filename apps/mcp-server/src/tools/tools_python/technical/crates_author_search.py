@@ -56,7 +56,7 @@ def run(input_data: Dict[str, Any]) -> Dict[str, Any]:
         publications.append(publication)
         if repo_url:
             repositories.append(
-                {"name": crate_name, "url": repo_url, "language": "Rust", "updated_at": crate.get("updated_at")}
+                {"name": crate_name, "url": repo_url, "updated_at": crate.get("updated_at")}
             )
         evidence.append(
             build_evidence(

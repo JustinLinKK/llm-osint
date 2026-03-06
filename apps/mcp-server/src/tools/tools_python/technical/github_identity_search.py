@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
@@ -251,7 +250,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], orgs: List[Di
         reasons.append("public email matched query")
 
     repo_items: List[Dict[str, Any]] = []
-    language_counter: Counter[str] = Counter()
     last_active = str(user.get("updated_at") or "").strip() or None
     latest_repo_push = ""
     for repo in repos[:10]:
@@ -259,9 +257,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], orgs: List[Di
         repo_name = str(repo.get("full_name") or repo.get("name") or "").strip()
         if not repo_url or not repo_name:
             continue
-        language = str(repo.get("language") or "").strip()
-        if language:
-            language_counter[language] += 1
         pushed_at = str(repo.get("pushed_at") or "").strip()
         if pushed_at and pushed_at > latest_repo_push:
             latest_repo_push = pushed_at
@@ -269,7 +264,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], orgs: List[Di
             {
                 "name": repo_name,
                 "url": repo_url,
-                "language": language or None,
                 "description": clean_text(repo.get("description"), max_len=160),
                 "stars": repo.get("stargazers_count"),
                 "fork": bool(repo.get("fork")),
@@ -337,7 +331,6 @@ def _candidate_result(query: Dict[str, Any], user: Dict[str, Any], orgs: List[Di
             "followers": user.get("followers"),
             "public_repos": user.get("public_repos"),
             "repo_count": len(repo_items),
-            "top_languages": [name for name, _ in language_counter.most_common(5)],
         }
     )
     return validate_result_shape(result)

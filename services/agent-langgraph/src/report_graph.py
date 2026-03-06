@@ -205,12 +205,12 @@ def build_report_graph(
         emit_stage(state, "build_outline_node", "completed", outline_count=len(fallback_outline), source="fallback")
         return {"outline": fallback_outline}
 
-    def _cached_graph_context_signals(entity_id: str) -> tuple[List[str], List[str], List[str]]:
+    def _cached_graph_context_signals(run_id: str, entity_id: str) -> tuple[List[str], List[str], List[str]]:
         with cache_lock:
             cached = entity_signal_cache.get(entity_id)
         if cached is not None:
             return cached
-        resolved = graph_context_signals(mcp_client, state["run_id"], [entity_id])
+        resolved = graph_context_signals(mcp_client, run_id, [entity_id])
         with cache_lock:
             return entity_signal_cache.setdefault(entity_id, resolved)
 
@@ -357,7 +357,7 @@ def build_report_graph(
         handles: List[str] = []
         domains: List[str] = []
         for entity_id in entity_ids:
-            item_aliases, item_handles, item_domains = _cached_graph_context_signals(entity_id)
+            item_aliases, item_handles, item_domains = _cached_graph_context_signals(state["run_id"], entity_id)
             aliases.extend(item_aliases)
             handles.extend(item_handles)
             domains.extend(item_domains)

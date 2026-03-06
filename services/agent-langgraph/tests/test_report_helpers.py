@@ -3,6 +3,7 @@ from report_helpers import (
     assemble_final_report,
     build_coverage_ledger,
     build_limits,
+    pick_primary_entities,
     build_report_memory,
     coverage_is_complete,
     pack_evidence,
@@ -202,6 +203,43 @@ def test_build_report_memory_recovers_profile_and_publication_inventory_from_rec
     assert "Bridging Human Interpretation and Machine Representation" in titles
 
 
+def test_pick_primary_entities_prefers_canonical_identity_from_receipts() -> None:
+    class _FakeMcpClient:
+        def call_tool(self, name: str, arguments: dict) -> object:
+            raise AssertionError("graph lookup should not be used when graph search is disabled")
+
+    receipts = [
+        ToolReceipt(
+            run_id="run-1",
+            tool_name="cross_platform_profile_resolver",
+            arguments={},
+            argument_signature="sig-1",
+            ok=True,
+            summary="Resolved canonical identity.",
+            key_facts=[
+                {
+                    "canonical_identity": {
+                        "canonical_name": "Frederick Xinyu Pi",
+                        "aliases": ["Xinyu Pi"],
+                    }
+                }
+            ],
+            artifact_ids=[],
+            document_ids=[],
+        )
+    ]
+
+    entities = pick_primary_entities(
+        mcp_client=_FakeMcpClient(),
+        run_id="run-1",
+        prompt="profile Xinyu Pi",
+        noteboard=["[Evidence] Primary target anchor: Frederick Xinyu Pi."],
+        receipts=receipts,
+    )
+
+    assert entities[0] == "Frederick Xinyu Pi"
+
+
 def test_assemble_final_report_accepts_long_form_llm_output() -> None:
     class _FakeLLM:
         def complete_json(self, prompt: str, payload: dict, temperature: float, timeout: int) -> dict:
@@ -259,6 +297,46 @@ def test_assemble_final_report_rejects_legacy_ledger_format() -> None:
     assert "## Core Identity and Professional Branding" in report
     assert "Coverage Ledger" not in report
     assert "Evidence Index" not in report
+
+
+def test_assemble_final_report_rejects_internal_report_memory_citations() -> None:
+    class _InternalRefLLM:
+        def complete_json(self, prompt: str, payload: dict, temperature: float, timeout: int, **kwargs: object) -> dict:
+            return {
+                "report_text": (
+                    "Qwen Deep Research Profile of Xinyu Pi\n\n"
+                    "## Identity and Canonical Profile\n"
+                    "The subject is Frederick Xinyu Pi [report_memory: canonical_identity].\n\n"
+                    "## Publications\n"
+                    "Publication confidence remains low [coverage: publications_resolved].\n"
+                )
+            }
+
+    state = {
+        "prompt": "profile Xinyu Pi",
+        "report_type": "person",
+        "primary_entities": ["Xinyu Pi"],
+        "section_drafts": [
+            SectionDraftModel(
+                section_id="identity_profile",
+                title="Core Identity and Professional Branding",
+                content="Xinyu Pi appears publicly as both Xinyu Pi and Frederick Pi [ID_1].",
+            )
+        ],
+        "claim_ledger": [],
+        "evidence_refs": [],
+        "section_issues": [],
+        "stage1_receipts": [],
+        "noteboard": [],
+        "report_memory": None,
+    }
+
+    report = assemble_final_report(state, _InternalRefLLM())
+
+    assert report.startswith("Qwen Deep Research")
+    assert "[report_memory:" not in report
+    assert "[coverage:" not in report
+    assert "## Core Identity and Professional Branding" in report
 
 
 def test_pack_evidence_accepts_graph_backed_rows_and_rejects_unbacked_rows() -> None:

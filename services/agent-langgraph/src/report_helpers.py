@@ -359,6 +359,69 @@ def default_outline(report_type: str, primary_entities: List[str]) -> List[Secti
     ]
 
 
+def _name_signature(value: str) -> str:
+    normalized = " ".join(str(value or "").split()).strip()
+    tokens = [token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z'-]*", normalized)]
+    return " ".join(tokens)
+
+
+def _candidate_matches_primary_targets(candidate: str, primary_targets: List[str]) -> bool:
+    candidate_signature = _name_signature(candidate)
+    if not candidate_signature:
+        return False
+    if not primary_targets:
+        return True
+    candidate_tokens = set(candidate_signature.split())
+    for target in primary_targets:
+        target_signature = _name_signature(target)
+        if not target_signature:
+            continue
+        if candidate_signature == target_signature:
+            return True
+        target_tokens = set(target_signature.split())
+        if target_tokens and (target_tokens.issubset(candidate_tokens) or candidate_tokens.issubset(target_tokens)):
+            return True
+        if len(candidate_tokens & target_tokens) >= 2:
+            return True
+    return False
+
+
+def _primary_identity_candidates_from_receipts(receipts: List[ToolReceipt], prompt_targets: List[str]) -> List[str]:
+    ranked: Dict[str, int] = {}
+    for receipt in receipts:
+        if not receipt.ok:
+            continue
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            candidates: List[tuple[str, int]] = []
+            canonical_identity = fact.get("canonical_identity")
+            if isinstance(canonical_identity, dict):
+                canonical_name = str(canonical_identity.get("canonical_name") or "").strip()
+                if canonical_name:
+                    candidates.append((canonical_name, 120))
+            for candidate in fact.get("candidates", []) if isinstance(fact.get("candidates"), list) else []:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_name = str(candidate.get("canonical_name") or candidate.get("name") or "").strip()
+                if candidate_name:
+                    candidates.append((candidate_name, 90))
+            display_name = str(fact.get("displayName") or fact.get("name") or "").strip()
+            if display_name:
+                candidates.append((display_name, 40))
+            for candidate_name, score in candidates:
+                if not _candidate_matches_primary_targets(candidate_name, prompt_targets):
+                    continue
+                ranked[candidate_name] = max(ranked.get(candidate_name, 0), score + len(_name_signature(candidate_name).split()))
+    return [
+        name
+        for name, _ in sorted(
+            ranked.items(),
+            key=lambda item: (-item[1], -len(item[0]), item[0].casefold()),
+        )
+    ]
+
+
 def pick_primary_entities(
     mcp_client: McpClientProtocol,
     run_id: str,
@@ -366,16 +429,23 @@ def pick_primary_entities(
     noteboard: List[str],
     receipts: List[ToolReceipt],
 ) -> List[str]:
+    prompt_candidates = dedupe_str_list(
+        extract_person_targets(prompt)
+        + [item for note in noteboard for item in extract_person_targets(note)]
+    )
+    receipt_candidates = _primary_identity_candidates_from_receipts(receipts, prompt_candidates)
     if not _env_flag("STAGE2_ENABLE_GRAPH_ENTITY_SEARCH", False):
         # Keep the default path cheap: use extracted hints directly instead of fuzzy graph scans.
         direct_candidates = dedupe_str_list(
-            extract_person_targets(prompt)
+            receipt_candidates
+            + prompt_candidates
             + extract_entity_hints_from_text(prompt)
             + [item for note in noteboard for item in (extract_person_targets(note) + extract_entity_hints_from_text(note))]
         )
         return direct_candidates[:4]
 
     candidates: List[str] = []
+    candidates.extend(receipt_candidates)
     for receipt in receipts:
         candidates.extend(extract_person_targets(receipt.summary))
         candidates.extend(extract_entity_hints_from_text(receipt.summary))
@@ -385,7 +455,7 @@ def pick_primary_entities(
                     candidates.extend(extract_person_targets(value))
                     candidates.extend(extract_entity_hints_from_text(value))
 
-    candidates.extend(extract_person_targets(prompt))
+    candidates.extend(prompt_candidates)
     candidates.extend(extract_entity_hints_from_text(prompt))
     for note in noteboard:
         candidates.extend(extract_person_targets(note))
@@ -591,7 +661,8 @@ def _is_valid_public_source_url(url: str) -> bool:
 
 def _tokenize_relevance_terms(text: str) -> List[str]:
     lowered = str(text or "").lower()
-    tokens = re.findall(r"[a-z0-9][a-z0-9._-]{1,}", lowered)
+    lowered = re.sub(r"[_./:-]+", " ", lowered)
+    tokens = re.findall(r"[a-z0-9]{2,}", lowered)
     stopwords = {
         "about",
         "from",
@@ -746,6 +817,36 @@ def fallback_claims(task: SectionTaskModel, evidence: List[EvidenceRefModel]) ->
     return claims
 
 
+def _build_section_writing_context(
+    task: SectionTaskModel,
+    claims: List[ClaimModel],
+    evidence: List[EvidenceRefModel],
+) -> Dict[str, Any]:
+    primary_subject = task.entity_ids[0] if task.entity_ids else ""
+    related_entities = dedupe_str_list(
+        [
+            item
+            for item in [
+                *(evidence_item.title or "" for evidence_item in evidence[:6]),
+                *(evidence_item.domain or "" for evidence_item in evidence[:6]),
+            ]
+            if item and _name_signature(item)
+        ]
+    )[:6]
+    claim_spine = [claim.text.strip() for claim in claims[:4] if claim.text.strip()]
+    source_spine = dedupe_str_list(
+        [item.source_url or item.domain or item.title or "" for item in evidence[:5] if (item.source_url or item.domain or item.title)]
+    )[:5]
+    return {
+        "primary_subject": primary_subject,
+        "section_group": task.section_group,
+        "graph_chain": list(task.graph_chain),
+        "related_entities": related_entities,
+        "claim_spine": claim_spine,
+        "source_spine": source_spine,
+    }
+
+
 def draft_section_content(
     run_id: str,
     task: SectionTaskModel,
@@ -775,6 +876,7 @@ def draft_section_content(
         "section": task.model_dump(),
         "claims": [item.model_dump() for item in claims],
         "evidence": [item.model_dump() for item in evidence],
+        "writing_context": _build_section_writing_context(task, claims, evidence),
         "output_schema": {"section_text": "string"},
     }
     try:
@@ -859,9 +961,10 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
 
     payload = {
         "report_type": state.get("report_type", "person"),
+        "primary_entities": state.get("primary_entities", []),
+        "outline": [item.model_dump() for item in state.get("outline", [])],
         "sections": [item.model_dump() for item in drafts],
         "quality_issues": state.get("section_issues", []),
-        "report_memory": report_memory.model_dump(),
         "output_schema": {"report_text": "string"},
     }
     try:
@@ -877,7 +980,11 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
         report_text = parsed.get("report_text")
         if isinstance(report_text, str) and report_text.strip():
             assembled = report_text.strip()
-            if _looks_like_benchmark_report(assembled) and (len(assembled) >= 200 or len(drafts) <= 2):
+            if (
+                _looks_like_benchmark_report(assembled)
+                and not _contains_internal_report_refs(assembled)
+                and (len(assembled) >= 200 or len(drafts) <= 2)
+            ):
                 return assembled
     except Exception:
         logger.exception("Final report assembly failed")
@@ -1271,6 +1378,16 @@ def _looks_like_benchmark_report(report_text: str) -> bool:
     if any(marker in normalized for marker in legacy_markers):
         return False
     return normalized.startswith("Qwen Deep Research") or "\n## " in normalized
+
+
+def _contains_internal_report_refs(report_text: str) -> bool:
+    return bool(
+        re.search(
+            r"\[(?:report_memory|coverage|attempt_log|profile_index|canonical_identity|disambiguation_evidence|not_found_reasons|quality_issues)\s*:",
+            report_text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _why_evidence_matters(citation_key: str, claims: List[ClaimModel]) -> str:
