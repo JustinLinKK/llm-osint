@@ -477,6 +477,17 @@ def _throttle_tool_request(tool_name: str) -> None:
 def _tool_result_error_text(result: Any) -> str:
     if result is None:
         return ""
+    if getattr(result, "ok", True):
+        return ""
+    raw = getattr(result, "raw", None)
+    if isinstance(raw, dict):
+        raw_error = raw.get("error")
+        if isinstance(raw_error, str):
+            return raw_error
+        if isinstance(raw_error, dict):
+            message = raw_error.get("message")
+            if isinstance(message, str):
+                return message
     content = getattr(result, "content", None)
     if isinstance(content, dict):
         if isinstance(content.get("error"), str):
@@ -492,6 +503,8 @@ def _tool_result_error_text(result: Any) -> str:
 
 
 def _is_tavily_rate_limited_result(result: Any) -> bool:
+    if result is None or getattr(result, "ok", True):
+        return False
     error_text = _tool_result_error_text(result).lower()
     return "429" in error_text or "too many requests" in error_text
 

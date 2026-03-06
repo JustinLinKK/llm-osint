@@ -946,3 +946,38 @@ def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> No
     assert sleep_calls == [30.0]
     assert events
     assert events[0][0][1] == "TOOL_RATE_LIMIT_BACKOFF"
+
+
+def test_call_tool_with_rate_limit_control_does_not_backoff_on_success_payload_text(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    tool_worker_graph.TAVILY_REQUEST_MIN_GAP_SECONDS = 8.0
+    tool_worker_graph.TAVILY_RATE_LIMIT_BACKOFF_SECONDS = 30.0
+    tool_worker_graph.TAVILY_MAX_RETRIES = 2
+    tool_worker_graph._TAVILY_LAST_REQUEST_AT = 0.0
+    tool_worker_graph._TAVILY_NOT_BEFORE_AT = 0.0
+
+    sleep_calls = []
+    events = []
+
+    monkeypatch.setattr(tool_worker_graph.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(tool_worker_graph.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(tool_worker_graph, "emit_run_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    client = types.SimpleNamespace(
+        call_tool=lambda name, arguments: types.SimpleNamespace(
+            ok=True,
+            content={"text": "artifact document stored under runs/e429-example/path"},
+            raw={},
+        )
+    )
+
+    result = tool_worker_graph._call_tool_with_rate_limit_control(
+        client,
+        "tavily_person_search",
+        {"query": "Find Frederick Pi"},
+        "run-3",
+    )
+
+    assert result.ok is True
+    assert sleep_calls == []
+    assert events == []
