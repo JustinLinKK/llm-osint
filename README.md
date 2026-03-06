@@ -1,202 +1,103 @@
-# LLM-OSINT: Agentic OSINT Person Profiling Pipeline
+# LLM-OSINT
 
-LLM-OSINT is an **open-source, scalable OSINT research pipeline** that combines:
+LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a Streamable HTTP MCP server, and Python LangGraph graphs for evidence collection and report generation.
 
-- **Agentic data collection** (via MCP tool servers)
-- **Multimodal ingestion** (text, images, audio/video → text)
-- **Graph databases** for structured facts and provenance
-- **Vector databases** for semantic retrieval
-- **LLMs** for evidence-grounded summarization, reasoning, and reflection
+## What is in the repo
 
-The system is designed to be **auditable, explainable, and research-friendly**, avoiding “black-box” OSINT or ungrounded LLM hallucination.
+- `apps/api`: Fastify API for runs, events, files, graph views, and report retrieval
+- `apps/mcp-server`: MCP server with deterministic ingest tools and Python-backed research tools
+- `apps/web`: React + Vite analyst UI
+- `services/agent-langgraph`: Stage 1 planner/tool-worker graphs and Stage 2 report graph
+- `services/worker-python`: deterministic text chunking and embedding helpers
+- `services/worker-temporal`: Temporal worker skeleton
+- `services/worker-embedding`: local vLLM embedding service
+- `infra/docker`: Docker Compose stack for local development
+- `infra/db/migrations`: Postgres schema migrations
 
----
+## Current runtime flow
 
-## 🚀 Project Goals
+1. `POST /runs` creates a run.
+2. The API autostarts `services/agent-langgraph/src/run_planner.py`.
+3. The API passes `--run-stage2`, so successful API-launched runs execute Stage 1 and then Stage 2 by default.
+4. Stage 1 calls MCP tools, stores evidence, emits receipts, and updates vector/graph stores.
+5. Stage 2 writes report snapshots to Postgres and the API exposes them at `GET /runs/:runId/report`.
 
-This project aims to:
+## Core services
 
-- Build a **reproducible OSINT pipeline** from prompt → collection → analysis → report
-- Separate **semantic recall (Vector DB)** from **structural truth (Graph DB)**
-- Use LLMs only for **grounded synthesis**, never raw discovery
-- Support **human-in-the-loop investigation** via a local web UI
-- Stay **open-source, modular, and scalable**
+- API: `http://localhost:3000`
+- MCP server: `http://localhost:3001/mcp`
+- Kali/preset MCP server: `http://localhost:3002/mcp`
+- Web UI: `http://localhost:5173`
+- MinIO console: `http://localhost:9001`
+- Neo4j browser: `http://localhost:7474`
+- Temporal UI: `http://localhost:8233`
 
----
+## Quick start
 
-## 🧠 High-Level Pipeline
-![LLM-OSINT Pipeline Flow](public/Flow.png)
-
----
-
-## 🧱 Core Architecture
-
-### Agentic Collection
-- Planner/executor loop controlled by an **MCP server**
-- Strict tool boundaries, allowlists, rate limits, and stop rules
-- Full audit log of *what was accessed and why*
-
-### Storage Model
-- **Object Storage (MinIO)**  
-  Raw artifacts: HTML, PDFs, images, audio/video, transcripts
-- **Vector DB (Qdrant)**  
-  Semantic retrieval of evidence chunks
-- **Graph DB (Neo4j)**  
-  Entities, claims, relationships, provenance, confidence
-- **Postgres**  
-  Metadata, runs, logs, reproducibility
-
-### LLM Usage (Constrained)
-LLMs are used only after evidence is assembled:
-1. Evidence-grounded summary (with citations)
-2. Structured reasoning (confidence tiers, alternatives)
-3. Reflection / critique (unsupported claims, gaps)
-
----
-
-## 🖥️ Local Web UI (Analyst-Facing)
-
-The frontend (localhost) allows users to:
-- Start investigations with scoped prompts
-- Monitor agentic collection in real time
-- Browse documents and extracted evidence
-- Explore entity graphs interactively
-- Read/export final OSINT reports
-
----
-
-## 🛠️ Tech Stack
-
-### Languages
-- **TypeScript** — APIs, MCP server, orchestration, frontend
-- **Python** — parsing, extraction, embeddings, graph mining
-
-
-### Infrastructure
-- Docker + Docker Compose (local dev)
-- Kubernetes + Helm (deployment, later)
-- Temporal (workflow orchestration)
-
-### Datastores
-- MinIO (object storage)
-- PostgreSQL (metadata, provenance)
-- Qdrant (vector database)
-- Neo4j Community (graph database)
-- Redis (cache)
-
-### LLM Integration
-- OpenRouter-backed planning, embeddings, and Stage 2 drafting/retrieval helpers
-- Heuristic fallbacks where LLM calls are unavailable
-
----
-
-## ⚖️ Ethics & Scope
-
-This project is intended for **legitimate OSINT use**, such as:
-
-- Research and education
-- Security analysis
-- Fraud/impersonation detection
-- Investigating *your own* digital footprint
-- Consent-based or authorized analysis
-
-**Non-goals:**
-- Doxxing
-- Harassment
-- Circumventing paywalls or authentication
-- Accessing private or non-public data
-
-All agent actions are:
-- Logged
-- Scope-restricted
-- Auditable
-
----
-
-## 🧑‍💻 Development Setup (Quick Start)
-
-### Prerequisites
-- Windows / macOS / Linux
-- Docker Desktop (WSL2 on Windows)
-- VS Code + Dev Containers extension
-
-### Start Developing
-1. Open repo in VS Code
-2. **“Reopen in Container”** (clone into container volume is supported)
-3. Inside the container:
-   ```bash
-   yarn dev
-   ```
-
-This brings up:
-- Infrastructure services (Postgres, MinIO, Neo4j, Qdrant, Temporal)
-- Backend API
-- Frontend web UI (localhost)
-
----
-
-## 📂 Repository Structure (Current)
-
-```
-apps/
-  web/            # Analyst UI (React + Vite)
-  api/            # Fastify API + run/event endpoints + LangGraph launcher
-  mcp-server/     # MCP tool server (HTTP) + Python tool bridge
-services/
-  agent-langgraph/ # Planner graph, tool worker graph, Stage 2 report graph
-  worker-embedding/ # vLLM OpenAI-compatible embedding service
-  worker-python/   # Deterministic ingestion/chunk/embed helpers
-  worker-temporal/ # Temporal worker skeleton
-packages/
-  shared/          # Shared package placeholder
-infra/
-  docker/          # Docker Compose (local dev)
-  db/              # Postgres + Neo4j schema migrations
-.devcontainer/     # VS Code Dev Container config
+```bash
+cp .env.example .env
+yarn install
+yarn infra:up
 ```
 
----
+If you are running inside the VS Code dev container, connect it to the compose network once:
 
-## 🧪 Project Status
+```bash
+docker network connect docker_default $(hostname) || true
+```
 
-**Current stage:**  
-🟡 Foundation complete, Stage 1 pipeline working, Stage 2 reporting prototyped
+Run migrations:
 
-**Implemented now:**
-- Docker-based local stack for Postgres, MinIO, Qdrant, Neo4j, Redis, Temporal, API, and MCP servers
-- Fastify API with run creation, run listing, SSE events, file listing, graph listing, and report retrieval endpoints
-- MCP server over **Streamable HTTP** with working `fetch_url`, `ingest_text`, graph ingest, report-query, and Python-bridge tools
-- LangGraph **planner graph** plus **tool worker graph** with receipts, noteboard notes, vector ingest, and graph ingest hooks
-- LangGraph **Stage 2 report graph** with outline/draft/claim/evidence persistence to Stage 2 tables
-- Web UI for starting runs, monitoring live events, and inspecting file/graph evidence after completion
+```bash
+PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
+for f in infra/db/migrations/*.sql; do
+  docker exec -i "$PG_CID" psql -U osint -d osint < "$f"
+done
+```
 
-**Still incomplete or only partially wired:**
-- Temporal workflow is still a stub; it is not orchestrating the real pipeline yet
-- `worker-python` exists for ingestion logic, but there is no standalone background processing service wired into runs
-- Stage 2 reporting exists in Python, but API autostart currently launches only Stage 1 unless Stage 2 is invoked explicitly
-- No dedicated analyst report viewer in the web app yet
-- CI, broader tests, rate limiting, and stronger safety controls are still pending
+Start the web app:
 
----
+```bash
+yarn dev:web
+```
 
-## 🤝 Contributions
+Health check:
 
-Contributions are welcome once the core pipeline stabilizes.
+```bash
+curl http://localhost:3000/health
+```
 
-Planned contribution guidelines:
-- Clear provenance for all extracted data
-- No LLM-only facts
-- Reproducible runs
+Create a run:
 
----
+```bash
+curl -X POST http://localhost:3000/runs \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"Investigate example.com and related accounts"}'
+```
 
-## 📜 License
+## Current status
 
-MIT
+Implemented now:
 
----
+- Docker Compose stack for Postgres, Redis, MinIO, Qdrant, Neo4j, Temporal, API, MCP servers, and embedding worker
+- API run lifecycle, run listing, SSE events, file listing, graph projection, and report retrieval
+- Streamable HTTP MCP server with `fetch_url`, ingest tools, report query tools, and Python tool bridge
+- LangGraph Stage 1 planner/tool-worker flow
+- LangGraph Stage 2 report graph with Postgres-backed report snapshots
+- Web UI for prompting runs, streaming events, exploring files/graph data, and loading reports
 
-## 📌 Disclaimer
+Still incomplete:
 
-This software is provided **as-is** for research and educational purposes.  
-Users are responsible for complying with applicable laws, platform terms of service, and ethical standards.
+- Temporal is not the real orchestrator yet
+- `services/worker-python` is a helper library, not a long-running worker service
+- final report publication into the legacy `reports` + MinIO path is not the primary report path
+- upload-driven analyst workflows and deeper report UX are still limited
+
+## Related docs
+
+- `SETUP.md`: full setup and verification
+- `ENV_FILES_README.md`: environment template guidance
+- `ENV_CONFIGURATION_SUMMARY.md`: environment behavior summary
+- `Checkpoint.md`: current repository checkpoint
+- `PROJECT_PLAN_TODO.md`: remaining work
+- `pipeline_structure.md`: Stage 1 / Stage 2 runtime structure
