@@ -75,23 +75,6 @@ curl -X POST http://localhost:3000/runs \
   -d '{"prompt":"Investigate example.com and related accounts"}'
 ```
 
-## Current status
-
-Implemented now:
-
-- Docker Compose stack for Postgres, Redis, MinIO, Qdrant, Neo4j, Temporal, API, MCP servers, and embedding worker
-- API run lifecycle, run listing, SSE events, file listing, graph projection, and report retrieval
-- Streamable HTTP MCP server with `fetch_url`, ingest tools, report query tools, and Python tool bridge
-- LangGraph Stage 1 planner/tool-worker flow
-- LangGraph Stage 2 report graph with Postgres-backed report snapshots
-- Web UI for prompting runs, streaming events, exploring files/graph data, and loading reports
-
-Still incomplete:
-
-- Temporal is not the real orchestrator yet
-- `services/worker-python` is a helper library, not a long-running worker service
-- final report publication into the legacy `reports` + MinIO path is not the primary report path
-- upload-driven analyst workflows and deeper report UX are still limited
 
 ## Related docs
 
