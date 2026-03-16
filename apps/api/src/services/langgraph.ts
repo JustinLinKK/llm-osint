@@ -10,6 +10,8 @@ type LaunchLangGraphParams = {
   prompt: string;
 };
 
+type Stage2ModelOverrides = Record<string, unknown>;
+
 type ChildFailureInfo = {
   phase: "spawn" | "exit";
   error: string;
@@ -45,6 +47,17 @@ async function emitLaunchFailure(runId: string, info: ChildFailureInfo) {
   await emitEvent(runId, "RUN_FAILED", info);
 }
 
+async function loadStage2ModelOverrides(runId: string): Promise<Stage2ModelOverrides> {
+  const { rows } = await pool.query(`SELECT constraints FROM runs WHERE run_id = $1`, [runId]);
+  const constraints = rows[0]?.constraints;
+  if (!constraints || typeof constraints !== "object") return {};
+  const stage2 = (constraints as Record<string, unknown>).stage2;
+  if (!stage2 || typeof stage2 !== "object") return {};
+  const models = (stage2 as Record<string, unknown>).models;
+  if (!models || typeof models !== "object") return {};
+  return models as Stage2ModelOverrides;
+}
+
 export async function launchLangGraphRun(params: LaunchLangGraphParams): Promise<void> {
   if (!cfg.langgraph.autostart) return;
 
@@ -74,6 +87,10 @@ export async function launchLangGraphRun(params: LaunchLangGraphParams): Promise
     "--max-iterations",
     String(cfg.langgraph.maxIterations)
   ];
+  const stage2ModelOverrides = await loadStage2ModelOverrides(params.runId);
+  if (Object.keys(stage2ModelOverrides).length > 0) {
+    args.push("--stage2-model-config-json", JSON.stringify(stage2ModelOverrides));
+  }
 
   const child = spawn(cfg.langgraph.pythonBin, args, {
     cwd: cfg.langgraph.workdir || process.cwd(),

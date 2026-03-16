@@ -49,10 +49,7 @@ docker network connect docker_default $(hostname) || true
 Run migrations:
 
 ```bash
-PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
-for f in infra/db/migrations/*.sql; do
-  docker exec -i "$PG_CID" psql -U osint -d osint < "$f"
-done
+yarn db:migrate
 ```
 
 Start the web app:

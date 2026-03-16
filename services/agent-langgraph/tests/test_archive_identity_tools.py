@@ -102,6 +102,100 @@ def test_cross_platform_profile_resolver_merges_aliases_with_independent_signals
     assert {"affiliation", "advisor", "publication"}.issubset(evidence_types)
 
 
+def test_cross_platform_profile_resolver_rejects_off_target_profiles_when_contract_supplied() -> None:
+    result = run_cross_platform_profile_resolver(
+        {
+            "profiles": [
+                {
+                    "platform": "github",
+                    "name": "Frederick Xinyu Pi",
+                    "username": "fxpi",
+                    "site": "https://github.com/fxpi",
+                    "institution": "University of California San Diego",
+                    "publications": [{"title": "Neural Audio Systems"}],
+                },
+                {
+                    "platform": "scholar",
+                    "name": "Ruolan Yang",
+                    "site": "https://www.semanticscholar.org/author/ruolan-yang",
+                    "institution": "University of California San Diego",
+                    "publications": [{"title": "Neural Audio Systems"}],
+                },
+            ],
+            "target_contract": {
+                "canonical_name": "Frederick Xinyu Pi",
+                "prompt_targets": ["Frederick Xinyu Pi", "Xinyu Pi"],
+                "approved_aliases": ["Frederick Pi"],
+                "approved_handles": ["fxpi"],
+                "approved_domains": ["github.com"],
+            },
+        }
+    )
+
+    assert result["canonical_identity"]["canonical_name"] == "Frederick Xinyu Pi"
+    assert len(result["matched_profiles"]) == 1
+    assert result["matched_profiles"][0]["username"] == "fxpi"
+    assert len(result["rejected_profiles"]) == 1
+    assert result["rejected_profiles"][0]["name"] == "Ruolan Yang"
+    assert any("target contract" in item["reason"] for item in result["rejected_profile_reasons"])
+
+
+def test_cross_platform_profile_resolver_does_not_accept_generic_host_domain_match_only() -> None:
+    result = run_cross_platform_profile_resolver(
+        {
+            "profiles": [
+                {
+                    "platform": "github",
+                    "name": "Amy Frederick",
+                    "username": "amycensys",
+                    "site": "https://github.com/amycensys",
+                }
+            ],
+            "target_contract": {
+                "canonical_name": "Frederick Xinyu Pi",
+                "prompt_targets": ["Frederick Xinyu Pi", "Xinyu Pi"],
+                "approved_aliases": ["Frederick Pi"],
+                "approved_handles": [],
+                "approved_domains": ["github.com"],
+            },
+        }
+    )
+
+    assert result["matched_profiles"] == []
+    assert len(result["rejected_profiles"]) == 1
+    assert result["rejected_profiles"][0]["username"] == "amycensys"
+
+
+def test_cross_platform_profile_resolver_accepts_generic_host_only_with_handle_or_path_evidence() -> None:
+    result = run_cross_platform_profile_resolver(
+        {
+            "profiles": [
+                {
+                    "platform": "github",
+                    "username": "frederickpi1969",
+                    "site": "https://github.com/frederickpi1969",
+                },
+                {
+                    "platform": "linkedin",
+                    "site": "https://www.linkedin.com/in/frederick-pi-40a668181",
+                },
+            ],
+            "target_contract": {
+                "canonical_name": "Frederick Xinyu Pi",
+                "prompt_targets": ["Frederick Xinyu Pi", "Xinyu Pi"],
+                "approved_aliases": ["Frederick Pi"],
+                "approved_handles": ["frederickpi1969"],
+                "approved_domains": ["github.com", "linkedin.com"],
+            },
+        }
+    )
+
+    matched_sites = {item.get("site") for item in result["matched_profiles"]}
+    assert "https://github.com/frederickpi1969" in matched_sites
+    assert "https://www.linkedin.com/in/frederick-pi-40a668181" in matched_sites
+    assert result["rejected_profiles"] == []
+
+
 def test_email_pattern_inference_builds_patterns() -> None:
     result = run_email_pattern_inference({"domain": "example.edu", "person_name": "Ada Lovelace"})
     assert "ada.lovelace@example.edu" in result["patterns"]

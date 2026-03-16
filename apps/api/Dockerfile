@@ -24,6 +24,7 @@ RUN apk add --no-cache python3 py3-pip \
 
 # Copy LangGraph service sources and install its Python dependencies.
 COPY services/agent-langgraph /app/services/agent-langgraph
+COPY schemas /app/schemas
 RUN /opt/agent-venv/bin/pip install --no-cache-dir -r /app/services/agent-langgraph/requirements.txt
 
 # Copy only compiled output + node_modules needed for api workspace

@@ -1,20 +1,27 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 from urllib.parse import urlparse
 
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from conflict_models import ConflictCandidateValueModel, ConflictEvidenceRefModel, GraphConflictCaseModel
+from conflict_store import persist_conflict_snapshot
+from graph_normalization_models import GraphNormalizationActionModel, GraphNormalizationCaseModel
 from mcp_client import McpClientProtocol, RoutedMcpClient
-from openrouter_llm import OpenRouterLLM
+from openrouter_llm import OpenRouterLLM, invoke_complete_json
+from report_models import PrimaryGraphTemplateModel, PrimaryTargetContractModel
 from run_events import emit_run_event
-from system_prompts import WORK_PLANNER_SYSTEM_PROMPT
+from run_store import persist_primary_target_contract
+from system_prompts import GRAPH_STRUCTURE_NORMALIZATION_SYSTEM_PROMPT, WORK_PLANNER_SYSTEM_PROMPT
 from target_normalization import extract_person_targets, normalize_person_candidate, sanitize_search_tool_arguments
 from tool_worker_graph import ToolReceipt, run_tool_worker, tool_argument_signature
 from logger import get_logger
@@ -36,6 +43,11 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_text(name: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -44,6 +56,14 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return float(default)
+
+
+def _planner_model_name() -> str:
+    return _env_text("OPENROUTER_PLANNER_MODEL") or _env_text("OPENROUTER_MODEL")
+
+
+def _conflict_solver_model_name(planner_model: str = "") -> str:
+    return _env_text("OPENROUTER_CONFLICT_SOLVER_MODEL") or planner_model or _planner_model_name()
 
 
 logger = get_logger(__name__)
@@ -89,9 +109,13 @@ STAGE1_SOCIAL_TIMELINE_MAX_FAILURES = max(
     1, int(os.getenv("STAGE1_SOCIAL_TIMELINE_MAX_FAILURES", "2"))
 )
 STAGE1_BLUEPRINT_ENABLED = _env_flag("STAGE1_BLUEPRINT_ENABLED", True)
+_DEFAULT_STAGE1_BLUEPRINT_CONTRACT_BASENAME = "stage1_graph_blueprint_contract.v1.json"
+_DEFAULT_STAGE1_BLUEPRINT_CONTRACT_PATH = (
+    Path(__file__).resolve().parents[3] / "schemas" / _DEFAULT_STAGE1_BLUEPRINT_CONTRACT_BASENAME
+)
 STAGE1_BLUEPRINT_CONTRACT_PATH = os.getenv(
     "STAGE1_BLUEPRINT_CONTRACT_PATH",
-    "/workspaces/llm-osint/schemas/stage1_graph_blueprint_contract.v1.json",
+    str(_DEFAULT_STAGE1_BLUEPRINT_CONTRACT_PATH),
 ).strip()
 STAGE1_BLUEPRINT_ENFORCEMENT = (
     os.getenv("STAGE1_BLUEPRINT_ENFORCEMENT", "balanced").strip().lower() or "balanced"
@@ -110,6 +134,59 @@ STAGE1_LLM_ENTITY_ADJUDICATION_CONFIDENCE = max(
     0.0,
     min(1.0, _env_float("STAGE1_LLM_ENTITY_ADJUDICATION_CONFIDENCE", 0.78)),
 )
+STAGE1_SECONDARY_PERSON_BUDGET = max(1, int(os.getenv("STAGE1_SECONDARY_PERSON_BUDGET", "2")))
+STAGE1_COAUTHOR_PERSON_BUDGET = max(1, int(os.getenv("STAGE1_COAUTHOR_PERSON_BUDGET", "2")))
+STAGE1_TAVILY_TOTAL_BUDGET = max(1, int(os.getenv("STAGE1_TAVILY_TOTAL_BUDGET", "5")))
+STAGE1_TAVILY_PER_PERSON_BUDGET = max(1, int(os.getenv("STAGE1_TAVILY_PER_PERSON_BUDGET", "1")))
+STAGE1_TAVILY_CRAWL_PER_URL_BUDGET = max(1, int(os.getenv("STAGE1_TAVILY_CRAWL_PER_URL_BUDGET", "1")))
+STAGE1_CONFLICT_AUTO_APPLY_CONFIDENCE = max(
+    0.0,
+    min(1.0, _env_float("STAGE1_CONFLICT_AUTO_APPLY_CONFIDENCE", 0.80)),
+)
+STAGE1_CONFLICT_MAX_CASES = max(1, int(os.getenv("STAGE1_CONFLICT_MAX_CASES", "12")))
+STAGE1_CONFLICT_MAX_EVIDENCE_ROWS = max(2, int(os.getenv("STAGE1_CONFLICT_MAX_EVIDENCE_ROWS", "6")))
+STAGE1_GRAPH_NORMALIZATION_MAX_CASES = max(
+    1, int(os.getenv("STAGE1_GRAPH_NORMALIZATION_MAX_CASES", "8"))
+)
+STAGE1_GRAPH_NORMALIZATION_NEIGHBOR_DEPTH = 2
+PRIMARY_GRAPH_TEMPLATE_ENTITY_CATEGORIES = [
+    "ContactPoint",
+    "Handle",
+    "Website",
+    "Document",
+    "Affiliation",
+    "Experience",
+    "EducationalCredential",
+    "Organization",
+    "Institution",
+    "Publication",
+    "Topic",
+    "TimelineEvent",
+]
+PRIMARY_GRAPH_TEMPLATE_RELATION_CATEGORIES = [
+    "HAS_CONTACT_POINT",
+    "HAS_PROFILE",
+    "HAS_DOCUMENT",
+    "HAS_AFFILIATION",
+    "HAS_EXPERIENCE",
+    "HAS_CREDENTIAL",
+    "WORKS_AT",
+    "STUDIED_AT",
+    "AFFILIATED_WITH",
+    "PUBLISHED",
+    "RESEARCHES",
+    "HAS_TOPIC",
+    "HAS_TIMELINE_EVENT",
+]
+STRONG_IDENTITY_RECEIPT_TOOLS = {
+    "cross_platform_profile_resolver",
+    "semantic_scholar_search",
+    "orcid_search",
+    "dblp_author_search",
+    "pubmed_author_search",
+    "conference_profile_search",
+    "person_search",
+}
 
 URL_REGEX = re.compile(r"https?://[^\s\]]+")
 EMAIL_REGEX = re.compile(
@@ -127,6 +204,8 @@ DATE_LIKE_PHONE_REGEX = re.compile(
 IPV4_REGEX = re.compile(
     r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
 CAPITALIZED_NAME_REGEX = re.compile(r"\b[A-Z][a-z]+(?:[\s-]+[A-Z][a-z]+){0,3}\b")
+GOOGLE_SERP_QUOTED_TARGET_REGEX = re.compile(r'"([^"]+)"')
+GOOGLE_SCHOLAR_SITE_QUERY_REGEX = re.compile(r"(?i)\bsite:scholar\.google\.com/citations\b")
 PERSON_HINT_REGEX = re.compile(
     r"(?i)\b(?:investigate|investigation(?:\s+into)?|profile|research|look\s+into|find\s+info\s+on|osint(?:\s+on)?)\b[:\s-]*([A-Za-z][A-Za-z'\s-]{1,79})"
 )
@@ -135,6 +214,7 @@ USERNAME_URL_PROFILE_HOSTS = {
     "gitlab.com",
     "huggingface.co",
     "kaggle.com",
+    "linkedin.com",
     "reddit.com",
     "x.com",
     "twitter.com",
@@ -386,6 +466,18 @@ STRUCTURED_RELATED_PERSON_TOOLS = {
     "institution_directory_search",
     "arxiv_search_and_download",
 }
+STRUCTURED_PERSON_RELATION_TYPES = {
+    "COAUTHORED_WITH",
+    "AUTHORED_WITH",
+    "ADVISED_BY",
+    "COLLABORATED_WITH",
+    "MENTORED_BY",
+    "OFFICER_OF",
+    "DIRECTOR_OF",
+    "COLLEAGUE_OF",
+    "MEMBER_OF_LAB_WITH",
+    "WORKS_AT",
+}
 RELATED_PERSON_LOCATION_TOKENS = {
     "kingdom",
     "state",
@@ -398,8 +490,89 @@ RELATED_PERSON_LOCATION_TOKENS = {
     "village",
     "country",
     "countries",
+    "shore",
+    "shores",
+    "beach",
+    "beaches",
     "parliament",
     "government",
+}
+RELATED_PERSON_NON_PERSON_TOKENS = {
+    "startup",
+    "scholarship",
+    "fellowship",
+    "patent",
+    "patents",
+    "conference",
+    "conferences",
+    "journal",
+    "journals",
+    "paper",
+    "papers",
+    "project",
+    "projects",
+    "initiative",
+    "initiatives",
+    "program",
+    "programs",
+    "lab",
+    "labs",
+    "school",
+    "schools",
+    "university",
+    "universities",
+    "college",
+    "colleges",
+}
+PERSON_TARGET_REQUIRED_TOOLS = {
+    "alias_variant_generator",
+    "company_officer_search",
+    "dblp_author_search",
+    "google_serp_person_search",
+    "orcid_search",
+    "person_search",
+    "sanctions_watchlist_search",
+    "sec_person_search",
+    "semantic_scholar_search",
+    "tavily_person_search",
+}
+CONFLICT_BLOCKING_ENTITY_FIELDS = {
+    "canonical_name",
+    "affiliation",
+    "organization",
+    "role_title",
+    "education",
+    "timeline_date",
+    "publication_presence",
+}
+CONFLICT_BLOCKING_RELATION_TYPES = {
+    "WORKS_AT",
+    "AFFILIATED_WITH",
+    "STUDIED_AT",
+    "COAUTHORED_WITH",
+    "ADVISED_BY",
+    "COLLABORATED_WITH",
+    "OFFICER_OF",
+    "DIRECTOR_OF",
+    "PUBLISHED_IN",
+}
+CONFLICT_AUTHORITATIVE_TOOLS = {
+    "orcid_search",
+    "semantic_scholar_search",
+    "dblp_author_search",
+    "pubmed_author_search",
+    "conference_profile_search",
+    "institution_directory_search",
+    "company_officer_search",
+    "sec_person_search",
+    "open_corporates_search",
+    "cross_platform_profile_resolver",
+    "linkedin_download_html_ocr",
+}
+CONFLICT_DIRECT_TOOLS = CONFLICT_AUTHORITATIVE_TOOLS | {
+    "google_scholar_profile_search",
+    "coauthor_graph_search",
+    "director_disclosure_search",
 }
 RELATED_PERSON_NOISE_TOKENS = {
     "cookie",
@@ -692,6 +865,38 @@ def _coerce_string_list(value: Any, fallback: List[str]) -> List[str]:
     return items if items else list(fallback)
 
 
+def _stage1_blueprint_contract_candidates(raw_path: str) -> List[Path]:
+    candidates: List[Path] = []
+
+    def add_candidate(candidate: Path | str) -> None:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+        if path not in candidates:
+            candidates.append(path)
+
+    def add_schema_candidates(base: Path) -> None:
+        for ancestor in [base, *base.parents]:
+            add_candidate(ancestor / "schemas" / _DEFAULT_STAGE1_BLUEPRINT_CONTRACT_BASENAME)
+
+    configured = str(raw_path or "").strip()
+    if configured:
+        add_candidate(configured)
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            add_candidate(_DEFAULT_STAGE1_BLUEPRINT_CONTRACT_PATH.parents[1] / configured_path)
+        else:
+            add_candidate(configured_path.parent / _DEFAULT_STAGE1_BLUEPRINT_CONTRACT_BASENAME)
+
+    add_candidate(_DEFAULT_STAGE1_BLUEPRINT_CONTRACT_PATH)
+    add_schema_candidates(Path(__file__).resolve().parent)
+    add_schema_candidates(Path.cwd())
+    add_candidate(Path("/app/schemas") / _DEFAULT_STAGE1_BLUEPRINT_CONTRACT_BASENAME)
+    return candidates
+
+
 def _normalize_stage1_blueprint_contract(raw: Any) -> Dict[str, Any]:
     default = _default_stage1_blueprint_contract()
     if not isinstance(raw, dict):
@@ -721,11 +926,14 @@ def _load_stage1_blueprint_contract() -> Dict[str, Any]:
     status = "default"
     source = "builtin_default"
     error = ""
-    path = STAGE1_BLUEPRINT_CONTRACT_PATH
+    configured_path = STAGE1_BLUEPRINT_CONTRACT_PATH
+    candidate_paths = _stage1_blueprint_contract_candidates(configured_path)
+    resolved_path = next((candidate for candidate in candidate_paths if candidate.is_file()), None)
+    path = str(resolved_path or candidate_paths[:1][0])
 
     if STAGE1_BLUEPRINT_ENABLED:
         try:
-            with open(path, "r", encoding="utf-8") as fh:
+            with open(resolved_path or path, "r", encoding="utf-8") as fh:
                 raw = json.load(fh)
             contract = _normalize_stage1_blueprint_contract(raw)
             status = "loaded"
@@ -733,7 +941,8 @@ def _load_stage1_blueprint_contract() -> Dict[str, Any]:
         except Exception as exc:
             status = "fallback_default"
             source = "builtin_default"
-            error = str(exc)
+            searched = ", ".join(str(candidate) for candidate in candidate_paths[:5])
+            error = f"{exc}; searched={searched}"
     else:
         status = "disabled"
         source = "disabled"
@@ -783,6 +992,8 @@ class PlannerState(TypedDict):
     run_id: str
     prompt: str
     inputs: List[str]
+    primary_target_contract: PrimaryTargetContractModel
+    primary_graph_template: PrimaryGraphTemplateModel
     seed_urls: List[str]
     pending_urls: List[str]
     current_fetch_urls: List[str]
@@ -808,10 +1019,30 @@ class PlannerState(TypedDict):
     archive_identity_task_dedupe: Dict[str, int]
     relationship_task_dedupe: Dict[str, int]
     depth_task_dedupe: Dict[str, int]
+    secondary_person_names: List[str]
+    coauthor_person_names: List[str]
+    tavily_call_counter: int
+    tavily_person_counter: Dict[str, int]
+    tavily_crawl_counter: Dict[str, int]
     coverage_ledger: Dict[str, bool]
     evidence_quality_ok: bool
     evidence_quality_stats: Dict[str, int]
     graph_state_snapshot: Dict[str, Any]
+    graph_export_json: Dict[str, Any]
+    graph_normalization_cases: List[GraphNormalizationCaseModel]
+    graph_normalization_actions: List[GraphNormalizationActionModel]
+    graph_normalization_notes: List[str]
+    normalization_gate_ok: bool
+    primary_root_entity_id: str
+    merged_entity_count: int
+    suppressed_noise_count: int
+    graph_entity_rewrites: Dict[str, str]
+    root_bootstrap_ok: bool
+    root_bootstrap_notes: List[str]
+    conflict_cases: List[GraphConflictCaseModel]
+    resolved_conflicts: List[GraphConflictCaseModel]
+    unresolved_conflicts: List[GraphConflictCaseModel]
+    conflict_gate_ok: bool
 
 
 @dataclass
@@ -824,16 +1055,450 @@ class PlannerResult:
     iterations: int
     noteboard: List[str]
     next_stage: str
+    primary_target_contract: PrimaryTargetContractModel
+    primary_graph_template: PrimaryGraphTemplateModel
     coverage_ledger: Dict[str, bool]
     evidence_quality_ok: bool
     evidence_quality_stats: Dict[str, int]
     graph_state_snapshot: Dict[str, Any]
+    graph_normalization_cases: List[GraphNormalizationCaseModel]
+    graph_normalization_actions: List[GraphNormalizationActionModel]
+    graph_normalization_notes: List[str]
+    normalization_gate_ok: bool
+    primary_root_entity_id: str
+    merged_entity_count: int
+    suppressed_noise_count: int
+    root_bootstrap_ok: bool
+    root_bootstrap_notes: List[str]
+    conflict_cases: List[GraphConflictCaseModel]
+    resolved_conflicts: List[GraphConflictCaseModel]
+    unresolved_conflicts: List[GraphConflictCaseModel]
+    conflict_gate_ok: bool
+
+
+def _failure_receipt_summary(tool_name: str, error_message: str) -> str:
+    message = " ".join(str(error_message or "").strip().split())
+    return f"{tool_name} failed." if not message else f"{tool_name} failed: {message}"
+
+
+def _build_failed_tool_receipt(
+    run_id: str,
+    tool_name: str,
+    arguments: Dict[str, Any],
+    error_message: str,
+) -> ToolReceipt:
+    payload = {
+        "run_id": run_id,
+        "tool_name": tool_name,
+        "tool_type": None,
+        "confidence_score": None,
+        "arguments": dict(arguments or {}),
+        "argument_signature": tool_argument_signature(tool_name, arguments or {}),
+        "ok": False,
+        "summary": _failure_receipt_summary(tool_name, error_message),
+        "artifact_ids": [],
+        "document_ids": [],
+        "key_facts": [{"error": str(error_message or "")}] if str(error_message or "").strip() else [],
+        "vector_upserts": {},
+        "graph_upserts": {},
+        "next_hints": [],
+        "next_urls": [],
+        "next_people": [],
+        "next_orgs": [],
+        "next_topics": [],
+        "next_handles": [],
+        "next_queries": [],
+    }
+    try:
+        return ToolReceipt(**payload)
+    except TypeError:
+        fallback_payload = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"tool_type", "confidence_score"}
+        }
+        return ToolReceipt(**fallback_payload)
+
+
+def _dedupe_case_insensitive(values: List[str]) -> List[str]:
+    seen: set[str] = set()
+    output: List[str] = []
+    for value in values:
+        cleaned = " ".join(str(value or "").strip().split())
+        if not cleaned:
+            continue
+        lowered = cleaned.casefold()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        output.append(cleaned)
+    return output
+
+
+def _initial_primary_target_contract(prompt: str, inputs: List[str]) -> PrimaryTargetContractModel:
+    prompt_targets = _dedupe_case_insensitive(
+        extract_person_targets(prompt or "")
+        + [candidate for item in inputs for candidate in extract_person_targets(item or "")]
+    )
+    canonical_name = prompt_targets[0] if prompt_targets else ""
+    return PrimaryTargetContractModel(
+        target_type="person" if prompt_targets else "unknown",
+        prompt_targets=prompt_targets,
+        canonical_name=canonical_name,
+        approved_aliases=_dedupe_case_insensitive(prompt_targets),
+        approved_handles=[],
+        approved_domains=[],
+        anchor_receipt_ids=[],
+        locked_iteration=0,
+        lock_reason="Initialized from prompt and explicit inputs.",
+    )
+
+
+def _target_contract_aliases(contract: PrimaryTargetContractModel) -> List[str]:
+    return _dedupe_case_insensitive(
+        [
+            contract.canonical_name,
+            *contract.prompt_targets,
+            *contract.approved_aliases,
+        ]
+    )
+
+
+def _derive_primary_graph_template(
+    contract: PrimaryTargetContractModel,
+    *,
+    root_entity_id: str = "",
+) -> PrimaryGraphTemplateModel:
+    resolved_root_id = str(root_entity_id or contract.root_entity_id or "").strip()
+    return PrimaryGraphTemplateModel(
+        root_entity_id=resolved_root_id,
+        root_entity_type="Person" if str(contract.target_type or "person").strip() == "person" else "Unknown",
+        root_canonical_name=str(contract.canonical_name or "").strip(),
+        root_aliases=_target_contract_aliases(contract),
+        approved_handles=_dedupe_case_insensitive(list(contract.approved_handles)),
+        approved_domains=_dedupe_case_insensitive(list(contract.approved_domains)),
+        first_hop_entity_categories=list(PRIMARY_GRAPH_TEMPLATE_ENTITY_CATEGORIES),
+        first_hop_relation_categories=list(PRIMARY_GRAPH_TEMPLATE_RELATION_CATEGORIES),
+        template_mode="metadata_only",
+    )
+
+
+def _base_graph_bootstrap_updates() -> Dict[str, Any]:
+    return {
+        "primary_graph_template": PrimaryGraphTemplateModel(),
+        "root_bootstrap_ok": True,
+        "root_bootstrap_notes": [],
+    }
+
+
+def _candidate_matches_target_contract(candidate: str, contract: PrimaryTargetContractModel) -> bool:
+    cleaned = str(candidate or "").strip()
+    if not cleaned:
+        return False
+    aliases = _target_contract_aliases(contract)
+    if not aliases:
+        return False
+    if _primary_target_match_score(cleaned, aliases) > 0:
+        return True
+    return any(
+        _name_tokens_embed_with_one_typo(alias, cleaned) or _name_tokens_embed_with_one_typo(cleaned, alias)
+        for alias in aliases
+        if str(alias).strip()
+    )
+
+
+def _receipt_matches_target_contract(
+    receipt: ToolReceipt,
+    contract: PrimaryTargetContractModel,
+) -> bool:
+    aliases = _target_contract_aliases(contract)
+    if not aliases:
+        return True
+    searchable_values: List[str] = [str(receipt.summary or "")]
+    if isinstance(receipt.arguments, dict):
+        searchable_values.extend([str(value) for value in receipt.arguments.values() if value is not None])
+    for fact in receipt.key_facts:
+        if isinstance(fact, dict):
+            searchable_values.extend(_related_entity_text_fragments(fact))
+    blob = " ".join(searchable_values)
+    return any(_primary_target_match_score(blob, [alias]) > 0 for alias in aliases)
+
+
+def _contract_anchor_receipt_id(receipt: ToolReceipt) -> str:
+    if receipt.argument_signature:
+        return receipt.argument_signature
+    return f"{receipt.tool_name}|{tool_argument_signature(receipt.tool_name, receipt.arguments or {})}"
+
+
+def _extract_contract_handles_from_receipt(receipt: ToolReceipt) -> List[str]:
+    handles: List[str] = []
+    if isinstance(receipt.arguments, dict):
+        for key in ("username", "handle"):
+            value = receipt.arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                handles.append(value.strip().lstrip("@"))
+    for fact in receipt.key_facts:
+        if not isinstance(fact, dict):
+            continue
+        for value in fact.values():
+            if isinstance(value, str):
+                handles.extend([item.lstrip("@") for item in re.findall(r"@([A-Za-z0-9_.-]{3,32})", value)])
+                for url in URL_REGEX.findall(value):
+                    parsed = urlparse(url)
+                    path_parts = [part for part in parsed.path.split("/") if part]
+                    if parsed.hostname and parsed.hostname.lower() in USERNAME_URL_PROFILE_HOSTS and path_parts:
+                        handles.append(path_parts[-1].strip())
+    return _dedupe_case_insensitive(handles)
+
+
+def _extract_contract_domains_from_receipt(receipt: ToolReceipt) -> List[str]:
+    domains: List[str] = []
+    if isinstance(receipt.arguments, dict):
+        for value in receipt.arguments.values():
+            if isinstance(value, str):
+                domains.extend(DOMAIN_REGEX.findall(value))
+                for url in URL_REGEX.findall(value):
+                    host = _normalize_host(urlparse(url).hostname or "")
+                    if host:
+                        domains.append(host)
+    for fact in receipt.key_facts:
+        if not isinstance(fact, dict):
+            continue
+        for value in fact.values():
+            if isinstance(value, str):
+                domains.extend(DOMAIN_REGEX.findall(value))
+                for url in URL_REGEX.findall(value):
+                    host = _normalize_host(urlparse(url).hostname or "")
+                    if host:
+                        domains.append(host)
+    return _dedupe_case_insensitive([_normalize_host(item) for item in domains if _normalize_host(item)])
+
+
+def _name_tokens_embed_with_one_typo(shorter_name: str, longer_name: str) -> bool:
+    shorter_tokens = _person_name_signature(shorter_name).split()
+    longer_tokens = _person_name_signature(longer_name).split()
+    if not shorter_tokens or len(longer_tokens) <= len(shorter_tokens):
+        return False
+    search_index = 0
+    typo_used = False
+    for short_token in shorter_tokens:
+        matched = False
+        while search_index < len(longer_tokens):
+            long_token = longer_tokens[search_index]
+            search_index += 1
+            if short_token == long_token:
+                matched = True
+                break
+            if (
+                not typo_used
+                and min(len(short_token), len(long_token)) >= 4
+                and _single_token_edit_distance_at_most_one(short_token, long_token)
+            ):
+                typo_used = True
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def _is_guarded_canonical_upgrade(current_name: str, candidate_name: str) -> bool:
+    current_signature = _person_name_signature(current_name)
+    candidate_signature = _person_name_signature(candidate_name)
+    if not current_signature or not candidate_signature or current_signature == candidate_signature:
+        return False
+    if len(candidate_signature) <= len(current_signature):
+        return False
+    return _name_tokens_embed_with_one_typo(current_name, candidate_name)
+
+
+def _sync_primary_root_contract_to_graph(
+    *,
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    contract: PrimaryTargetContractModel,
+) -> tuple[bool, List[str], Dict[str, Any], str]:
+    template = _derive_primary_graph_template(contract, root_entity_id=contract.root_entity_id)
+    notes: List[str] = []
+    if not hasattr(mcp_client, "call_tool"):
+        return False, ["Primary root bootstrap skipped because the graph client was unavailable."], _empty_graph_export_json(), ""
+    if str(contract.target_type or "").strip() != "person" or not str(contract.canonical_name or "").strip():
+        notes.append("Primary root bootstrap skipped because the target contract did not resolve to a named person.")
+        return True, notes, _empty_graph_export_json(), str(contract.root_entity_id or "").strip()
+    payload = [
+        {
+            "actionType": "ensure_root_entity",
+            "targetEntityId": str(contract.root_entity_id or "").strip() or None,
+            "canonicalName": contract.canonical_name,
+            "entityType": "Person",
+            "aliases": template.root_aliases,
+            "rationale": "Seed or refresh the locked primary person root before planner execution.",
+        }
+    ]
+    try:
+        result = mcp_client.call_tool(
+            "graph_apply_normalization_plan",
+            {
+                "runId": run_id,
+                "actionsJson": json.dumps(payload),
+                "dryRun": False,
+            },
+        )
+    except Exception as exc:
+        return False, [f"Primary root bootstrap failed: {exc}"], _empty_graph_export_json(), ""
+    if not getattr(result, "ok", False):
+        return False, ["Primary root bootstrap failed while applying ensure_root_entity."], _empty_graph_export_json(), ""
+    graph_export_json = _fetch_graph_export_json(mcp_client, run_id)
+    resolved_ids = _graph_export_resolved_entity_ids(graph_export_json, template.root_aliases)
+    resolved_root_id = str(contract.root_entity_id or "").strip()
+    if resolved_root_id:
+        resolved_ids = [resolved_root_id] + [item for item in resolved_ids if item != resolved_root_id]
+    resolved_root_id = resolved_ids[0] if resolved_ids else resolved_root_id
+    if resolved_root_id:
+        notes.append(f"Seeded primary graph root {resolved_root_id} for {contract.canonical_name}.")
+    else:
+        notes.append("Primary root bootstrap applied ensure_root_entity, but the refreshed graph export did not resolve a root id.")
+    return True, notes, graph_export_json, resolved_root_id
+
+
+def _enrich_primary_target_contract(
+    contract: PrimaryTargetContractModel,
+    receipts: List[ToolReceipt],
+    iteration: int,
+) -> PrimaryTargetContractModel:
+    updated = contract.model_copy(deep=True)
+    aliases = list(updated.approved_aliases)
+    handles = list(updated.approved_handles)
+    domains = list(updated.approved_domains)
+    receipt_ids = list(updated.anchor_receipt_ids)
+    canonical_name = updated.canonical_name
+    for receipt in receipts:
+        if not receipt.ok or not _receipt_matches_target_contract(receipt, updated):
+            continue
+        receipt_ids.append(_contract_anchor_receipt_id(receipt))
+        handles.extend(_extract_contract_handles_from_receipt(receipt))
+        domains.extend(_extract_contract_domains_from_receipt(receipt))
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            canonical_identity = fact.get("canonical_identity")
+            if isinstance(canonical_identity, dict):
+                candidate_name = str(canonical_identity.get("canonical_name") or "").strip()
+                upgraded_candidate_name = ""
+                if candidate_name and _candidate_matches_target_contract(candidate_name, updated):
+                    if not canonical_name:
+                        canonical_name = candidate_name
+                    elif (
+                        not updated.root_entity_id
+                        and len(candidate_name) > len(canonical_name)
+                    ):
+                        canonical_name = candidate_name
+                    elif (
+                        updated.root_entity_id
+                        and receipt.tool_name in STRONG_IDENTITY_RECEIPT_TOOLS
+                        and _is_guarded_canonical_upgrade(canonical_name, candidate_name)
+                    ):
+                        canonical_name = candidate_name
+                    upgraded_candidate_name = candidate_name
+                aliases.extend(
+                    [
+                        str(item).strip()
+                        for item in canonical_identity.get("aliases", [])
+                        if str(item).strip()
+                        and (
+                            _candidate_matches_target_contract(str(item).strip(), updated)
+                            or (
+                                upgraded_candidate_name
+                                and _primary_target_match_score(str(item).strip(), [upgraded_candidate_name]) > 0
+                            )
+                        )
+                    ]
+                )
+            for candidate in fact.get("candidates", []) if isinstance(fact.get("candidates"), list) else []:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate_name = str(candidate.get("canonical_name") or candidate.get("name") or "").strip()
+                if candidate_name and _candidate_matches_target_contract(candidate_name, updated):
+                    if (
+                        updated.root_entity_id
+                        and receipt.tool_name in STRONG_IDENTITY_RECEIPT_TOOLS
+                        and _is_guarded_canonical_upgrade(canonical_name, candidate_name)
+                    ):
+                        canonical_name = candidate_name
+                    aliases.append(candidate_name)
+    updated.canonical_name = canonical_name or updated.canonical_name
+    updated.approved_aliases = _dedupe_case_insensitive([*aliases, updated.canonical_name, *updated.prompt_targets])
+    updated.approved_handles = _dedupe_case_insensitive(handles)
+    updated.approved_domains = _dedupe_case_insensitive(domains)
+    updated.anchor_receipt_ids = _dedupe_case_insensitive(receipt_ids)
+    updated.locked_iteration = max(updated.locked_iteration, iteration)
+    if updated.approved_aliases and updated.lock_reason.strip() == "Initialized from prompt and explicit inputs." and iteration > 0:
+        updated.lock_reason = "Prompt anchor retained; aliases/handles/domains enriched only from matching receipts."
+    return updated
+
+
+def _recompute_budget_counters(
+    *,
+    receipts: List[ToolReceipt],
+    related_entity_candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    secondary_names: List[str] = []
+    coauthor_names: List[str] = []
+    tavily_call_counter = 0
+    tavily_person_counter: Dict[str, int] = {}
+    tavily_crawl_counter: Dict[str, int] = {}
+    candidate_by_name = {
+        str(item.get("entity_name") or "").strip().casefold(): item
+        for item in related_entity_candidates
+        if str(item.get("entity_name") or "").strip()
+    }
+    for receipt in receipts:
+        tool_name = str(receipt.tool_name or "").strip()
+        arguments = receipt.arguments if isinstance(receipt.arguments, dict) else {}
+        if tool_name in {"tavily_research", "tavily_person_search", "extract_webpage", "crawl_webpage", "map_webpage"}:
+            tavily_call_counter += 1
+        if tool_name in {"tavily_research", "tavily_person_search"}:
+            person_target = _llm_plan_related_person_target(ToolPlanItem(tool=tool_name, arguments=arguments, rationale=""))
+            if person_target:
+                key = (normalize_person_candidate(person_target) or person_target).casefold()
+                tavily_person_counter[key] = int(tavily_person_counter.get(key, 0)) + 1
+        if tool_name == "crawl_webpage":
+            crawl_url = _normalize_crawl_url(str(arguments.get("url") or ""))
+            if crawl_url:
+                tavily_crawl_counter[crawl_url.casefold()] = int(tavily_crawl_counter.get(crawl_url.casefold(), 0)) + 1
+        if tool_name not in {"person_search", "github_identity_search", "semantic_scholar_search", "company_officer_search"}:
+            continue
+        entity_name = str(arguments.get("name") or arguments.get("person_name") or "").strip()
+        normalized_name = normalize_person_candidate(entity_name) or entity_name
+        if not normalized_name:
+            continue
+        if normalized_name not in secondary_names:
+            secondary_names.append(normalized_name)
+        candidate = candidate_by_name.get(normalized_name.casefold(), {})
+        relationship_types = {
+            str(item).strip()
+            for item in candidate.get("relationship_types", [])
+            if str(item).strip()
+        }
+        if relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH"} and normalized_name not in coauthor_names:
+            coauthor_names.append(normalized_name)
+    return {
+        "secondary_person_names": secondary_names,
+        "coauthor_person_names": coauthor_names,
+        "tavily_call_counter": tavily_call_counter,
+        "tavily_person_counter": tavily_person_counter,
+        "tavily_crawl_counter": tavily_crawl_counter,
+    }
 
 
 def _person_name_signature(value: str) -> str:
     normalized = normalize_person_candidate(value) or ""
     tokens = [token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z'-]*", normalized)]
     return " ".join(tokens)
+
+
+def _compact_alpha_signature(value: str) -> str:
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalpha())
 
 
 def _primary_target_match_score(candidate: str, expected_targets: List[str]) -> int:
@@ -922,6 +1587,8 @@ def _extract_primary_person_targets_from_receipts(
 def build_planner_graph(
     mcp_client: McpClientProtocol,
     llm: OpenRouterLLM | None = None,
+    *,
+    conflict_solver_llm: OpenRouterLLM | None = None,
     max_worker: int = DEFAULT_MAX_WORKER,
 ) -> StateGraph:
     graph = StateGraph(PlannerState)
@@ -935,9 +1602,16 @@ def build_planner_graph(
 
         seed_urls = _dedupe(prompt_urls + input_urls)
         allowed_hosts = _extract_allowed_hosts(seed_urls)
+        primary_target_contract = _initial_primary_target_contract(
+            state.get("prompt", ""),
+            list(state.get("inputs", [])),
+        )
+        persist_primary_target_contract(state["run_id"], primary_target_contract)
         logger.info("Planner input analyzed", extra={"seed_urls": seed_urls})
         return {
             **state,
+            "primary_target_contract": primary_target_contract,
+            "primary_graph_template": _derive_primary_graph_template(primary_target_contract),
             "seed_urls": seed_urls,
             "pending_urls": seed_urls,
             "current_fetch_urls": [],
@@ -954,10 +1628,94 @@ def build_planner_graph(
             "archive_identity_task_dedupe": {},
             "relationship_task_dedupe": {},
             "depth_task_dedupe": {},
+            "secondary_person_names": [],
+            "coauthor_person_names": [],
+            "tavily_call_counter": 0,
+            "tavily_person_counter": {},
+            "tavily_crawl_counter": {},
             "coverage_ledger": empty_coverage_ledger(),
             "evidence_quality_ok": False,
             "evidence_quality_stats": {"source_urls": 0, "source_domains": 0, "object_refs": 0},
             "graph_state_snapshot": _empty_graph_state_snapshot(),
+            "graph_export_json": _empty_graph_export_json(),
+            "graph_normalization_cases": [],
+            "graph_normalization_actions": [],
+            "graph_normalization_notes": [],
+            "normalization_gate_ok": True,
+            "primary_root_entity_id": "",
+            "merged_entity_count": 0,
+            "suppressed_noise_count": 0,
+            "graph_entity_rewrites": {},
+            "root_bootstrap_ok": True,
+            "root_bootstrap_notes": [],
+            "conflict_cases": [],
+            "resolved_conflicts": [],
+            "unresolved_conflicts": [],
+            "conflict_gate_ok": True,
+        }
+
+    def bootstrap_primary_root(state: PlannerState) -> PlannerState:
+        primary_target_contract = state.get("primary_target_contract") or PrimaryTargetContractModel()
+        noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
+        template = _derive_primary_graph_template(primary_target_contract, root_entity_id=primary_target_contract.root_entity_id)
+        if str(primary_target_contract.target_type or "").strip() != "person" or not str(primary_target_contract.canonical_name or "").strip():
+            notes = ["Primary root bootstrap skipped because the target contract did not resolve to a named person."]
+            _extend_noteboard_items(noteboard_sections, "graph_judgment", notes)
+            emit_run_event(
+                state["run_id"],
+                "PRIMARY_ROOT_BOOTSTRAPPED",
+                {"bootstrapOk": True, "rootEntityId": "", "templateMode": template.template_mode},
+            )
+            return {
+                **state,
+                "primary_graph_template": template,
+                "primary_root_entity_id": "",
+                "root_bootstrap_ok": True,
+                "root_bootstrap_notes": notes,
+                "noteboard_sections": _trim_noteboard_sections(noteboard_sections),
+                "noteboard": _flatten_noteboard_sections(_trim_noteboard_sections(noteboard_sections)),
+            }
+
+        bootstrap_ok, notes, graph_export_json, root_entity_id = _sync_primary_root_contract_to_graph(
+            mcp_client=mcp_client,
+            run_id=state["run_id"],
+            contract=primary_target_contract,
+        )
+        updated_contract = primary_target_contract.model_copy(
+            update={"root_entity_id": root_entity_id or primary_target_contract.root_entity_id}
+        )
+        persist_primary_target_contract(state["run_id"], updated_contract)
+        template = _derive_primary_graph_template(updated_contract, root_entity_id=updated_contract.root_entity_id)
+        graph_state_snapshot = _normalize_graph_state_snapshot(state.get("graph_state_snapshot", {}))
+        if graph_export_json.get("generated", False):
+            graph_state_snapshot = _derive_graph_state_snapshot(
+                mcp_client,
+                {**state, "primary_target_contract": updated_contract, "graph_export_json": graph_export_json},
+                graph_export=graph_export_json,
+            )
+            graph_state_snapshot["primary_root_entity_id"] = updated_contract.root_entity_id
+        _extend_noteboard_items(noteboard_sections, "graph_judgment", notes)
+        emit_run_event(
+            state["run_id"],
+            "PRIMARY_ROOT_BOOTSTRAPPED",
+            {
+                "bootstrapOk": bootstrap_ok,
+                "rootEntityId": updated_contract.root_entity_id,
+                "templateMode": template.template_mode,
+            },
+        )
+        trimmed_sections = _trim_noteboard_sections(noteboard_sections)
+        return {
+            **state,
+            "primary_target_contract": updated_contract,
+            "primary_graph_template": template,
+            "graph_export_json": graph_export_json if graph_export_json.get("generated", False) else state.get("graph_export_json", _empty_graph_export_json()),
+            "graph_state_snapshot": graph_state_snapshot,
+            "primary_root_entity_id": updated_contract.root_entity_id,
+            "root_bootstrap_ok": bootstrap_ok,
+            "root_bootstrap_notes": notes,
+            "noteboard_sections": trimmed_sections,
+            "noteboard": _flatten_noteboard_sections(trimmed_sections),
         }
 
     def plan_tools(state: PlannerState) -> PlannerState:
@@ -1062,13 +1820,13 @@ def build_planner_graph(
                 "name": "linkedin_download_html_ocr",
                 "description": "Core: download LinkedIn profile/activity HTML via Browserbase for later parsing/OCR.",
                 "type": "social_profile_capture",
-                "confidence": 0.75,
+                "confidence": 0.85,
                 "category": ["social", "linkedin", "capture"],
                 "args": {"runId": "uuid", "profile": "string", "output_dir": "string"},
             },
             {
                 "name": "tavily_research",
-                "description": "Core: run Tavily's async research workflow to produce a cited source-backed report for a person, company, site, or topic.",
+                "description": "Core: run Tavily's async research workflow to produce a cited source-backed report for a person, company.",
                 "type": "deep_research",
                 "confidence": 0.86,
                 "category": ["research", "tavily", "sources"],
@@ -1483,7 +2241,10 @@ def build_planner_graph(
                 rationale = result.get("rationale", "")
                 enough_info = bool(result.get("enough_info", False))
                 llm_plan = _normalize_llm_tool_plan(
-                    result.get("plan", []), state["run_id"], catalog_tool_names, person_targets
+                    result.get("plan", []),
+                    state["run_id"],
+                    catalog_tool_names,
+                    primary_person_targets or person_targets,
                 )
                 llm_plan, llm_plan_notes = _validate_llm_plan_items(
                     state=state,
@@ -1637,14 +2398,16 @@ def build_planner_graph(
                         )
                     )
 
-            for target_name in primary_person_targets[:3]:
-                has_tavily_research = _receipt_has_value(state, "tavily_research", {"input": target_name})
-                has_tavily_search = _receipt_has_value(state, "tavily_person_search", {"targetName": target_name})
-                github_query = _tavily_github_query(target_name)
-                has_tavily_github_search = _receipt_has_argument_signature(
+            for target_name in primary_person_targets[:1]:
+                has_tavily_research = _receipt_has_argument_signature(
+                    state,
+                    "tavily_research",
+                    {"target_name": target_name},
+                )
+                has_tavily_search = _receipt_has_argument_signature(
                     state,
                     "tavily_person_search",
-                    {"target_name": target_name, "query": github_query, "max_results": 5},
+                    {"target_name": target_name, "max_results": 5},
                 )
                 if not _receipt_has_argument_signature(state, "alias_variant_generator", {"person_name": target_name}):
                     plan.append(
@@ -1666,7 +2429,12 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_research",
-                            arguments={"runId": state["run_id"], "input": _tavily_person_research_query(target_name), "timeout_seconds": 240},
+                            arguments={
+                                "runId": state["run_id"],
+                                "target_name": target_name,
+                                "input": _tavily_person_research_query(target_name),
+                                "timeout_seconds": 240,
+                            },
                             rationale=f"Use Tavily research as the high-depth public-web entry point for a cited synthesis of biography, affiliations, relationships, and public footprint for: {target_name}",
                         )
                     )
@@ -1674,44 +2442,37 @@ def build_planner_graph(
                     plan.append(
                         ToolPlanItem(
                             tool="tavily_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "query": _tavily_person_search_query(target_name), "max_results": 10},
+                            arguments={"runId": state["run_id"], "target_name": target_name, "query": _tavily_person_search_query(target_name), "max_results": 5},
                             rationale=f"Use Tavily search as the broad discovery layer for biography, history, contact, and relationship clues for: {target_name}",
                         )
                     )
-                if not has_tavily_github_search:
-                    plan.append(
-                        ToolPlanItem(
-                            tool="tavily_person_search",
-                            arguments={
-                                "runId": state["run_id"],
-                                "target_name": target_name,
-                                "query": github_query,
-                                "max_results": 5,
-                            },
-                            rationale=f"Use Tavily search to discover GitHub account/profile evidence before repo-native GitHub resolution for: {target_name}",
+                google_serp_target = _extract_google_serp_person_target({"target_name": target_name})
+                if google_serp_target:
+                    scholar_query = _google_scholar_profile_query(google_serp_target)
+                    if not _receipt_has_argument_signature(
+                        state,
+                        "google_serp_person_search",
+                        {"target_name": scholar_query, "max_results": 10},
+                    ):
+                        plan.append(
+                            ToolPlanItem(
+                                tool="google_serp_person_search",
+                                arguments={"runId": state["run_id"], "target_name": scholar_query, "max_results": 10},
+                                rationale=f"Search Google Scholar profile candidates via SERP for: {google_serp_target}",
+                            )
                         )
-                    )
-                scholar_query = _google_scholar_profile_query(target_name)
-                if not _receipt_has_argument_signature(
-                    state,
-                    "google_serp_person_search",
-                    {"target_name": scholar_query, "max_results": 10},
-                ):
-                    plan.append(
-                        ToolPlanItem(
-                            tool="google_serp_person_search",
-                            arguments={"runId": state["run_id"], "target_name": scholar_query, "max_results": 10},
-                            rationale=f"Search Google Scholar profile candidates via SERP for: {target_name}",
+                    if has_tavily_search and not _receipt_has_value(
+                        state,
+                        "google_serp_person_search",
+                        {"targetName": google_serp_target},
+                    ):
+                        plan.append(
+                            ToolPlanItem(
+                                tool="google_serp_person_search",
+                                arguments={"runId": state["run_id"], "target_name": google_serp_target, "max_results": 10},
+                                rationale=f"Fallback public-web discovery via Google SERP for: {google_serp_target}",
+                            )
                         )
-                    )
-                if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
-                    plan.append(
-                        ToolPlanItem(
-                            tool="google_serp_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
-                            rationale=f"Fallback public-web discovery via Google SERP for: {target_name}",
-                        )
-                    )
                 if has_tavily_search and not _receipt_has_value(state, "person_search", {"name": target_name}):
                     plan.append(
                         ToolPlanItem(
@@ -1720,7 +2481,7 @@ def build_planner_graph(
                             rationale=f"Run broad person search to collect corroborating public profiles, history, and contact signals for: {target_name}",
                         )
                     )
-                if has_tavily_github_search and not _receipt_has_argument_signature(state, "github_identity_search", {"person_name": target_name}):
+                if not _receipt_has_argument_signature(state, "github_identity_search", {"person_name": target_name}):
                     plan.append(
                         ToolPlanItem(
                             tool="github_identity_search",
@@ -1768,44 +2529,10 @@ def build_planner_graph(
 
         else:
             for target_name in related_person_targets[:4]:
-                has_tavily_research = _receipt_has_value(state, "tavily_research", {"input": target_name})
-                has_tavily_search = _receipt_has_value(state, "tavily_person_search", {"targetName": target_name})
-                github_query = _tavily_github_query(target_name)
-                has_tavily_github_search = _receipt_has_argument_signature(
-                    state,
-                    "tavily_person_search",
-                    {"target_name": target_name, "query": github_query, "max_results": 5},
-                )
-                if not has_tavily_research:
-                    plan.append(
-                        ToolPlanItem(
-                            tool="tavily_research",
-                            arguments={"runId": state["run_id"], "input": _tavily_person_research_query(target_name), "timeout_seconds": 180},
-                            rationale=f"Expand related-person coverage with cited Tavily research for discovered person: {target_name}",
-                        )
-                    )
-                if not has_tavily_search:
-                    plan.append(
-                        ToolPlanItem(
-                            tool="tavily_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "query": _tavily_person_search_query(target_name), "max_results": 10},
-                            rationale=f"Expand related-person coverage using Tavily search for discovered person: {target_name}",
-                        )
-                    )
-                if not has_tavily_github_search:
-                    plan.append(
-                        ToolPlanItem(
-                            tool="tavily_person_search",
-                            arguments={
-                                "runId": state["run_id"],
-                                "target_name": target_name,
-                                "query": github_query,
-                                "max_results": 5,
-                            },
-                            rationale=f"Discover GitHub account/profile evidence for related person before repo-native GitHub resolution: {target_name}",
-                        )
-                    )
-                scholar_query = _google_scholar_profile_query(target_name)
+                normalized_target_name = _extract_google_serp_person_target({"target_name": target_name})
+                if not normalized_target_name:
+                    continue
+                scholar_query = _google_scholar_profile_query(normalized_target_name)
                 if not _receipt_has_argument_signature(
                     state,
                     "google_serp_person_search",
@@ -1815,23 +2542,23 @@ def build_planner_graph(
                         ToolPlanItem(
                             tool="google_serp_person_search",
                             arguments={"runId": state["run_id"], "target_name": scholar_query, "max_results": 8},
-                            rationale=f"Search Google Scholar profile candidates for related person: {target_name}",
+                            rationale=f"Search Google Scholar profile candidates for related person: {normalized_target_name}",
                         )
                     )
-                if has_tavily_search and not _receipt_has_value(state, "google_serp_person_search", {"targetName": target_name}):
-                    plan.append(
-                        ToolPlanItem(
-                            tool="google_serp_person_search",
-                            arguments={"runId": state["run_id"], "target_name": target_name, "max_results": 10},
-                            rationale=f"Fallback related-person coverage via Google SERP for discovered person: {target_name}",
-                        )
-                    )
-                if has_tavily_search and not _receipt_has_value(state, "person_search", {"name": target_name}):
+                if not _receipt_has_argument_signature(state, "person_search", {"name": normalized_target_name}):
                     plan.append(
                         ToolPlanItem(
                             tool="person_search",
-                            arguments={"runId": state["run_id"], "name": target_name, "max_results": 10},
-                            rationale=f"Collect biography, contact, and relationship clues for discovered related person: {target_name}",
+                            arguments={"runId": state["run_id"], "name": normalized_target_name, "max_results": 10},
+                            rationale=f"Collect biography, contact, and relationship clues for discovered related person: {normalized_target_name}",
+                        )
+                    )
+                if not _receipt_has_argument_signature(state, "github_identity_search", {"person_name": normalized_target_name}):
+                    plan.append(
+                        ToolPlanItem(
+                            tool="github_identity_search",
+                            arguments={"runId": state["run_id"], "person_name": normalized_target_name, "max_results": 5},
+                            rationale=f"Resolve public code identity anchors, repositories, and org memberships for discovered related person: {normalized_target_name}",
                         )
                     )
 
@@ -1890,25 +2617,6 @@ def build_planner_graph(
                     )
 
             for username in usernames[:6]:
-                github_query = _tavily_github_query(username)
-                has_tavily_github_search = _receipt_has_argument_signature(
-                    state,
-                    "tavily_person_search",
-                    {"target_name": username, "query": github_query, "max_results": 5},
-                )
-                if not has_tavily_github_search:
-                    plan.append(
-                        ToolPlanItem(
-                            tool="tavily_person_search",
-                            arguments={
-                                "runId": state["run_id"],
-                                "target_name": username,
-                                "query": github_query,
-                                "max_results": 5,
-                            },
-                            rationale=f"Use Tavily search to check whether username pivot maps to a GitHub account before repo-native GitHub resolution: {username}",
-                        )
-                    )
                 if not _receipt_has_argument_signature(state, "username_permutation_search", {"username": username}):
                     plan.append(
                         ToolPlanItem(
@@ -1917,7 +2625,7 @@ def build_planner_graph(
                             rationale=f"Check direct cross-platform URL permutations for discovered username pivot: {username}",
                         )
                     )
-                if has_tavily_github_search and not _receipt_has_argument_signature(state, "github_identity_search", {"username": username}):
+                if not _receipt_has_argument_signature(state, "github_identity_search", {"username": username}):
                     plan.append(
                         ToolPlanItem(
                             tool="github_identity_search",
@@ -1992,8 +2700,10 @@ def build_planner_graph(
                         )
                     )
 
+        plan = _rewrite_crawl_plan_with_fetch_fallback(state, plan)
         plan = _dedupe_tool_plan(plan)
         plan = _filter_completed_tool_plan(state, plan)
+        plan = _filter_tool_plan_for_budgets(state, plan)
         plan = _prioritize_tool_plan(
             {**state, "graph_state_snapshot": graph_state_snapshot},
             plan,
@@ -2045,8 +2755,26 @@ def build_planner_graph(
 
         def execute_plan_item(index: int, item: ToolPlanItem) -> tuple[int, List[ToolReceipt]]:
             receipts: List[ToolReceipt] = []
-            worker_result = run_tool_worker(
-                mcp_client, state["run_id"], item.tool, item.arguments)
+            try:
+                worker_result = run_tool_worker(
+                    mcp_client,
+                    state["run_id"],
+                    item.tool,
+                    item.arguments,
+                    primary_target_contract=state.get("primary_target_contract"),
+                    primary_graph_template=state.get("primary_graph_template"),
+                )
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "Planner tool worker failed",
+                    extra={"tool": item.tool, "run_id": state["run_id"]},
+                )
+                receipts.append(
+                    _build_failed_tool_receipt(state["run_id"], item.tool, item.arguments, error_message)
+                )
+                return index, receipts
+
             receipt = worker_result.receipt
             receipts.append(receipt)
             logger.info("Planner executed tool", extra={
@@ -2055,41 +2783,95 @@ def build_planner_graph(
             auto_entities = _build_auto_graph_entities(
                 item.tool, item.arguments, worker_result.result)
             if auto_entities:
-                ingest_result = run_tool_worker(
-                    mcp_client,
-                    state["run_id"],
-                    "ingest_graph_entities",
-                    {
-                        "runId": state["run_id"],
-                        "entitiesJson": auto_entities,
-                    },
-                )
-                ingest_receipt = ingest_result.receipt
-                receipts.append(ingest_receipt)
-                logger.info(
-                    "Planner auto-ingested graph entities",
-                    extra={
-                        "source_tool": item.tool,
-                        "entity_count": len(auto_entities),
-                        "ok": ingest_receipt.ok,
-                    },
-                )
+                ingest_arguments = {
+                    "runId": state["run_id"],
+                    "entitiesJson": auto_entities,
+                }
+                try:
+                    ingest_result = run_tool_worker(
+                        mcp_client,
+                        state["run_id"],
+                        "ingest_graph_entities",
+                        ingest_arguments,
+                        primary_target_contract=state.get("primary_target_contract"),
+                        primary_graph_template=state.get("primary_graph_template"),
+                    )
+                except Exception as exc:
+                    error_message = f"{type(exc).__name__}: {exc}"
+                    logger.exception(
+                        "Planner auto-ingest failed",
+                        extra={
+                            "source_tool": item.tool,
+                            "tool": "ingest_graph_entities",
+                            "run_id": state["run_id"],
+                        },
+                    )
+                    receipts.append(
+                        _build_failed_tool_receipt(
+                            state["run_id"],
+                            "ingest_graph_entities",
+                            ingest_arguments,
+                            error_message,
+                        )
+                    )
+                else:
+                    ingest_receipt = ingest_result.receipt
+                    receipts.append(ingest_receipt)
+                    logger.info(
+                        "Planner auto-ingested graph entities",
+                        extra={
+                            "source_tool": item.tool,
+                            "entity_count": len(auto_entities),
+                            "ok": ingest_receipt.ok,
+                        },
+                    )
 
             return index, receipts
 
+        def execute_plan_item_safely(index: int, item: ToolPlanItem) -> tuple[int, List[ToolReceipt]]:
+            try:
+                return execute_plan_item(index, item)
+            except Exception as exc:
+                error_message = f"{type(exc).__name__}: {exc}"
+                logger.exception(
+                    "Planner fan-out worker crashed unexpectedly",
+                    extra={"tool": item.tool, "run_id": state["run_id"]},
+                )
+                return (
+                    index,
+                    [_build_failed_tool_receipt(state["run_id"], item.tool, item.arguments, error_message)],
+                )
+
         if worker_limit == 1 or len(tool_plan) <= 1:
             for index, item in enumerate(tool_plan):
-                _, receipts = execute_plan_item(index, item)
+                _, receipts = execute_plan_item_safely(index, item)
                 latest_receipts.extend(receipts)
         else:
             ordered_receipts: Dict[int, List[ToolReceipt]] = {}
             with ThreadPoolExecutor(max_workers=worker_limit) as executor:
-                futures = [
-                    executor.submit(execute_plan_item, index, item)
+                futures = {
+                    executor.submit(execute_plan_item_safely, index, item): (index, item)
                     for index, item in enumerate(tool_plan)
-                ]
+                }
                 for future in as_completed(futures):
-                    index, receipts = future.result()
+                    fallback_index, fallback_item = futures[future]
+                    try:
+                        index, receipts = future.result()
+                    except Exception as exc:
+                        error_message = f"{type(exc).__name__}: {exc}"
+                        logger.exception(
+                            "Planner future resolution failed",
+                            extra={"tool": fallback_item.tool, "run_id": state["run_id"]},
+                        )
+                        index = fallback_index
+                        receipts = [
+                            _build_failed_tool_receipt(
+                                state["run_id"],
+                                fallback_item.tool,
+                                fallback_item.arguments,
+                                error_message,
+                            )
+                        ]
                     ordered_receipts[index] = receipts
 
             for index in range(len(tool_plan)):
@@ -2122,6 +2904,7 @@ def build_planner_graph(
         archive_identity_task_dedupe = dict(state.get("archive_identity_task_dedupe", {}))
         relationship_task_dedupe = dict(state.get("relationship_task_dedupe", {}))
         depth_task_dedupe = dict(state.get("depth_task_dedupe", {}))
+        primary_target_contract = state.get("primary_target_contract") or PrimaryTargetContractModel()
 
         for receipt in latest_receipts:
             all_receipts.append(receipt)
@@ -2179,7 +2962,35 @@ def build_planner_graph(
                 f"Discovered {len(filtered_discovered_urls)} in-scope internal URL(s) for follow-up extraction."
             )
 
-        primary_person_targets = _extract_primary_person_targets(state)
+        primary_target_contract = _enrich_primary_target_contract(
+            primary_target_contract,
+            all_receipts,
+            state.get("iteration", 0),
+        )
+        root_bootstrap_ok = bool(state.get("root_bootstrap_ok", True))
+        root_bootstrap_notes = list(state.get("root_bootstrap_notes", []))
+        previous_contract = state.get("primary_target_contract") or PrimaryTargetContractModel()
+        previous_canonical_name = str(previous_contract.canonical_name or "").strip()
+        root_sync_notes: List[str] = []
+        if primary_target_contract.root_entity_id and str(primary_target_contract.canonical_name or "").strip() != previous_canonical_name:
+            root_bootstrap_ok, root_sync_notes, synced_graph_export, synced_root_entity_id = _sync_primary_root_contract_to_graph(
+                mcp_client=mcp_client,
+                run_id=state["run_id"],
+                contract=primary_target_contract,
+            )
+            if synced_root_entity_id:
+                primary_target_contract = primary_target_contract.model_copy(update={"root_entity_id": synced_root_entity_id})
+            if synced_graph_export.get("generated", False):
+                state["graph_export_json"] = synced_graph_export
+        persist_primary_target_contract(state["run_id"], primary_target_contract)
+        primary_graph_template = _derive_primary_graph_template(
+            primary_target_contract,
+            root_entity_id=primary_target_contract.root_entity_id,
+        )
+        root_bootstrap_notes = _dedupe([*root_bootstrap_notes, *root_sync_notes])
+        if root_sync_notes:
+            _extend_noteboard_items(noteboard_sections, "graph_judgment", root_sync_notes)
+        primary_person_targets = _target_contract_aliases(primary_target_contract)
         if not primary_person_targets:
             primary_person_targets = _extract_person_targets_from_state(state)
         if primary_person_targets:
@@ -2200,6 +3011,8 @@ def build_planner_graph(
         entity_resolution_follow_up_tasks, archive_identity_task_dedupe, entity_resolution_notes = _derive_entity_resolution_follow_up_tasks(
             run_id=state["run_id"],
             receipts=all_receipts,
+            primary_person_targets=primary_person_targets,
+            primary_target_contract=primary_target_contract,
             iteration=state.get("iteration", 0),
             dedupe_store=archive_identity_task_dedupe,
         )
@@ -2438,6 +3251,8 @@ def build_planner_graph(
             receipts=all_receipts,
             candidates=related_entity_candidates,
             primary_person_targets=primary_person_targets,
+            secondary_person_names=list(state.get("secondary_person_names", [])),
+            coauthor_person_names=list(state.get("coauthor_person_names", [])),
             iteration=state.get("iteration", 0),
             dedupe_store=depth_task_dedupe,
             allow_related_person_depth=allow_related_person_depth,
@@ -2452,6 +3267,7 @@ def build_planner_graph(
                         "priority": task.priority,
                         "reason": task.reason,
                         "dedupe_key": task.dedupe_key,
+                        **_depth_task_metadata(task.payload, related_entity_candidates),
                     }
                     for task in depth_follow_up_tasks
                 ]
@@ -2469,6 +3285,7 @@ def build_planner_graph(
             )
         _extend_noteboard_items(noteboard_sections, "depth_candidates", adjudication_notes + depth_notes)
 
+        graph_export_json = _fetch_graph_export_json(mcp_client, state["run_id"])
         graph_state_snapshot = _derive_graph_state_snapshot(
             mcp_client,
             {
@@ -2478,6 +3295,7 @@ def build_planner_graph(
                 "noteboard_sections": noteboard_sections,
                 "coverage_ledger": state.get("coverage_ledger", empty_coverage_ledger()),
             },
+            graph_export=graph_export_json,
         )
         _extend_noteboard_items(
             noteboard_sections,
@@ -2503,10 +3321,15 @@ def build_planner_graph(
         coverage_ledger = _derive_coverage_ledger(
             {
                 **state,
+                "primary_target_contract": primary_target_contract,
                 "tool_receipts": all_receipts,
                 "noteboard": noteboard,
                 "noteboard_sections": noteboard_sections,
             }
+        )
+        budget_counters = _recompute_budget_counters(
+            receipts=all_receipts,
+            related_entity_candidates=related_entity_candidates,
         )
 
         emit_run_event(
@@ -2534,8 +3357,162 @@ def build_planner_graph(
             "archive_identity_task_dedupe": archive_identity_task_dedupe,
             "relationship_task_dedupe": relationship_task_dedupe,
             "depth_task_dedupe": depth_task_dedupe,
+            "primary_target_contract": primary_target_contract,
+            "primary_graph_template": primary_graph_template,
+            "primary_root_entity_id": primary_target_contract.root_entity_id or str(state.get("primary_root_entity_id") or ""),
+            "secondary_person_names": budget_counters["secondary_person_names"],
+            "coauthor_person_names": budget_counters["coauthor_person_names"],
+            "tavily_call_counter": budget_counters["tavily_call_counter"],
+            "tavily_person_counter": budget_counters["tavily_person_counter"],
+            "tavily_crawl_counter": budget_counters["tavily_crawl_counter"],
             "coverage_ledger": coverage_ledger,
             "graph_state_snapshot": graph_state_snapshot,
+            "graph_export_json": graph_export_json,
+            "root_bootstrap_ok": root_bootstrap_ok,
+            "root_bootstrap_notes": root_bootstrap_notes,
+        }
+
+    def normalize_graph_structure(state: PlannerState) -> PlannerState:
+        noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
+        updates = _run_graph_normalization_pass(
+            mcp_client=mcp_client,
+            llm=llm,
+            state=state,
+        )
+        graph_state_snapshot = _normalize_graph_state_snapshot(updates.get("graph_state_snapshot", {}))
+        graph_export_json = _normalize_graph_export_json(updates.get("graph_export_json", {}))
+        normalization_notes = [
+            str(item).strip()
+            for item in updates.get("graph_normalization_notes", [])
+            if str(item).strip()
+        ]
+        if normalization_notes:
+            _extend_noteboard_items(noteboard_sections, "graph_judgment", normalization_notes)
+        _extend_noteboard_items(
+            noteboard_sections,
+            "graph_judgment",
+            _graph_snapshot_note_lines(graph_state_snapshot),
+        )
+        emit_run_event(
+            state["run_id"],
+            "GRAPH_NORMALIZATION_COMPLETED",
+            {
+                "normalizationGateOk": bool(updates.get("normalization_gate_ok", True)),
+                "primaryRootEntityId": str(updates.get("primary_root_entity_id") or ""),
+                "mergedEntityCount": int(updates.get("merged_entity_count", 0) or 0),
+                "suppressedNoiseCount": int(updates.get("suppressed_noise_count", 0) or 0),
+                "caseCount": len(updates.get("graph_normalization_cases", [])),
+            },
+        )
+        noteboard_sections = _trim_noteboard_sections(noteboard_sections)
+        return {
+            **state,
+            **updates,
+            "graph_state_snapshot": graph_state_snapshot,
+            "graph_export_json": graph_export_json,
+            "noteboard_sections": noteboard_sections,
+            "noteboard": _flatten_noteboard_sections(noteboard_sections),
+        }
+
+    def resolve_graph_conflicts(state: PlannerState) -> PlannerState:
+        noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
+        if not bool(state.get("normalization_gate_ok", True)):
+            _append_noteboard_item(
+                noteboard_sections,
+                "graph_judgment",
+                "Conflict adjudication skipped until graph normalization completes.",
+            )
+            noteboard_sections = _trim_noteboard_sections(noteboard_sections)
+            return {
+                **state,
+                "noteboard_sections": noteboard_sections,
+                "noteboard": _flatten_noteboard_sections(noteboard_sections),
+                "conflict_cases": [],
+                "resolved_conflicts": [],
+                "unresolved_conflicts": [],
+                "conflict_gate_ok": False,
+            }
+        primary_person_targets = _target_contract_aliases(state.get("primary_target_contract") or PrimaryTargetContractModel())
+        if not primary_person_targets:
+            primary_person_targets = _extract_primary_person_targets(state)
+        graph_export_json = _normalize_graph_export_json(state.get("graph_export_json", {}))
+        if not graph_export_json.get("generated", False):
+            graph_export_json = _fetch_graph_export_json(mcp_client, state["run_id"])
+        graph_state_snapshot = _derive_graph_state_snapshot(
+            mcp_client,
+            state,
+            graph_export=graph_export_json,
+        )
+        conflict_cases = _build_conflict_cases(
+            mcp_client=mcp_client,
+            llm=conflict_solver_llm or llm,
+            run_id=state["run_id"],
+            receipts=[item for item in state.get("tool_receipts", []) if getattr(item, "ok", False)],
+            graph_state_snapshot=graph_state_snapshot,
+            primary_person_targets=primary_person_targets,
+            entity_rewrites=state.get("graph_entity_rewrites", {}),
+        )
+        conflict_cases, apply_notes = _apply_resolved_conflicts(
+            mcp_client=mcp_client,
+            run_id=state["run_id"],
+            conflict_cases=conflict_cases,
+        )
+        resolved_conflicts = [item for item in conflict_cases if item.status in {"resolved", "applied"}]
+        unresolved_conflicts = [item for item in conflict_cases if item.status not in {"resolved", "applied"}]
+        conflict_gate_ok = not any(item.blocking for item in unresolved_conflicts)
+
+        for note in apply_notes:
+            _append_noteboard_item(noteboard_sections, "graph_judgment", note)
+        if unresolved_conflicts:
+            summary = ", ".join(
+                [
+                    f"{item.relation_type or item.field_name} ({item.status}, {item.confidence:.2f})"
+                    for item in unresolved_conflicts[:4]
+                ]
+            )
+            _append_noteboard_item(
+                noteboard_sections,
+                "gaps",
+                f"Stage 1 graph conflict gate blocked by unresolved conflicts: {summary}.",
+            )
+        elif conflict_cases:
+            _append_noteboard_item(
+                noteboard_sections,
+                "graph_judgment",
+                f"Stage 1 conflict adjudication completed with {len(resolved_conflicts)} resolved/applied case(s).",
+            )
+
+        try:
+            persist_conflict_snapshot(state["run_id"], conflict_cases)
+        except Exception:
+            getattr(logger, "exception", logger.warning)(
+                "Failed to persist conflict snapshot",
+                extra={"run_id": state["run_id"]},
+            )
+        emit_run_event(
+            state["run_id"],
+            "GRAPH_CONFLICTS_UPDATED",
+            {
+                "caseCount": len(conflict_cases),
+                "resolvedCount": len(resolved_conflicts),
+                "unresolvedCount": len(unresolved_conflicts),
+                "conflictGateOk": conflict_gate_ok,
+                "graphExportStatus": graph_state_snapshot.get("graph_export_status"),
+                "graphExportNodeCount": graph_state_snapshot.get("graph_export_node_count"),
+                "graphExportRelationCount": graph_state_snapshot.get("graph_export_relation_count"),
+            },
+        )
+        noteboard_sections = _trim_noteboard_sections(noteboard_sections)
+        return {
+            **state,
+            "noteboard_sections": noteboard_sections,
+            "noteboard": _flatten_noteboard_sections(noteboard_sections),
+            "graph_state_snapshot": graph_state_snapshot,
+            "graph_export_json": graph_export_json,
+            "conflict_cases": conflict_cases,
+            "resolved_conflicts": resolved_conflicts,
+            "unresolved_conflicts": unresolved_conflicts,
+            "conflict_gate_ok": conflict_gate_ok,
         }
 
     def decide_stop_or_refine(state: PlannerState) -> PlannerState:
@@ -2548,6 +3525,8 @@ def build_planner_graph(
             state.get("graph_state_snapshot", {})
         )
         graph_ok, graph_note = _graph_stop_gate(state, graph_state_snapshot)
+        normalization_gate_ok = bool(state.get("normalization_gate_ok", True))
+        conflict_gate_ok = bool(state.get("conflict_gate_ok", True))
         has_pending_follow_up = bool(state.get("queued_tasks", []))
         noteboard_sections = _normalize_noteboard_sections(state.get("noteboard_sections", {}))
         scorecard = _format_coverage_scorecard(coverage_ledger)
@@ -2564,6 +3543,10 @@ def build_planner_graph(
             _append_noteboard_item(noteboard_sections, "gaps", graph_note)
         if not evidence_quality_ok and evidence_quality_note:
             _append_noteboard_item(noteboard_sections, "gaps", evidence_quality_note)
+        if not normalization_gate_ok:
+            _append_noteboard_item(noteboard_sections, "gaps", "Stage 1 graph normalization must complete before Stage 2.")
+        if not conflict_gate_ok:
+            _append_noteboard_item(noteboard_sections, "gaps", "Stage 1 conflict adjudication must resolve blocking graph conflicts before Stage 2.")
 
         min_iterations_reached = iteration >= min(
             state.get("max_iterations", 1),
@@ -2576,14 +3559,18 @@ def build_planner_graph(
                 and ((not state.get("tool_plan")) and not has_pending_follow_up)
                 and coverage_ok
                 and evidence_quality_ok
+                and normalization_gate_ok
                 and graph_ok
+                and conflict_gate_ok
             )
             or (
                 min_iterations_reached
                 and coverage_ok
                 and evidence_quality_ok
                 and depth_ok
+                and normalization_gate_ok
                 and graph_ok
+                and conflict_gate_ok
                 and not has_pending_follow_up
             )
         )
@@ -2615,18 +3602,24 @@ def build_planner_graph(
         return END if state.get("done") else "plan_tools"
 
     graph.add_node("analyze_input", analyze_input)
+    graph.add_node("bootstrap_primary_root", bootstrap_primary_root)
     graph.add_node("plan_tools", plan_tools)
     graph.add_node("explain_plan", explain_plan)
     graph.add_node("execute_tools", execute_tools)
     graph.add_node("planner_review_receipts", planner_review_receipts)
+    graph.add_node("normalize_graph_structure", normalize_graph_structure)
+    graph.add_node("resolve_graph_conflicts", resolve_graph_conflicts)
     graph.add_node("decide_stop_or_refine", decide_stop_or_refine)
 
     graph.set_entry_point("analyze_input")
-    graph.add_edge("analyze_input", "plan_tools")
+    graph.add_edge("analyze_input", "bootstrap_primary_root")
+    graph.add_edge("bootstrap_primary_root", "plan_tools")
     graph.add_edge("plan_tools", "explain_plan")
     graph.add_edge("explain_plan", "execute_tools")
     graph.add_edge("execute_tools", "planner_review_receipts")
-    graph.add_edge("planner_review_receipts", "decide_stop_or_refine")
+    graph.add_edge("planner_review_receipts", "normalize_graph_structure")
+    graph.add_edge("normalize_graph_structure", "resolve_graph_conflicts")
+    graph.add_edge("resolve_graph_conflicts", "decide_stop_or_refine")
     graph.add_conditional_edges("decide_stop_or_refine", should_continue)
 
     return graph
@@ -2640,12 +3633,25 @@ def run_planner(
     max_worker: int = DEFAULT_MAX_WORKER,
 ) -> PlannerResult:
     load_env()
+    try:
+        from run_store import ensure_run_exists as _ensure_run_exists
+    except ImportError:
+        _ensure_run_exists = None
+    if callable(_ensure_run_exists):
+        _ensure_run_exists(run_id, prompt)
     emit_run_event(run_id, "PLANNER_STARTED", {})
     llm: OpenRouterLLM | None = None
+    conflict_solver_llm: OpenRouterLLM | None = None
     if os.getenv("OPENROUTER_API_KEY"):
-        planner_model = os.getenv(
-            "OPENROUTER_PLANNER_MODEL") or os.getenv("OPENROUTER_MODEL")
-        llm = OpenRouterLLM(model=planner_model)
+        planner_model = _planner_model_name()
+        if planner_model:
+            llm = OpenRouterLLM(model=planner_model)
+        conflict_solver_model = _conflict_solver_model_name(planner_model)
+        if conflict_solver_model:
+            if llm is not None and conflict_solver_model == planner_model:
+                conflict_solver_llm = llm
+            else:
+                conflict_solver_llm = OpenRouterLLM(model=conflict_solver_model)
 
     run_title = _derive_run_title(prompt, inputs or [], llm)
     _persist_run_title(run_id, run_title)
@@ -2655,11 +3661,18 @@ def run_planner(
     mcp_client.start()
 
     try:
-        graph = build_planner_graph(mcp_client, llm, max_worker=max_worker)
+        graph = build_planner_graph(
+            mcp_client,
+            llm,
+            conflict_solver_llm=conflict_solver_llm,
+            max_worker=max_worker,
+        )
         state: PlannerState = {
             "run_id": run_id,
             "prompt": prompt,
             "inputs": inputs or [],
+            "primary_target_contract": PrimaryTargetContractModel(),
+            "primary_graph_template": PrimaryGraphTemplateModel(),
             "seed_urls": [],
             "pending_urls": [],
             "current_fetch_urls": [],
@@ -2685,10 +3698,30 @@ def run_planner(
             "archive_identity_task_dedupe": {},
             "relationship_task_dedupe": {},
             "depth_task_dedupe": {},
+            "secondary_person_names": [],
+            "coauthor_person_names": [],
+            "tavily_call_counter": 0,
+            "tavily_person_counter": {},
+            "tavily_crawl_counter": {},
             "coverage_ledger": empty_coverage_ledger(),
             "evidence_quality_ok": False,
             "evidence_quality_stats": {"source_urls": 0, "source_domains": 0, "object_refs": 0},
             "graph_state_snapshot": _empty_graph_state_snapshot(),
+            "graph_export_json": _empty_graph_export_json(),
+            "graph_normalization_cases": [],
+            "graph_normalization_actions": [],
+            "graph_normalization_notes": [],
+            "normalization_gate_ok": True,
+            "primary_root_entity_id": "",
+            "merged_entity_count": 0,
+            "suppressed_noise_count": 0,
+            "graph_entity_rewrites": {},
+            "root_bootstrap_ok": True,
+            "root_bootstrap_notes": [],
+            "conflict_cases": [],
+            "resolved_conflicts": [],
+            "unresolved_conflicts": [],
+            "conflict_gate_ok": True,
         }
 
         final_state = graph.compile().invoke(state)
@@ -2703,12 +3736,27 @@ def run_planner(
             iterations=final_state.get("iteration", 0),
             noteboard=final_state.get("noteboard", []),
             next_stage=final_state.get("next_stage", "stage1"),
+            primary_target_contract=final_state.get("primary_target_contract", PrimaryTargetContractModel()),
+            primary_graph_template=final_state.get("primary_graph_template", PrimaryGraphTemplateModel()),
             coverage_ledger=final_state.get("coverage_ledger", empty_coverage_ledger()),
             evidence_quality_ok=bool(final_state.get("evidence_quality_ok", False)),
             evidence_quality_stats=final_state.get("evidence_quality_stats", {"source_urls": 0, "source_domains": 0, "object_refs": 0}),
             graph_state_snapshot=_normalize_graph_state_snapshot(
                 final_state.get("graph_state_snapshot", {})
             ),
+            graph_normalization_cases=final_state.get("graph_normalization_cases", []),
+            graph_normalization_actions=final_state.get("graph_normalization_actions", []),
+            graph_normalization_notes=final_state.get("graph_normalization_notes", []),
+            normalization_gate_ok=bool(final_state.get("normalization_gate_ok", True)),
+            primary_root_entity_id=str(final_state.get("primary_root_entity_id") or ""),
+            merged_entity_count=int(final_state.get("merged_entity_count", 0) or 0),
+            suppressed_noise_count=int(final_state.get("suppressed_noise_count", 0) or 0),
+            root_bootstrap_ok=bool(final_state.get("root_bootstrap_ok", True)),
+            root_bootstrap_notes=final_state.get("root_bootstrap_notes", []),
+            conflict_cases=final_state.get("conflict_cases", []),
+            resolved_conflicts=final_state.get("resolved_conflicts", []),
+            unresolved_conflicts=final_state.get("unresolved_conflicts", []),
+            conflict_gate_ok=bool(final_state.get("conflict_gate_ok", True)),
         )
     finally:
         mcp_client.close()
@@ -2761,6 +3809,9 @@ def _extract_username_from_profile_url(url: str) -> str | None:
     candidate = ""
     if host == "reddit.com":
         if len(path_parts) >= 2 and path_parts[0].casefold() == "user":
+            candidate = path_parts[1]
+    elif host == "linkedin.com":
+        if len(path_parts) >= 2 and path_parts[0].casefold() in {"in", "pub"}:
             candidate = path_parts[1]
     else:
         candidate = path_parts[0]
@@ -2858,6 +3909,80 @@ def _google_scholar_profile_query(target: str) -> str:
     if not normalized:
         return "site:scholar.google.com/citations"
     return f'site:scholar.google.com/citations "{normalized}"'
+
+
+def _normalize_valid_person_tool_target(value: str) -> str | None:
+    normalized_candidate = normalize_person_candidate(str(value or "").strip())
+    if not normalized_candidate:
+        return None
+    candidate_tokens = [token.casefold() for token in normalized_candidate.split() if token]
+    if _related_person_candidate_has_non_person_traits(
+        normalized_candidate,
+        tokens=candidate_tokens,
+    ):
+        return None
+    return normalized_candidate
+
+
+def _related_person_candidate_has_non_person_traits(
+    candidate: str,
+    *,
+    tokens: List[str] | None = None,
+) -> bool:
+    normalized = " ".join(str(candidate or "").split()).strip(" -,:;|")
+    if not normalized:
+        return True
+    lowered_tokens = tokens or [token.casefold() for token in normalized.split() if token]
+    if not lowered_tokens:
+        return True
+    joined = " ".join(lowered_tokens)
+    if any(token in RELATED_PERSON_LOCATION_TOKENS for token in lowered_tokens):
+        return True
+    if any(token in RELATED_PERSON_NON_PERSON_TOKENS for token in lowered_tokens):
+        return True
+    if any(phrase in joined for phrase in RELATED_ORG_DESCRIPTOR_TERMS):
+        return True
+    return False
+
+
+def _extract_google_serp_person_target(arguments: Dict[str, Any]) -> str | None:
+    raw_values: List[str] = []
+    for key in ("target_name", "query"):
+        value = " ".join(str(arguments.get(key) or "").split()).strip()
+        if value:
+            raw_values.append(value)
+    for raw_value in raw_values:
+        quoted_targets = [
+            " ".join(item.split()).strip()
+            for item in GOOGLE_SERP_QUOTED_TARGET_REGEX.findall(raw_value)
+            if " ".join(item.split()).strip()
+        ]
+        if quoted_targets:
+            candidate_values = quoted_targets
+        else:
+            stripped = " ".join(
+                GOOGLE_SCHOLAR_SITE_QUERY_REGEX.sub(" ", raw_value).replace('"', " ").split()
+            ).strip()
+            candidate_values = [item for item in (stripped, raw_value) if item]
+            candidate_values.extend(extract_person_targets(stripped))
+            candidate_values.extend(extract_person_targets(raw_value))
+        seen: set[str] = set()
+        for candidate in candidate_values:
+            normalized_candidate = normalize_person_candidate(candidate)
+            if not normalized_candidate:
+                continue
+            candidate_key = normalized_candidate.casefold()
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            candidate_tokens = [token.casefold() for token in normalized_candidate.split() if token]
+            if _related_person_candidate_has_non_person_traits(
+                normalized_candidate,
+                tokens=candidate_tokens,
+            ):
+                continue
+            return normalized_candidate
+    return None
 
 
 def _looks_like_dateish_phone_candidate(value: str) -> bool:
@@ -2993,6 +4118,11 @@ def _receipt_next_values(receipt: ToolReceipt, field_name: str) -> List[str]:
 
 
 def _extract_primary_person_targets(state: PlannerState) -> List[str]:
+    contract = state.get("primary_target_contract")
+    if isinstance(contract, PrimaryTargetContractModel):
+        contract_targets = _target_contract_aliases(contract)
+        if contract_targets:
+            return contract_targets
     prompt_candidates: List[str] = []
     prompt_candidates.extend(extract_person_targets(state.get("prompt", "") or ""))
     for item in state.get("inputs", []):
@@ -3320,11 +4450,38 @@ def _receipt_mentions_primary_target(receipt: ToolReceipt, primary_person_target
         return True
     searchable_values: List[str] = []
     searchable_values.append(str(receipt.summary or ""))
-    for value in receipt.arguments.values() if isinstance(receipt.arguments, dict) else []:
-        searchable_values.extend(_related_entity_text_fragments(value))
     for fact in receipt.key_facts:
         searchable_values.extend(_related_entity_text_fragments(fact))
     blob = " ".join(searchable_values).casefold()
+    return any(alias in blob for alias in target_aliases)
+
+
+def _receipt_invoked_with_primary_target(receipt: ToolReceipt, primary_person_targets: List[str]) -> bool:
+    target_aliases = {
+        alias.casefold()
+        for target in primary_person_targets
+        for alias in ([target] + extract_person_targets(target))
+        if isinstance(alias, str) and alias.strip()
+    }
+    if not target_aliases:
+        return True
+    searchable_values: List[str] = []
+    for value in receipt.arguments.values() if isinstance(receipt.arguments, dict) else []:
+        searchable_values.extend(_related_entity_text_fragments(value))
+    blob = " ".join(searchable_values).casefold()
+    return any(alias in blob for alias in target_aliases)
+
+
+def _value_mentions_primary_target(value: Any, primary_person_targets: List[str]) -> bool:
+    target_aliases = {
+        alias.casefold()
+        for target in primary_person_targets
+        for alias in ([target] + extract_person_targets(target))
+        if isinstance(alias, str) and alias.strip()
+    }
+    if not target_aliases:
+        return True
+    blob = " ".join(_related_entity_text_fragments(value)).casefold()
     return any(alias in blob for alias in target_aliases)
 
 
@@ -3439,9 +4596,51 @@ def _candidate_has_structured_person_support(candidate: Dict[str, Any]) -> bool:
         for item in candidate.get("relationship_types", [])
         if str(item).strip()
     }
-    if relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH", "ADVISED_BY", "COLLABORATED_WITH", "MENTORED_BY", "OFFICER_OF", "DIRECTOR_OF"} and not supporting_tools.issubset(NOISY_WEB_RELATED_PERSON_TOOLS):
+    if relationship_types & STRUCTURED_PERSON_RELATION_TYPES and not supporting_tools.issubset(NOISY_WEB_RELATED_PERSON_TOOLS):
         return True
     return False
+
+
+def _candidate_anchor_metadata(
+    candidate: Dict[str, Any],
+    *,
+    anchor_types: List[str],
+    structured_support: bool,
+    profile_support: bool,
+) -> Dict[str, Any]:
+    reasons: List[str] = []
+    score = 0.0
+    for anchor_type in anchor_types:
+        reasons.append(f"shared_{anchor_type}")
+        score += 2.0
+    if structured_support:
+        reasons.append("structured_relation")
+        score += 3.0
+    mention_count = int(candidate.get("mention_count", 0) or 0)
+    if mention_count >= 2 and (anchor_types or structured_support):
+        reasons.append("repeated_anchored_mentions")
+        score += 1.0
+    if profile_support and (anchor_types or structured_support):
+        reasons.append("profile_identity_surface")
+        score += 0.5
+    anchored = bool(anchor_types or structured_support)
+    relationship_types = {
+        str(item).strip()
+        for item in candidate.get("relationship_types", [])
+        if str(item).strip()
+    }
+    required_for_report = bool(
+        anchored
+        and candidate.get("entity_type") == "person"
+        and relationship_types & STRUCTURED_PERSON_RELATION_TYPES
+    )
+    return {
+        "anchor_score": score,
+        "anchor_reasons": _dedupe(reasons),
+        "anchored": anchored,
+        "required_for_report": required_for_report,
+        "scope": "secondary",
+    }
 
 
 def _heuristic_related_candidate_adjudication(
@@ -3459,6 +4658,12 @@ def _heuristic_related_candidate_adjudication(
     anchor_types = _candidate_anchor_types(candidate, primary_context)
     profile_support = _candidate_has_profileish_identity_url(candidate)
     structured_support = _candidate_has_structured_person_support(candidate)
+    anchor_metadata = _candidate_anchor_metadata(
+        candidate,
+        anchor_types=anchor_types,
+        structured_support=structured_support,
+        profile_support=profile_support,
+    )
     noisy_support_only = bool(supporting_tools) and supporting_tools.issubset(NOISY_WEB_RELATED_PERSON_TOOLS)
     if entity_type != "person":
         return {
@@ -3469,6 +4674,7 @@ def _heuristic_related_candidate_adjudication(
             "reason": f"Candidate already typed as {entity_type}.",
             "supporting_spans": [],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if entity_name and RELATED_PERSON_HANDLE_PATTERN.fullmatch(entity_name):
         return {
@@ -3479,6 +4685,7 @@ def _heuristic_related_candidate_adjudication(
             "reason": "Handle-like identifier is not a human name.",
             "supporting_spans": [entity_name],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if sum(1 for token in tokens if token in RELATED_PERSON_NOISE_TOKENS) >= 2:
         return {
@@ -3489,6 +4696,7 @@ def _heuristic_related_candidate_adjudication(
             "reason": "Page-chrome or compliance phrase, not a person.",
             "supporting_spans": [entity_name],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if any(token in RELATED_PERSON_LOCATION_TOKENS for token in tokens):
         return {
@@ -3499,16 +4707,18 @@ def _heuristic_related_candidate_adjudication(
             "reason": "Geographic or governmental phrase, not a person.",
             "supporting_spans": [entity_name],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if structured_support:
         return {
             "canonical_name": entity_name,
             "entity_type": "person",
             "confidence": 0.9,
-            "expandable": True,
+            "expandable": bool(anchor_metadata["anchored"]),
             "reason": "Structured relationship or identity evidence supports a real person.",
             "supporting_spans": [],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if noisy_support_only and len({str(item).strip().lower() for item in candidate.get("domains", []) if str(item).strip()}) >= 2 and not anchor_types:
         return {
@@ -3519,6 +4729,7 @@ def _heuristic_related_candidate_adjudication(
             "reason": "Generic web search surfaced multiple divergent profiles without overlap to the primary target.",
             "supporting_spans": [],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     if noisy_support_only and not anchor_types:
         return {
@@ -3529,15 +4740,17 @@ def _heuristic_related_candidate_adjudication(
             "reason": "Generic web evidence lacks a shared paper, institution, domain, or other target anchor.",
             "supporting_spans": [],
             "anchor_types": anchor_types,
+            **anchor_metadata,
         }
     return {
         "canonical_name": entity_name,
         "entity_type": "person",
         "confidence": 0.78 if anchor_types or profile_support else 0.68,
-        "expandable": bool(anchor_types or profile_support or not noisy_support_only),
+        "expandable": bool(anchor_metadata["anchored"]),
         "reason": "Candidate has enough support to remain a person candidate.",
         "supporting_spans": [],
         "anchor_types": anchor_types,
+        **anchor_metadata,
     }
 
 
@@ -3697,6 +4910,11 @@ def _adjudicate_related_entity_candidates(
         merged["adjudication_reason"] = str(heuristic.get("reason") or "").strip()
         merged["supporting_spans"] = list(heuristic.get("supporting_spans") or [])
         merged["anchor_types"] = list(heuristic.get("anchor_types") or [])
+        merged["anchor_score"] = float(heuristic.get("anchor_score", 0.0) or 0.0)
+        merged["anchor_reasons"] = list(heuristic.get("anchor_reasons") or [])
+        merged["anchored"] = bool(heuristic.get("anchored", False))
+        merged["required_for_report"] = bool(heuristic.get("required_for_report", False))
+        merged["scope"] = str(heuristic.get("scope") or "secondary")
         merged["adjudication_source"] = "heuristic"
         adjudicated.append(merged)
         if _candidate_requires_llm_adjudication(candidate, heuristic):
@@ -3723,6 +4941,11 @@ def _adjudicate_related_entity_candidates(
             merged["adjudication_reason"] = str(llm_result.get("reason") or merged.get("adjudication_reason") or "").strip()
             merged["supporting_spans"] = list(llm_result.get("supporting_spans") or merged.get("supporting_spans") or [])
             merged["adjudication_source"] = "llm"
+        if merged.get("entity_type") in {"location", "noise", "handle"}:
+            notes.append(
+                f"Filtered related candidate {merged.get('entity_name')}: classified as {merged.get('entity_type')} and excluded from depth expansion."
+            )
+            continue
         final_candidates.append(merged)
         if merged.get("entity_type") != "person":
             notes.append(
@@ -3746,6 +4969,46 @@ def _primary_target_aliases(primary_person_targets: List[str]) -> set[str]:
             if isinstance(alias, str) and alias.strip():
                 aliases.add(alias.strip().casefold())
     return aliases
+
+
+def _related_entity_name_from_payload(payload: Dict[str, Any]) -> str:
+    for key in ("target_name", "name", "person_name", "company_name", "org_name"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _depth_task_metadata(
+    payload: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    entity_name = _related_entity_name_from_payload(payload)
+    if not entity_name:
+        return {
+            "anchor_score": 0.0,
+            "anchor_reasons": [],
+            "anchored": False,
+            "required_for_report": False,
+            "scope": "secondary",
+        }
+    for candidate in candidates:
+        if str(candidate.get("entity_name") or "").strip().casefold() != entity_name.casefold():
+            continue
+        return {
+            "anchor_score": float(candidate.get("anchor_score", 0.0) or 0.0),
+            "anchor_reasons": list(candidate.get("anchor_reasons") or []),
+            "anchored": bool(candidate.get("anchored", False)),
+            "required_for_report": bool(candidate.get("required_for_report", False)),
+            "scope": str(candidate.get("scope") or "secondary"),
+        }
+    return {
+        "anchor_score": 0.0,
+        "anchor_reasons": [],
+        "anchored": False,
+        "required_for_report": False,
+        "scope": "secondary",
+    }
 
 
 def _parse_tavily_person_research_target(query: str) -> str | None:
@@ -3774,23 +5037,46 @@ def _looks_like_non_person_tavily_query(query: str) -> bool:
     )
 
 
+def _extract_tavily_research_person_target(arguments: Dict[str, Any]) -> str | None:
+    explicit_target = _normalize_valid_person_tool_target(
+        str(arguments.get("target_name") or arguments.get("name") or "").strip()
+    )
+    if explicit_target:
+        return explicit_target
+    input_text = str(arguments.get("input") or arguments.get("query") or "").strip()
+    if not input_text or _looks_like_non_person_tavily_query(input_text):
+        return None
+    parsed = _parse_tavily_person_research_target(input_text)
+    if parsed:
+        return _normalize_valid_person_tool_target(parsed)
+    return _normalize_valid_person_tool_target(input_text)
+
+
+def _extract_tavily_person_search_target(arguments: Dict[str, Any]) -> str | None:
+    for key in ("target_name", "name"):
+        candidate = _normalize_valid_person_tool_target(str(arguments.get(key) or "").strip())
+        if candidate:
+            return candidate
+    return _normalize_valid_person_tool_target(str(arguments.get("query") or "").strip())
+
+
 def _llm_plan_related_person_target(item: ToolPlanItem) -> str | None:
     arguments = item.arguments or {}
     if item.tool == "tavily_research":
-        input_text = str(arguments.get("input") or "").strip()
-        if not input_text or _looks_like_non_person_tavily_query(input_text):
-            return None
-        parsed = _parse_tavily_person_research_target(input_text)
-        if parsed:
-            return parsed
-        return normalize_person_candidate(input_text)
+        return _extract_tavily_research_person_target(arguments)
+    if item.tool == "google_serp_person_search":
+        return _extract_google_serp_person_target(arguments)
     if item.tool in {"tavily_person_search", "person_search"}:
+        if item.tool == "tavily_person_search":
+            return _extract_tavily_person_search_target(arguments)
         for key in ("target_name", "name"):
-            candidate = normalize_person_candidate(str(arguments.get(key) or "").strip())
+            candidate = _normalize_valid_person_tool_target(str(arguments.get(key) or "").strip())
             if candidate:
                 return candidate
-        return normalize_person_candidate(str(arguments.get("query") or "").strip())
+        return _normalize_valid_person_tool_target(str(arguments.get("query") or "").strip())
     if item.tool in {
+        "alias_variant_generator",
+        "sanctions_watchlist_search",
         "github_identity_search",
         "gitlab_identity_search",
         "semantic_scholar_search",
@@ -3799,7 +5085,7 @@ def _llm_plan_related_person_target(item: ToolPlanItem) -> str | None:
         "company_officer_search",
         "sec_person_search",
     }:
-        return normalize_person_candidate(str(arguments.get("person_name") or "").strip())
+        return _normalize_valid_person_tool_target(str(arguments.get("person_name") or "").strip())
     return None
 
 
@@ -3832,6 +5118,11 @@ def _validate_llm_plan_items(
             "urls": [],
             "mention_count": 1,
             "score": 1,
+            "anchor_score": 0.0,
+            "anchor_reasons": [],
+            "anchored": False,
+            "required_for_report": False,
+            "scope": "secondary",
         }
         candidate_rows.append(candidate)
         candidate_map[key] = candidate
@@ -3860,7 +5151,7 @@ def _validate_llm_plan_items(
         if not adjudicated:
             filtered_plan.append(item)
             continue
-        anchored = bool(adjudicated.get("anchor_types")) or _candidate_has_structured_person_support(adjudicated) or adjudicated.get("adjudication_source") == "llm"
+        anchored = bool(adjudicated.get("anchored", False))
         if adjudicated.get("entity_type") == "person" and adjudicated.get("expandable", False) and anchored:
             filtered_plan.append(item)
             continue
@@ -3891,6 +5182,11 @@ def _rank_related_entity_candidates(
                 "urls": [],
                 "mention_count": 0,
                 "score": 0,
+                "anchor_score": 0.0,
+                "anchor_reasons": [],
+                "anchored": False,
+                "required_for_report": False,
+                "scope": "secondary",
             }
             candidates[key] = current
         return current
@@ -3908,6 +5204,11 @@ def _rank_related_entity_candidates(
         "officers": "OFFICER_OF",
         "staff": "WORKS_AT",
         "overlaps": "DIRECTOR_OF",
+    }
+    structured_person_keys = {
+        key
+        for key, rel_type in person_keys.items()
+        if rel_type in STRUCTURED_PERSON_RELATION_TYPES
     }
     org_keys = {
         "organizations": "AFFILIATED_WITH",
@@ -3968,23 +5269,37 @@ def _rank_related_entity_candidates(
         receipt: ToolReceipt,
         value: Any,
         score: int,
+        anchor_reasons: List[str] | None = None,
     ) -> None:
         candidate = ensure_candidate(name, entity_type)
         candidate["relationship_types"] = _dedupe(candidate["relationship_types"] + [rel_type])
         candidate["supporting_tools"] = _dedupe(candidate["supporting_tools"] + [receipt.tool_name])
         candidate["mention_count"] += 1
         candidate["score"] += score
+        for reason in anchor_reasons or []:
+            if reason:
+                candidate["anchor_reasons"] = _dedupe(candidate["anchor_reasons"] + [reason])
         _attach_urls(candidate, value)
 
     for receipt in receipts:
         if not receipt.ok:
             continue
+        receipt_mentions_primary = _receipt_mentions_primary_target(receipt, primary_person_targets)
+        receipt_invoked_with_primary = _receipt_invoked_with_primary_target(receipt, primary_person_targets)
         for fact in receipt.key_facts:
             if not isinstance(fact, dict):
                 continue
+            fact_mentions_primary = _value_mentions_primary_target(fact, primary_person_targets)
             for key, rel_type in person_keys.items():
                 if key not in fact:
                     continue
+                if not receipt_mentions_primary:
+                    if not (
+                        receipt_invoked_with_primary
+                        and key in structured_person_keys
+                        and fact_mentions_primary
+                    ):
+                        continue
                 values = fact.get(key)
                 items = values if isinstance(values, list) else [values]
                 for item in items:
@@ -3995,6 +5310,11 @@ def _rank_related_entity_candidates(
                     ):
                         if name.casefold() in primary_people:
                             continue
+                        anchor_reasons: List[str] = []
+                        if receipt_mentions_primary or fact_mentions_primary:
+                            anchor_reasons.append("same_receipt_primary_mention")
+                        if receipt_invoked_with_primary and key in structured_person_keys:
+                            anchor_reasons.append(f"structured_{rel_type.lower()}")
                         _register_candidate(
                             name=name,
                             entity_type="person",
@@ -4002,6 +5322,7 @@ def _rank_related_entity_candidates(
                             receipt=receipt,
                             value=item,
                             score=2 if key in {"coauthors", "advisor", "advisors", "collaborators", "officers", "staff"} else 1,
+                            anchor_reasons=anchor_reasons,
                         )
             for key, rel_type in org_keys.items():
                 if key not in fact:
@@ -4044,7 +5365,35 @@ def _rank_related_entity_candidates(
                         candidate["score"] += 1
 
     ranked = [item for item in candidates.values() if int(item.get("score", 0)) >= STAGE1_RELATED_ENTITY_MIN_SCORE]
-    ranked.sort(key=lambda item: (int(item.get("score", 0)), int(item.get("mention_count", 0)), item.get("entity_name", "")), reverse=True)
+    for item in ranked:
+        anchor_reason_count = len([reason for reason in item.get("anchor_reasons", []) if str(reason).strip()])
+        anchor_score = float(item.get("anchor_score", 0.0) or 0.0) + float(anchor_reason_count)
+        anchored = bool(anchor_reason_count) and item.get("entity_type") == "person"
+        if item.get("entity_type") != "person":
+            anchored = bool(anchor_reason_count)
+        required_for_report = bool(
+            anchored
+            and item.get("entity_type") == "person"
+            and {
+                str(rel).strip()
+                for rel in item.get("relationship_types", [])
+                if str(rel).strip()
+            }
+            & STRUCTURED_PERSON_RELATION_TYPES
+        )
+        item["anchor_score"] = anchor_score
+        item["anchored"] = anchored
+        item["required_for_report"] = required_for_report
+        item["scope"] = "secondary"
+    ranked.sort(
+        key=lambda item: (
+            float(item.get("anchor_score", 0.0) or 0.0),
+            int(item.get("score", 0)),
+            int(item.get("mention_count", 0)),
+            item.get("entity_name", ""),
+        ),
+        reverse=True,
+    )
     org_count = 0
     person_count = 0
     topic_count = 0
@@ -4084,6 +5433,8 @@ def _is_related_person_candidate(
     if any(token in RELATED_PERSON_REJECT_TOKENS for token in tokens):
         return False
     if any(token in RELATED_ORG_PROVIDER_BLOCKLIST for token in tokens):
+        return False
+    if _related_person_candidate_has_non_person_traits(candidate, tokens=tokens):
         return False
     if not all(re.fullmatch(r"[A-Za-z][A-Za-z'-]*", token) for token in candidate.split()):
         return False
@@ -4600,6 +5951,10 @@ def _empty_graph_state_snapshot() -> Dict[str, Any]:
         "blueprint_required_slots": list(contract.get("required_slots_balanced", [])),
         "generated": False,
         "status": "uninitialized",
+        "graph_export_status": "uninitialized",
+        "graph_export_node_count": 0,
+        "graph_export_relation_count": 0,
+        "graph_export_error": "",
         "profile_focus": "unknown",
         "primary_target_names": [],
         "query_signature": "",
@@ -4611,6 +5966,10 @@ def _empty_graph_state_snapshot() -> Dict[str, Any]:
         "missing_slots": [],
         "planner_hints": [],
         "errors": [],
+        "primary_root_entity_id": "",
+        "root_candidate_count": 0,
+        "merged_entity_count": 0,
+        "suppressed_noise_count": 0,
         "generated_at_iteration": -1,
     }
 
@@ -4643,6 +6002,12 @@ def _normalize_graph_state_snapshot(raw: Any) -> Dict[str, Any]:
     ).strip()
     snapshot["generated"] = bool(raw.get("generated", snapshot["generated"]))
     snapshot["status"] = str(raw.get("status", snapshot["status"]) or snapshot["status"]).strip()
+    snapshot["graph_export_status"] = str(
+        raw.get("graph_export_status", snapshot["graph_export_status"]) or snapshot["graph_export_status"]
+    ).strip()
+    snapshot["graph_export_error"] = str(
+        raw.get("graph_export_error", snapshot["graph_export_error"]) or snapshot["graph_export_error"]
+    ).strip()
     snapshot["profile_focus"] = str(raw.get("profile_focus", snapshot["profile_focus"]) or snapshot["profile_focus"]).strip()
     value = raw.get("primary_target_names")
     if isinstance(value, list):
@@ -4652,6 +6017,9 @@ def _normalize_graph_state_snapshot(raw: Any) -> Dict[str, Any]:
         value = raw.get(key)
         if isinstance(value, list):
             snapshot[key] = [str(item).strip() for item in value if str(item).strip()]
+    snapshot["primary_root_entity_id"] = str(
+        raw.get("primary_root_entity_id", snapshot["primary_root_entity_id"]) or ""
+    ).strip()
     for key in ("node_label_counts", "relation_type_counts", "coverage_slots"):
         value = raw.get(key)
         if isinstance(value, dict):
@@ -4660,6 +6028,16 @@ def _normalize_graph_state_snapshot(raw: Any) -> Dict[str, Any]:
         snapshot["generated_at_iteration"] = int(raw.get("generated_at_iteration", -1))
     except Exception:
         snapshot["generated_at_iteration"] = -1
+    for key in ("graph_export_node_count", "graph_export_relation_count"):
+        try:
+            snapshot[key] = int(raw.get(key, snapshot[key]) or 0)
+        except Exception:
+            snapshot[key] = 0
+    for key in ("root_candidate_count", "merged_entity_count", "suppressed_noise_count"):
+        try:
+            snapshot[key] = int(raw.get(key, snapshot[key]) or 0)
+        except Exception:
+            snapshot[key] = 0
     return snapshot
 
 
@@ -4738,6 +6116,242 @@ def _graph_entity_id_from_payload(payload: Dict[str, Any]) -> str:
     )
 
 
+def _graph_relation_id_from_payload(payload: Dict[str, Any]) -> str:
+    direct = _pick_str(payload, ["edgeId", "relationId", "id"])
+    if direct:
+        return direct
+    props = _pick_dict(payload, ["properties", "props"])
+    return _pick_str(props, ["edge_id", "relation_id"]) or ""
+
+
+def _empty_graph_export_json() -> Dict[str, Any]:
+    return {
+        "generated": False,
+        "status": "uninitialized",
+        "runId": "",
+        "scope": "run",
+        "nodeCount": 0,
+        "relationCount": 0,
+        "nodes": [],
+        "relations": [],
+        "errors": [],
+    }
+
+
+def _normalize_graph_export_json(raw: Any) -> Dict[str, Any]:
+    normalized = _empty_graph_export_json()
+    if not isinstance(raw, dict):
+        return normalized
+    normalized["generated"] = bool(raw.get("generated", bool(raw.get("nodes") or raw.get("relations"))))
+    normalized["status"] = str(raw.get("status", normalized["status"]) or normalized["status"]).strip()
+    normalized["runId"] = str(raw.get("runId", normalized["runId"]) or "").strip()
+    normalized["scope"] = str(raw.get("scope", normalized["scope"]) or normalized["scope"]).strip() or "run"
+    for key in ("nodeCount", "relationCount"):
+        try:
+            normalized[key] = int(raw.get(key, 0) or 0)
+        except Exception:
+            normalized[key] = 0
+    for key in ("nodes", "relations", "errors"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            normalized[key] = list(value)
+    if normalized["nodes"] or normalized["relations"]:
+        normalized["generated"] = True
+        if normalized["status"] == "uninitialized":
+            normalized["status"] = "ready"
+        if not normalized["nodeCount"]:
+            normalized["nodeCount"] = len(normalized["nodes"])
+        if not normalized["relationCount"]:
+            normalized["relationCount"] = len(normalized["relations"])
+    return normalized
+
+
+def _fetch_graph_export_json(
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    *,
+    scope: str = "run",
+) -> Dict[str, Any]:
+    export = _empty_graph_export_json()
+    export["runId"] = run_id
+    export["scope"] = scope
+    if not hasattr(mcp_client, "call_tool"):
+        export.update({"status": "tool_unavailable", "errors": ["graph context client missing call_tool"]})
+        return export
+    try:
+        result = mcp_client.call_tool(
+            "graph_export_json",
+            {
+                "runId": run_id,
+                "scope": scope,
+                "maxNodes": 800,
+                "maxRelations": 1600,
+            },
+        )
+    except Exception as exc:
+        export.update({"status": "tool_unavailable", "errors": [str(exc)]})
+        return export
+    if not getattr(result, "ok", False):
+        export.update({"status": "error", "errors": [_graph_error_text(getattr(result, "content", {}))]})
+        return export
+    parsed = _normalize_graph_export_json(getattr(result, "content", {}))
+    if not parsed.get("generated", False):
+        parsed["generated"] = True
+    if not parsed.get("status"):
+        parsed["status"] = "ready"
+    return parsed
+
+
+def _graph_export_entity_name(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    props = _pick_dict(payload, ["properties", "props"])
+    return (
+        _pick_str(payload, ["canonicalName", "name"])
+        or _pick_str(props, ["canonical_name", "name", "display_name", "title"])
+        or ""
+    )
+
+
+def _graph_export_entity_props(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _pick_dict(payload, ["properties", "props"])
+
+
+def _graph_export_entity_labels(payload: Dict[str, Any]) -> List[str]:
+    return [str(item).strip() for item in _pick_list(payload, ["labels"]) if isinstance(item, str)]
+
+
+def _graph_export_entity_type(payload: Dict[str, Any]) -> str:
+    props = _graph_export_entity_props(payload)
+    return (
+        _pick_str(payload, ["type"])
+        or _pick_str(props, ["type", "entity_type"])
+        or ""
+    )
+
+
+def _graph_export_entity_alt_names(payload: Dict[str, Any]) -> List[str]:
+    props = _graph_export_entity_props(payload)
+    value = props.get("alt_names")
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _single_token_edit_distance_at_most_one(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    i = 0
+    j = 0
+    edits = 0
+    while i < len(left) and j < len(right):
+        if left[i] == right[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) == len(right):
+            i += 1
+            j += 1
+        elif len(left) > len(right):
+            i += 1
+        else:
+            j += 1
+    if i < len(left) or j < len(right):
+        edits += 1
+    return edits <= 1
+
+
+def _primary_root_typo_match(candidate: str, target: str) -> bool:
+    candidate_tokens = _person_name_signature(candidate).split()
+    target_tokens = _person_name_signature(target).split()
+    if not candidate_tokens or len(candidate_tokens) != len(target_tokens):
+        return False
+    mismatches = []
+    for candidate_token, target_token in zip(candidate_tokens, target_tokens):
+        if candidate_token == target_token:
+            continue
+        mismatches.append((candidate_token, target_token))
+    if len(mismatches) != 1:
+        return False
+    mismatch_left, mismatch_right = mismatches[0]
+    if min(len(mismatch_left), len(mismatch_right)) < 4:
+        return False
+    return _single_token_edit_distance_at_most_one(mismatch_left, mismatch_right)
+
+
+def _primary_root_match_score(candidate: str, expected_targets: List[str]) -> int:
+    base = _primary_target_match_score(candidate, expected_targets)
+    if base > 0:
+        return base
+    for target in expected_targets:
+        if _primary_root_typo_match(candidate, target):
+            return 3
+    return 0
+
+
+def _graph_export_resolved_entity_ids(
+    graph_export: Dict[str, Any],
+    primary_target_names: List[str],
+) -> List[str]:
+    matches: List[tuple[int, int, str]] = []
+    for entity in graph_export.get("nodes", []) if isinstance(graph_export.get("nodes", []), list) else []:
+        if not isinstance(entity, dict):
+            continue
+        entity_id = _graph_entity_id_from_payload(entity)
+        if not entity_id:
+            continue
+        candidate_names = [_graph_export_entity_name(entity)]
+        props = _pick_dict(entity, ["properties", "props"])
+        alt_names = props.get("alt_names")
+        if isinstance(alt_names, list):
+            candidate_names.extend([str(item).strip() for item in alt_names if str(item).strip()])
+        best_score = max((_primary_root_match_score(name, primary_target_names) for name in candidate_names if name), default=0)
+        if best_score <= 0:
+            continue
+        labels = [str(item).strip() for item in _pick_list(entity, ["labels"]) if isinstance(item, str)]
+        label_bonus = 1 if any(label.lower() in {"person", "entity"} for label in labels) else 0
+        root_bonus = 2 if bool(props.get("is_primary_root")) else 0
+        matches.append((best_score, label_bonus + root_bonus, entity_id))
+    matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    ordered: List[str] = []
+    for _score, _label_bonus, entity_id in matches:
+        if entity_id not in ordered:
+            ordered.append(entity_id)
+    return ordered[:STAGE1_GRAPH_ENTITY_LIMIT]
+
+
+def _graph_export_count_summaries(
+    graph_export: Dict[str, Any],
+) -> tuple[Dict[str, int], Dict[str, int]]:
+    label_counts: Dict[str, int] = {}
+    relation_counts: Dict[str, int] = {}
+    for entity in graph_export.get("nodes", []) if isinstance(graph_export.get("nodes", []), list) else []:
+        if not isinstance(entity, dict):
+            continue
+        for label in _pick_list(entity, ["labels"]):
+            if isinstance(label, str):
+                _graph_increment_count(label_counts, label)
+        props = _pick_dict(entity, ["properties", "props"])
+        entity_type = _pick_str(entity, ["type"]) or _pick_str(props, ["type", "entity_type"])
+        if entity_type:
+            _graph_increment_count(label_counts, entity_type)
+    for relation in graph_export.get("relations", []) if isinstance(graph_export.get("relations", []), list) else []:
+        if not isinstance(relation, dict):
+            continue
+        rel_type = _pick_str(relation, ["relType", "edgeType", "canonicalName"]) or _pick_str(
+            _pick_dict(relation, ["properties", "props"]),
+            ["rel_type", "canonical_name"],
+        )
+        if rel_type:
+            _graph_increment_count(relation_counts, rel_type.strip().upper())
+    return label_counts, relation_counts
+
+
 def _graph_query_terms_from_state(state: PlannerState) -> List[str]:
     terms: List[str] = []
     terms.extend(_extract_primary_person_targets(state))
@@ -4784,6 +6398,7 @@ def _graph_coverage_slots(
     label_counts: Dict[str, int],
     relation_counts: Dict[str, int],
     resolved_entity_ids: List[str],
+    anchored_secondary_people: int = 0,
 ) -> Dict[str, bool]:
     contract = _load_stage1_blueprint_contract()
     normalized_labels = {label.strip().casefold() for label in label_counts}
@@ -4792,13 +6407,8 @@ def _graph_coverage_slots(
     has_org_label = bool(normalized_labels & GRAPH_ORG_LABEL_HINTS)
     has_identity_label = bool(normalized_labels & GRAPH_IDENTITY_LABEL_HINTS)
     has_evidence_label = bool(normalized_labels & GRAPH_EVIDENCE_LABEL_HINTS)
-    person_label_count = sum(
-        int(count)
-        for label, count in label_counts.items()
-        if label.strip().casefold() in GRAPH_PERSON_LABEL_HINTS
-    )
     has_relationship_rel = bool(relation_keys & GRAPH_RELATIONSHIP_TYPES)
-    has_secondary_people = person_label_count >= 2 or has_relationship_rel
+    has_secondary_people = anchored_secondary_people > 0
     has_related_identity_rel = bool(
         relation_keys & GRAPH_RELATED_IDENTITY_RELATION_TYPES
     )
@@ -4908,6 +6518,7 @@ def _graph_planner_hints(profile_focus: str, missing_slots: List[str]) -> List[s
 def _derive_graph_state_snapshot(
     mcp_client: McpClientProtocol,
     state: PlannerState,
+    graph_export: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     snapshot = _empty_graph_state_snapshot()
     contract = _load_stage1_blueprint_contract()
@@ -4947,6 +6558,30 @@ def _derive_graph_state_snapshot(
     relation_counts: Dict[str, int] = {}
     resolved_entity_ids: List[str] = []
     errors: List[str] = []
+    anchored_secondary_people = len(
+        [
+            item
+            for item in state.get("related_entity_candidates", [])
+            if isinstance(item, dict)
+            and str(item.get("entity_type") or "").strip().lower() == "person"
+            and bool(item.get("anchored", False))
+        ]
+    )
+
+    normalized_graph_export = _normalize_graph_export_json(graph_export or {})
+    if not normalized_graph_export.get("generated", False):
+        normalized_graph_export = _fetch_graph_export_json(mcp_client, str(state.get("run_id") or ""))
+    snapshot["graph_export_status"] = str(normalized_graph_export.get("status", "uninitialized") or "uninitialized")
+    snapshot["graph_export_node_count"] = int(normalized_graph_export.get("nodeCount", 0) or 0)
+    snapshot["graph_export_relation_count"] = int(normalized_graph_export.get("relationCount", 0) or 0)
+    export_errors = [
+        str(item).strip()
+        for item in normalized_graph_export.get("errors", [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+    if export_errors:
+        snapshot["graph_export_error"] = export_errors[0]
+        errors.extend(export_errors)
 
     if not query_terms:
         profile_focus = _graph_focus_from_state(state, label_counts)
@@ -4955,6 +6590,7 @@ def _derive_graph_state_snapshot(
             label_counts=label_counts,
             relation_counts=relation_counts,
             resolved_entity_ids=resolved_entity_ids,
+            anchored_secondary_people=anchored_secondary_people,
         )
         snapshot.update(
             {
@@ -4970,6 +6606,39 @@ def _derive_graph_state_snapshot(
                     profile_focus,
                     [slot for slot, ok in coverage_slots.items() if not ok],
                 ),
+            }
+        )
+        return snapshot
+
+    export_status = str(normalized_graph_export.get("status", "")).strip().lower()
+    if normalized_graph_export.get("generated", False) and export_status not in {"tool_unavailable", "error", "uninitialized"}:
+        label_counts, relation_counts = _graph_export_count_summaries(normalized_graph_export)
+        resolved_entity_ids = _graph_export_resolved_entity_ids(
+            normalized_graph_export,
+            snapshot["primary_target_names"],
+        )
+        profile_focus = _graph_focus_from_state(state, label_counts)
+        coverage_slots = _graph_coverage_slots(
+            profile_focus=profile_focus,
+            label_counts=label_counts,
+            relation_counts=relation_counts,
+            resolved_entity_ids=resolved_entity_ids,
+            anchored_secondary_people=anchored_secondary_people,
+        )
+        missing_slots = [slot for slot, ok in coverage_slots.items() if not ok]
+        status = "ready" if (normalized_graph_export.get("nodes") or normalized_graph_export.get("relations")) else "no_matches"
+        snapshot.update(
+            {
+                "generated": True,
+                "status": status,
+                "profile_focus": profile_focus,
+                "resolved_entity_ids": resolved_entity_ids[:STAGE1_GRAPH_ENTITY_LIMIT],
+                "node_label_counts": dict(sorted(label_counts.items(), key=lambda item: item[1], reverse=True)[:12]),
+                "relation_type_counts": dict(sorted(relation_counts.items(), key=lambda item: item[1], reverse=True)[:12]),
+                "coverage_slots": coverage_slots,
+                "missing_slots": missing_slots,
+                "planner_hints": _graph_planner_hints(profile_focus, missing_slots),
+                "errors": _dedupe(errors)[:3],
             }
         )
         return snapshot
@@ -5071,6 +6740,7 @@ def _derive_graph_state_snapshot(
         label_counts=label_counts,
         relation_counts=relation_counts,
         resolved_entity_ids=resolved_entity_ids,
+        anchored_secondary_people=anchored_secondary_people,
     )
     missing_slots = [slot for slot, ok in coverage_slots.items() if not ok]
     status = "ready" if (resolved_entity_ids or label_counts or relation_counts) else "no_matches"
@@ -5120,10 +6790,22 @@ def _graph_snapshot_prompt_lines(snapshot: Dict[str, Any] | None) -> List[str]:
     ids = normalized.get("resolved_entity_ids", []) if isinstance(normalized.get("resolved_entity_ids", []), list) else []
     query_terms = normalized.get("query_terms", []) if isinstance(normalized.get("query_terms", []), list) else []
     primary_targets = normalized.get("primary_target_names", []) if isinstance(normalized.get("primary_target_names", []), list) else []
+    export_status = str(normalized.get("graph_export_status", "")).strip() or "uninitialized"
+    export_nodes = int(normalized.get("graph_export_node_count", 0) or 0)
+    export_relations = int(normalized.get("graph_export_relation_count", 0) or 0)
+    primary_root_entity_id = str(normalized.get("primary_root_entity_id", "") or "").strip()
+    merged_entity_count = int(normalized.get("merged_entity_count", 0) or 0)
+    suppressed_noise_count = int(normalized.get("suppressed_noise_count", 0) or 0)
     lines = [
         blueprint_line,
         f"Graph focus={focus}; resolved entity anchors={len(ids)}; graph-query pivots={', '.join(query_terms[:3]) or 'none'}.",
     ]
+    if export_status not in {"", "uninitialized"}:
+        lines.append(f"Run graph export: status={export_status}, nodes={export_nodes}, relations={export_relations}.")
+    if primary_root_entity_id:
+        lines.append(
+            f"Primary graph root={primary_root_entity_id}; merged duplicates={merged_entity_count}; suppressed noise={suppressed_noise_count}."
+        )
     if primary_targets:
         lines.append("Primary target anchors: " + ", ".join(primary_targets[:3]) + ".")
     if required_slots:
@@ -5242,6 +6924,726 @@ def _graph_stop_gate(state: PlannerState, snapshot: Dict[str, Any]) -> tuple[boo
     )
 
 
+def _normalize_graphish_text(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[\W_]+", " ", str(value or "").casefold())).strip()
+
+
+def _graph_relation_props(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _pick_dict(payload, ["properties", "props"])
+
+
+def _graph_relation_type(payload: Dict[str, Any]) -> str:
+    props = _graph_relation_props(payload)
+    return (
+        _pick_str(payload, ["relType", "edgeType", "canonicalName"])
+        or _pick_str(props, ["rel_type", "canonical_name"])
+        or ""
+    ).strip().upper()
+
+
+def _graph_relation_endpoints(payload: Dict[str, Any]) -> tuple[str, str]:
+    props = _graph_relation_props(payload)
+    return (
+        str(payload.get("srcEntityId") or props.get("src_id") or "").strip(),
+        str(payload.get("dstEntityId") or props.get("dst_id") or "").strip(),
+    )
+
+
+def _graph_attr_values_from_props(props: Dict[str, Any], *keys: str) -> List[str]:
+    if not isinstance(props, dict):
+        return []
+    target_keys = {key.strip().lower() for key in keys if key.strip()}
+    values: List[str] = []
+    for key in keys:
+        direct_value = props.get(key)
+        if isinstance(direct_value, str) and direct_value.strip():
+            values.append(direct_value.strip())
+        elif isinstance(direct_value, list):
+            values.extend([str(item).strip() for item in direct_value if str(item).strip()])
+    attributes = props.get("attributes")
+    if isinstance(attributes, list):
+        for attribute in attributes:
+            if not isinstance(attribute, str) or ":" not in attribute:
+                continue
+            key, raw_value = attribute.split(":", 1)
+            if key.strip().lower() not in target_keys:
+                continue
+            cleaned = raw_value.strip()
+            if cleaned:
+                values.append(cleaned)
+    return _dedupe(values)
+
+
+def _graph_node_family(node: Dict[str, Any]) -> str:
+    node_type = _normalize_graphish_text(_graph_export_entity_type(node))
+    if node_type in {"person"}:
+        return "person"
+    if node_type in {"institution", "organization"}:
+        return "organization"
+    if node_type in {"website", "document", "domain", "contactpoint", "email", "handle", "phone"}:
+        return "digital"
+    return node_type or "unknown"
+
+
+def _graph_node_degree(entity_id: str, relations: List[Dict[str, Any]]) -> int:
+    degree = 0
+    for relation in relations:
+        src_id, dst_id = _graph_relation_endpoints(relation)
+        if entity_id in {src_id, dst_id}:
+            degree += 1
+    return degree
+
+
+def _graph_node_name_candidates(node: Dict[str, Any]) -> List[str]:
+    props = _graph_export_entity_props(node)
+    return _dedupe(
+        [
+            _graph_export_entity_name(node),
+            *_graph_export_entity_alt_names(node),
+            *_graph_attr_values_from_props(props, "title", "name", "display_name"),
+        ]
+    )
+
+
+def _graph_node_is_person(node: Dict[str, Any]) -> bool:
+    labels = {label.casefold() for label in _graph_export_entity_labels(node)}
+    return _graph_node_family(node) == "person" or "person" in labels
+
+
+def _graph_node_is_root_candidate(node: Dict[str, Any], contract: PrimaryTargetContractModel) -> bool:
+    if not _graph_node_is_person(node):
+        return False
+    aliases = _target_contract_aliases(contract)
+    return any(_primary_root_match_score(name, aliases) > 0 for name in _graph_node_name_candidates(node))
+
+
+def _graph_root_candidate_ids(
+    graph_export: Dict[str, Any],
+    contract: PrimaryTargetContractModel,
+) -> List[str]:
+    aliases = _target_contract_aliases(contract)
+    locked_root_entity_id = str(contract.root_entity_id or "").strip()
+    relations = graph_export.get("relations", []) if isinstance(graph_export.get("relations", []), list) else []
+    ranked: List[tuple[int, int, int, int, str]] = []
+    for node in graph_export.get("nodes", []) if isinstance(graph_export.get("nodes", []), list) else []:
+        if not isinstance(node, dict):
+            continue
+        entity_id = _graph_entity_id_from_payload(node)
+        if not entity_id or not _graph_node_is_person(node):
+            continue
+        name_score = max((_primary_root_match_score(name, aliases) for name in _graph_node_name_candidates(node)), default=0)
+        if name_score <= 0:
+            continue
+        props = _graph_export_entity_props(node)
+        root_bonus = 2 if bool(props.get("is_primary_root")) else 0
+        locked_bonus = 3 if locked_root_entity_id and entity_id == locked_root_entity_id else 0
+        degree_bonus = min(4, _graph_node_degree(entity_id, relations))
+        ranked.append((name_score, locked_bonus, root_bonus, degree_bonus, entity_id))
+    ranked.sort(key=lambda item: (-item[0], -item[1], -item[2], -item[3], item[4]))
+    ordered: List[str] = []
+    for *_prefix, entity_id in ranked:
+        if entity_id not in ordered:
+            ordered.append(entity_id)
+    return ordered[:STAGE1_GRAPH_ENTITY_LIMIT]
+
+
+def _graph_scope_entity_ids(
+    root_candidate_ids: List[str],
+    relations: List[Dict[str, Any]],
+    *,
+    depth: int = STAGE1_GRAPH_NORMALIZATION_NEIGHBOR_DEPTH,
+) -> set[str]:
+    if not root_candidate_ids:
+        return set()
+    adjacency: Dict[str, set[str]] = {}
+    for relation in relations:
+        src_id, dst_id = _graph_relation_endpoints(relation)
+        if not src_id or not dst_id:
+            continue
+        adjacency.setdefault(src_id, set()).add(dst_id)
+        adjacency.setdefault(dst_id, set()).add(src_id)
+    visited = set(root_candidate_ids)
+    frontier = set(root_candidate_ids)
+    for _ in range(max(0, depth)):
+        next_frontier: set[str] = set()
+        for entity_id in frontier:
+            next_frontier.update(adjacency.get(entity_id, set()))
+        next_frontier -= visited
+        if not next_frontier:
+            break
+        visited.update(next_frontier)
+        frontier = next_frontier
+    return visited
+
+
+def _graph_node_stable_identifiers(node: Dict[str, Any]) -> List[str]:
+    props = _graph_export_entity_props(node)
+    family = _graph_node_family(node)
+    identifiers: List[str] = []
+    canonical_id = str(props.get("canonical_id") or "").strip()
+    if canonical_id:
+        identifiers.append(f"canonical:{canonical_id}")
+    merge_keys = props.get("merge_keys")
+    if isinstance(merge_keys, list):
+        identifiers.extend([f"merge:{str(item).strip()}" for item in merge_keys if str(item).strip()])
+    for value in [
+        *_graph_attr_values_from_props(props, "url", "source_url", "profile_url"),
+        *([str(props.get("source_url")).strip()] if str(props.get("source_url") or "").strip() else []),
+    ]:
+        if value.startswith(("http://", "https://")):
+            identifiers.append(f"url:{family}:{value.rstrip('/')}")
+    for value in _graph_attr_values_from_props(props, "domain", "email", "handle", "username", "id", "doi", "arxiv_id"):
+        lowered = value.casefold()
+        if lowered:
+            identifiers.append(f"value:{family}:{lowered}")
+    return _dedupe(identifiers)
+
+
+def _graph_node_is_raw_url_noise_candidate(node: Dict[str, Any], relations: List[Dict[str, Any]]) -> bool:
+    entity_type = _normalize_graphish_text(_graph_export_entity_type(node))
+    if entity_type not in {"website", "domain"}:
+        return False
+    entity_id = _graph_entity_id_from_payload(node)
+    props = _graph_export_entity_props(node)
+    canonical_name = _graph_export_entity_name(node)
+    has_title = bool(_graph_attr_values_from_props(props, "title", "page_title", "site_title"))
+    if entity_type == "website":
+        if not canonical_name.startswith(("http://", "https://")):
+            return False
+    if entity_type == "domain":
+        if not DOMAIN_REGEX.search(canonical_name):
+            return False
+    if has_title:
+        return False
+    rel_types = {
+        _graph_relation_type(relation)
+        for relation in relations
+        if entity_id and entity_id in _graph_relation_endpoints(relation)
+    }
+    keep_types = {"HAS_PROFILE", "HAS_DOCUMENT", "HAS_CONTACT_POINT", "HAS_DOMAIN", "HAS_ORGANIZATION_PROFILE", "FOCUSES_ON"}
+    return not bool(rel_types & keep_types)
+
+
+def _graph_keep_score(node: Dict[str, Any], relations: List[Dict[str, Any]], *, root_entity_id: str = "") -> int:
+    entity_id = _graph_entity_id_from_payload(node)
+    props = _graph_export_entity_props(node)
+    score = _graph_node_degree(entity_id, relations)
+    score += len(_graph_node_name_candidates(node))
+    score += len(_graph_node_stable_identifiers(node))
+    if entity_id and entity_id == root_entity_id:
+        score += 50
+    if bool(props.get("is_primary_root")):
+        score += 25
+    if _graph_node_is_person(node):
+        score += 5
+    return score
+
+
+def _graph_normalization_digest(*parts: str) -> str:
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:20]
+    return digest
+
+
+def _graph_normalization_action(
+    action_type: str,
+    *,
+    source_entity_id: str = "",
+    target_entity_id: str = "",
+    relation_id: str = "",
+    src_entity_id: str = "",
+    dst_entity_id: str = "",
+    rel_type: str = "",
+    canonical_name: str = "",
+    entity_type: str = "",
+    aliases: List[str] | None = None,
+    rationale: str = "",
+    confidence: float = 1.0,
+    deterministic: bool = True,
+    applyable: bool = True,
+) -> GraphNormalizationActionModel:
+    digest_parts = [
+        action_type,
+        source_entity_id,
+        target_entity_id,
+        relation_id,
+        src_entity_id,
+        dst_entity_id,
+        rel_type,
+        canonical_name,
+        entity_type,
+    ]
+    action_id = f"gact:{_graph_normalization_digest(*digest_parts)}"
+    return GraphNormalizationActionModel(
+        action_id=action_id,
+        action_type=action_type,
+        source_entity_id=source_entity_id,
+        target_entity_id=target_entity_id,
+        relation_id=relation_id,
+        src_entity_id=src_entity_id,
+        dst_entity_id=dst_entity_id,
+        rel_type=rel_type,
+        canonical_name=canonical_name,
+        entity_type=entity_type,
+        aliases=list(aliases or []),
+        rationale=rationale,
+        confidence=confidence,
+        deterministic=deterministic,
+        applyable=applyable,
+    )
+
+
+def _graph_normalization_case(
+    *,
+    case_type: str,
+    target_entity_id: str = "",
+    candidate_entity_ids: List[str] | None = None,
+    candidate_relation_ids: List[str] | None = None,
+    summary: str = "",
+    notes: List[str] | None = None,
+    deterministic_actions: List[GraphNormalizationActionModel] | None = None,
+    suggested_actions: List[GraphNormalizationActionModel] | None = None,
+    status: str = "detected",
+) -> GraphNormalizationCaseModel:
+    case_id = "gnorm:" + _graph_normalization_digest(
+        case_type,
+        target_entity_id,
+        "|".join(sorted(candidate_entity_ids or [])),
+        summary,
+    )
+    return GraphNormalizationCaseModel(
+        case_id=case_id,
+        case_type=case_type if case_type in {"root_resolution", "duplicate_cluster", "noise_cluster"} else "duplicate_cluster",
+        status=status if status in {"detected", "suggested", "applied", "skipped"} else "detected",
+        target_entity_id=target_entity_id,
+        candidate_entity_ids=list(candidate_entity_ids or []),
+        candidate_relation_ids=list(candidate_relation_ids or []),
+        summary=summary,
+        notes=list(notes or []),
+        deterministic_actions=list(deterministic_actions or []),
+        suggested_actions=list(suggested_actions or []),
+    )
+
+
+def _build_graph_normalization_plan(
+    *,
+    run_id: str,
+    graph_export: Dict[str, Any],
+    contract: PrimaryTargetContractModel,
+) -> tuple[List[GraphNormalizationCaseModel], List[GraphNormalizationActionModel], List[str], str, List[str]]:
+    del run_id
+    nodes = [item for item in graph_export.get("nodes", []) if isinstance(item, dict)]
+    relations = [item for item in graph_export.get("relations", []) if isinstance(item, dict)]
+    node_by_id = {
+        _graph_entity_id_from_payload(node): node
+        for node in nodes
+        if _graph_entity_id_from_payload(node)
+    }
+    actions: List[GraphNormalizationActionModel] = []
+    cases: List[GraphNormalizationCaseModel] = []
+    notes: List[str] = []
+
+    root_candidate_ids = _graph_root_candidate_ids(graph_export, contract)
+    root_entity_id = root_candidate_ids[0] if root_candidate_ids else ""
+    contract_aliases = _target_contract_aliases(contract)
+
+    if root_entity_id:
+        root_node = node_by_id.get(root_entity_id, {})
+        root_props = _graph_export_entity_props(root_node)
+        existing_names = {_normalize_graphish_text(name) for name in _graph_node_name_candidates(root_node)}
+        missing_aliases = [alias for alias in contract_aliases if _normalize_graphish_text(alias) not in existing_names]
+        root_action = None
+        if not bool(root_props.get("is_primary_root")) or missing_aliases:
+            root_action = _graph_normalization_action(
+                "ensure_root_entity",
+                target_entity_id=root_entity_id,
+                canonical_name=_graph_export_entity_name(root_node),
+                entity_type="Person",
+                aliases=missing_aliases,
+                rationale="Mark the strongest matched person node as the locked primary graph root.",
+            )
+            actions.append(root_action)
+        cases.append(
+            _graph_normalization_case(
+                case_type="root_resolution",
+                target_entity_id=root_entity_id,
+                candidate_entity_ids=root_candidate_ids,
+                summary=f"Resolved primary root candidate {root_entity_id}.",
+                notes=[f"Primary target matched existing graph person node {root_entity_id}."],
+                deterministic_actions=[root_action] if root_action is not None else [],
+                status="applied" if root_action is not None else "detected",
+            )
+        )
+        notes.append(f"Graph normalization anchored the primary target to existing root {root_entity_id}.")
+    else:
+        fallback_name = contract.canonical_name or (contract.prompt_targets[:1][0] if contract.prompt_targets else "")
+        ensure_root_action = _graph_normalization_action(
+            "ensure_root_entity",
+            canonical_name=fallback_name,
+            entity_type="Person",
+            aliases=[alias for alias in contract_aliases if _normalize_graphish_text(alias) != _normalize_graphish_text(fallback_name)],
+            rationale="Create a minimal run-scoped primary root because no matched person anchor exists yet.",
+        )
+        actions.append(ensure_root_action)
+        cases.append(
+            _graph_normalization_case(
+                case_type="root_resolution",
+                summary=f"Primary target root missing; create minimal Person anchor for {fallback_name or 'target'}.",
+                notes=["No existing person node matched the locked primary target contract."],
+                deterministic_actions=[ensure_root_action],
+                status="detected",
+            )
+        )
+        notes.append(f"Graph normalization will create a minimal primary root for {fallback_name or 'the target'}.")
+
+    scope_ids = _graph_scope_entity_ids(root_candidate_ids or ([root_entity_id] if root_entity_id else []), relations)
+    if root_entity_id:
+        scope_ids.add(root_entity_id)
+
+    identifier_groups: Dict[str, List[str]] = {}
+    for entity_id, node in node_by_id.items():
+        if scope_ids and entity_id not in scope_ids and not _graph_node_is_raw_url_noise_candidate(node, relations):
+            continue
+        for identifier in _graph_node_stable_identifiers(node):
+            identifier_groups.setdefault(identifier, []).append(entity_id)
+
+    seen_duplicate_clusters: set[tuple[str, ...]] = set()
+    merged_sources: set[str] = set()
+    for identifier, group in identifier_groups.items():
+        unique_group = tuple(sorted(_dedupe(group)))
+        if len(unique_group) < 2 or unique_group in seen_duplicate_clusters:
+            continue
+        seen_duplicate_clusters.add(unique_group)
+        cluster_nodes = [node_by_id.get(entity_id, {}) for entity_id in unique_group]
+        families = {_graph_node_family(node) for node in cluster_nodes if isinstance(node, dict)}
+        if len(families) != 1:
+            cases.append(
+                _graph_normalization_case(
+                    case_type="duplicate_cluster",
+                    candidate_entity_ids=list(unique_group),
+                    summary=f"Ambiguous cross-type duplicate cluster for {identifier}.",
+                    notes=["Deterministic normalization skipped because the cluster mixes entity families."],
+                )
+            )
+            continue
+        target_entity_id = max(
+            unique_group,
+            key=lambda entity_id: _graph_keep_score(node_by_id.get(entity_id, {}), relations, root_entity_id=root_entity_id),
+        )
+        duplicate_actions: List[GraphNormalizationActionModel] = []
+        for entity_id in unique_group:
+            if entity_id == target_entity_id or entity_id in merged_sources:
+                continue
+            merged_sources.add(entity_id)
+            action = _graph_normalization_action(
+                "merge_entity_into",
+                source_entity_id=entity_id,
+                target_entity_id=target_entity_id,
+                rationale=f"Merge duplicate cluster backed by stable identifier {identifier}.",
+            )
+            actions.append(action)
+            duplicate_actions.append(action)
+        if duplicate_actions:
+            cases.append(
+                _graph_normalization_case(
+                    case_type="duplicate_cluster",
+                    target_entity_id=target_entity_id,
+                    candidate_entity_ids=list(unique_group),
+                    summary=f"Duplicate cluster merged into {target_entity_id}.",
+                    notes=[f"Stable identifier {identifier} matched multiple nodes."],
+                    deterministic_actions=duplicate_actions,
+                    status="applied",
+                )
+            )
+
+    if root_entity_id and len(root_candidate_ids) > 1:
+        root_node = node_by_id.get(root_entity_id, {})
+        root_names = _graph_node_name_candidates(root_node)
+        typo_merge_actions: List[GraphNormalizationActionModel] = []
+        for candidate_id in root_candidate_ids[1:]:
+            if candidate_id in merged_sources:
+                continue
+            candidate_node = node_by_id.get(candidate_id, {})
+            if not any(
+                _primary_root_typo_match(candidate_name, root_name)
+                for candidate_name in _graph_node_name_candidates(candidate_node)
+                for root_name in root_names
+            ):
+                continue
+            action = _graph_normalization_action(
+                "merge_entity_into",
+                source_entity_id=candidate_id,
+                target_entity_id=root_entity_id,
+                rationale="Merge duplicate primary-root candidate created by a one-token spelling variation.",
+            )
+            actions.append(action)
+            typo_merge_actions.append(action)
+            merged_sources.add(candidate_id)
+        if typo_merge_actions:
+            cases.append(
+                _graph_normalization_case(
+                    case_type="duplicate_cluster",
+                    target_entity_id=root_entity_id,
+                    candidate_entity_ids=root_candidate_ids,
+                    summary=f"Merged typo-level primary-root duplicates into {root_entity_id}.",
+                    notes=["Primary-root duplicate merge used the locked one-token typo rule."],
+                    deterministic_actions=typo_merge_actions,
+                    status="applied",
+                )
+            )
+
+    for entity_id, node in node_by_id.items():
+        if entity_id == root_entity_id:
+            continue
+        if not _graph_node_is_raw_url_noise_candidate(node, relations):
+            continue
+        if scope_ids and entity_id in scope_ids:
+            continue
+        degree = _graph_node_degree(entity_id, relations)
+        neighbor_ids = {
+            other_id
+            for relation in relations
+            for other_id in _graph_relation_endpoints(relation)
+            if entity_id in _graph_relation_endpoints(relation) and other_id != entity_id
+        }
+        if degree > 1 and any(not _graph_node_is_raw_url_noise_candidate(node_by_id.get(neighbor_id, {}), relations) for neighbor_id in neighbor_ids):
+            continue
+        action = _graph_normalization_action(
+            "suppress_entity",
+            source_entity_id=entity_id,
+            rationale="Suppress orphan raw-URL digital artifact noise outside the rooted backbone.",
+        )
+        actions.append(action)
+        cases.append(
+            _graph_normalization_case(
+                case_type="noise_cluster",
+                target_entity_id=entity_id,
+                candidate_entity_ids=[entity_id],
+                summary=f"Suppress orphan raw-URL noise node {entity_id}.",
+                notes=["The node is a raw URL/domain artifact with no anchored path into the kept primary backbone."],
+                deterministic_actions=[action],
+                status="applied",
+            )
+        )
+
+    deduped_actions: List[GraphNormalizationActionModel] = []
+    seen_action_ids: set[str] = set()
+    for action in actions:
+        if action.action_id in seen_action_ids:
+            continue
+        seen_action_ids.add(action.action_id)
+        deduped_actions.append(action)
+    return (
+        cases[:STAGE1_GRAPH_NORMALIZATION_MAX_CASES],
+        deduped_actions,
+        notes,
+        root_entity_id,
+        root_candidate_ids,
+    )
+
+
+def _llm_graph_normalization_suggestions(
+    *,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    contract: PrimaryTargetContractModel,
+    root_entity_id: str,
+    cases: List[GraphNormalizationCaseModel],
+) -> Dict[str, List[GraphNormalizationActionModel]]:
+    unresolved_cases = [case for case in cases if not case.deterministic_actions]
+    if llm is None or not unresolved_cases:
+        return {}
+    payload = {
+        "primary_target_contract": contract.model_dump(),
+        "root_entity_id": root_entity_id,
+        "cases": [
+            {
+                "case_id": case.case_id,
+                "case_type": case.case_type,
+                "target_entity_id": case.target_entity_id,
+                "candidate_entity_ids": case.candidate_entity_ids,
+                "candidate_relation_ids": case.candidate_relation_ids,
+                "summary": case.summary,
+                "notes": case.notes,
+            }
+            for case in unresolved_cases[:STAGE1_GRAPH_NORMALIZATION_MAX_CASES]
+        ],
+    }
+    try:
+        result = invoke_complete_json(
+            llm,
+            GRAPH_STRUCTURE_NORMALIZATION_SYSTEM_PROMPT,
+            payload,
+            temperature=0.1,
+            timeout=_env_float("OPENROUTER_PLANNER_TIMEOUT_SECONDS", 120.0),
+            run_id=run_id,
+            operation="planner.normalize_graph_structure",
+            metadata={"caseCount": len(unresolved_cases)},
+        )
+    except Exception:
+        getattr(logger, "exception", logger.warning)(
+            "Graph normalization LLM suggestion call failed",
+            extra={"run_id": run_id},
+        )
+        return {}
+    output: Dict[str, List[GraphNormalizationActionModel]] = {}
+    for item in _pick_list(result, ["cases", "items"]):
+        if not isinstance(item, dict):
+            continue
+        case_id = str(item.get("case_id") or item.get("caseId") or "").strip()
+        if not case_id:
+            continue
+        suggestions: List[GraphNormalizationActionModel] = []
+        for raw_action in _pick_list(item, ["actions", "suggestions"]):
+            if not isinstance(raw_action, dict):
+                continue
+            action_type = str(raw_action.get("action_type") or raw_action.get("actionType") or "").strip()
+            if action_type not in {"keep_separate", "merge_into_root", "merge_into_entity", "suppress_noise", "ensure_relation"}:
+                continue
+            suggestions.append(
+                _graph_normalization_action(
+                    action_type,
+                    source_entity_id=str(raw_action.get("source_entity_id") or raw_action.get("sourceEntityId") or "").strip(),
+                    target_entity_id=str(raw_action.get("target_entity_id") or raw_action.get("targetEntityId") or "").strip(),
+                    src_entity_id=str(raw_action.get("src_entity_id") or raw_action.get("srcEntityId") or "").strip(),
+                    dst_entity_id=str(raw_action.get("dst_entity_id") or raw_action.get("dstEntityId") or "").strip(),
+                    rel_type=str(raw_action.get("rel_type") or raw_action.get("relType") or "").strip().upper(),
+                    canonical_name=str(raw_action.get("canonical_name") or raw_action.get("canonicalName") or "").strip(),
+                    rationale=str(raw_action.get("rationale") or "").strip(),
+                    confidence=float(raw_action.get("confidence", 0.0) or 0.0),
+                    deterministic=False,
+                    applyable=False,
+                )
+            )
+        output[case_id] = suggestions
+    return output
+
+
+def _run_graph_normalization_pass(
+    *,
+    mcp_client: McpClientProtocol,
+    llm: OpenRouterLLM | None,
+    state: PlannerState,
+) -> Dict[str, Any]:
+    contract = state.get("primary_target_contract") or PrimaryTargetContractModel()
+    graph_export_json = _normalize_graph_export_json(state.get("graph_export_json", {}))
+    if not graph_export_json.get("generated", False):
+        graph_export_json = _fetch_graph_export_json(mcp_client, str(state.get("run_id") or ""))
+    if not graph_export_json.get("generated", False):
+        return {
+            "graph_normalization_cases": [],
+            "graph_normalization_actions": [],
+            "graph_normalization_notes": ["Graph normalization skipped because no run graph export was available."],
+            "normalization_gate_ok": True,
+            "primary_root_entity_id": "",
+            "merged_entity_count": 0,
+            "suppressed_noise_count": 0,
+            "graph_entity_rewrites": {},
+            "graph_export_json": graph_export_json,
+            "graph_state_snapshot": _normalize_graph_state_snapshot(state.get("graph_state_snapshot", {})),
+        }
+
+    cases, actions, notes, root_entity_id, root_candidate_ids = _build_graph_normalization_plan(
+        run_id=str(state.get("run_id") or ""),
+        graph_export=graph_export_json,
+        contract=contract,
+    )
+    suggested_actions = _llm_graph_normalization_suggestions(
+        llm=llm,
+        run_id=str(state.get("run_id") or ""),
+        contract=contract,
+        root_entity_id=root_entity_id,
+        cases=cases,
+    )
+    updated_cases: List[GraphNormalizationCaseModel] = []
+    for case in cases:
+        suggestions = suggested_actions.get(case.case_id, [])
+        next_notes = list(case.notes)
+        if suggestions:
+            next_notes.append(f"LLM suggested {len(suggestions)} note-only normalization action(s).")
+        updated_cases.append(
+            case.model_copy(
+                update={
+                    "suggested_actions": suggestions,
+                    "notes": next_notes,
+                    "status": "suggested" if suggestions and case.status == "detected" else case.status,
+                }
+            )
+        )
+
+    normalization_gate_ok = True
+    applied_root_entity_id = root_entity_id
+    merged_entity_count = len([item for item in actions if item.action_type == "merge_entity_into"])
+    suppressed_noise_count = len([item for item in actions if item.action_type == "suppress_entity"])
+    entity_rewrites = {
+        action.source_entity_id: action.target_entity_id
+        for action in actions
+        if action.action_type == "merge_entity_into" and action.source_entity_id and action.target_entity_id
+    }
+
+    if actions:
+        payload = []
+        for action in actions:
+            payload.append(
+                {
+                    "actionType": action.action_type,
+                    "sourceEntityId": action.source_entity_id or None,
+                    "targetEntityId": action.target_entity_id or None,
+                    "relationId": action.relation_id or None,
+                    "srcEntityId": action.src_entity_id or None,
+                    "dstEntityId": action.dst_entity_id or None,
+                    "relType": action.rel_type or None,
+                    "canonicalName": action.canonical_name or None,
+                    "entityType": action.entity_type or None,
+                    "aliases": list(action.aliases),
+                    "rationale": action.rationale,
+                }
+            )
+        try:
+            result = mcp_client.call_tool(
+                "graph_apply_normalization_plan",
+                {
+                    "runId": state.get("run_id"),
+                    "actionsJson": json.dumps(payload),
+                    "dryRun": False,
+                },
+            )
+        except Exception:
+            result = None
+        if result is None or not getattr(result, "ok", False):
+            normalization_gate_ok = False
+            notes.append("Graph normalization apply step failed; conflict adjudication will wait for a rooted graph.")
+        else:
+            graph_export_json = _fetch_graph_export_json(mcp_client, str(state.get("run_id") or ""))
+
+    graph_state_snapshot = _derive_graph_state_snapshot(
+        mcp_client,
+        {
+            **state,
+            "graph_export_json": graph_export_json,
+        },
+        graph_export=graph_export_json,
+    )
+    if graph_state_snapshot.get("resolved_entity_ids"):
+        applied_root_entity_id = str(graph_state_snapshot.get("resolved_entity_ids", [""])[0] or "").strip()
+    graph_state_snapshot["primary_root_entity_id"] = applied_root_entity_id
+    graph_state_snapshot["root_candidate_count"] = len(root_candidate_ids)
+    graph_state_snapshot["merged_entity_count"] = merged_entity_count
+    graph_state_snapshot["suppressed_noise_count"] = suppressed_noise_count
+
+    return {
+        "graph_normalization_cases": updated_cases,
+        "graph_normalization_actions": actions,
+        "graph_normalization_notes": _dedupe(notes),
+        "normalization_gate_ok": normalization_gate_ok,
+        "primary_root_entity_id": applied_root_entity_id,
+        "merged_entity_count": merged_entity_count,
+        "suppressed_noise_count": suppressed_noise_count,
+        "graph_entity_rewrites": entity_rewrites,
+        "graph_export_json": graph_export_json,
+        "graph_state_snapshot": graph_state_snapshot,
+    }
+
+
 def _fact_list(receipt: ToolReceipt, *keys: str) -> List[Any]:
     values: List[Any] = []
     for fact in receipt.key_facts:
@@ -5336,7 +7738,7 @@ def _is_simple_scholar_investigation(state: Dict[str, Any]) -> bool:
     strong_secondary_people = [
         item
         for item in validated_secondary_people
-        if _candidate_has_structured_person_support(item) or bool(item.get("anchor_types"))
+        if bool(item.get("anchored", False))
     ]
     return len(strong_secondary_people) <= 1
 
@@ -5680,8 +8082,1242 @@ def _derive_consistency_follow_up_tasks(
     return tasks, dedupe_store, notes
 
 
-def _profile_candidates_from_receipts(receipts: List[ToolReceipt]) -> List[Dict[str, Any]]:
+def _conflict_receipt_key(receipt: ToolReceipt) -> str:
+    if receipt.argument_signature:
+        return str(receipt.argument_signature)
+    return f"{receipt.tool_name}|{tool_argument_signature(receipt.tool_name, receipt.arguments or {})}"
+
+
+def _conflict_normalize_value(field_name: str, value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "present" if value else "absent"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = " ".join(str(value or "").strip().split())
+    if not text:
+        return None
+    if field_name == "publication_presence":
+        lowered = text.casefold()
+        if lowered in {"present", "yes", "true", "found"}:
+            return "present"
+        if lowered in {"absent", "no", "false", "none", "not found"}:
+            return "absent"
+    if field_name == "canonical_name":
+        return normalize_person_candidate(text) or text
+    return text
+
+
+def _conflict_string_values(value: Any) -> List[str]:
+    if isinstance(value, str):
+        text = " ".join(value.strip().split())
+        return [text] if text else []
+    if isinstance(value, (int, float, bool)):
+        return [str(value)]
+    if isinstance(value, list):
+        values: List[str] = []
+        for item in value:
+            values.extend(_conflict_string_values(item))
+        return _dedupe(values)
+    if isinstance(value, dict):
+        values: List[str] = []
+        for item in value.values():
+            values.extend(_conflict_string_values(item))
+        return _dedupe(values)
+    return []
+
+
+def _conflict_value_candidates(field_name: str, value: Any) -> List[str]:
+    values = [_conflict_normalize_value(field_name, item) for item in _conflict_string_values(value)]
+    return [item for item in _dedupe([item for item in values if item])]
+
+
+def _receipt_conflict_refs(receipt: ToolReceipt) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+
+    def add_ref(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        object_ref = raw.get("objectRef") if isinstance(raw.get("objectRef"), dict) else {}
+        document_id = str(raw.get("documentId") or object_ref.get("documentId") or "").strip()
+        chunk_id = str(raw.get("chunkId") or object_ref.get("chunkId") or "").strip()
+        bucket = str(raw.get("bucket") or object_ref.get("bucket") or "").strip()
+        object_key = str(raw.get("objectKey") or object_ref.get("objectKey") or "").strip()
+        source_url = str(raw.get("sourceUrl") or "").strip()
+        if not document_id and not chunk_id and not (bucket and object_key) and not source_url:
+            return
+        ref: Dict[str, Any] = {}
+        if document_id:
+            ref["documentId"] = document_id
+        if chunk_id:
+            ref["chunkId"] = chunk_id
+        if bucket or object_key:
+            ref["objectRef"] = {
+                "bucket": bucket or None,
+                "objectKey": object_key or None,
+                "versionId": raw.get("versionId") or object_ref.get("versionId"),
+                "etag": raw.get("etag") or object_ref.get("etag"),
+                "documentId": document_id or object_ref.get("documentId"),
+                "chunkId": chunk_id or object_ref.get("chunkId"),
+            }
+        if source_url:
+            ref["sourceUrl"] = source_url
+        refs.append(ref)
+
+    graph_upserts = receipt.graph_upserts if isinstance(receipt.graph_upserts, dict) else {}
+    for item in graph_upserts.get("evidenceRefs", []):
+        add_ref(item)
+
+    vector_upserts = receipt.vector_upserts if isinstance(receipt.vector_upserts, dict) else {}
+    document_id = str(vector_upserts.get("documentId") or "").strip()
+    chunk_ids = vector_upserts.get("chunkIds") if isinstance(vector_upserts.get("chunkIds"), list) else []
+    if document_id:
+        add_ref({"documentId": document_id})
+    for chunk_id in chunk_ids[:4]:
+        text = str(chunk_id or "").strip()
+        if text:
+            add_ref({"documentId": document_id or None, "chunkId": text})
+
+    for document_id in receipt.document_ids[:4]:
+        text = str(document_id or "").strip()
+        if text:
+            add_ref({"documentId": text})
+
+    seen: set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    for ref in refs:
+        object_ref = ref.get("objectRef") if isinstance(ref.get("objectRef"), dict) else {}
+        key = "|".join(
+            [
+                str(ref.get("documentId") or ""),
+                str(ref.get("chunkId") or ""),
+                str(object_ref.get("bucket") or ""),
+                str(object_ref.get("objectKey") or ""),
+                str(ref.get("sourceUrl") or ""),
+            ]
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped
+
+
+def _conflict_source_domains(receipt: ToolReceipt) -> List[str]:
+    domains: List[str] = []
+    for url in _receipt_source_urls(receipt):
+        host = _domain_from_url(url)
+        if host:
+            domains.append(host)
+    return _dedupe(domains)
+
+
+def _conflict_is_authoritative(tool_name: str, source_domains: List[str]) -> bool:
+    if tool_name in CONFLICT_AUTHORITATIVE_TOOLS:
+        return True
+    for domain in source_domains:
+        lowered = domain.casefold()
+        if lowered.endswith(".gov") or lowered.endswith(".edu"):
+            return True
+        if lowered in {
+            "orcid.org",
+            "dblp.org",
+            "semanticscholar.org",
+            "linkedin.com",
+            "scholar.google.com",
+            "openreview.net",
+            "arxiv.org",
+            "sec.gov",
+        }:
+            return True
+    return False
+
+
+def _conflict_observation(
+    *,
+    receipt: ToolReceipt,
+    field_name: str,
+    value: str,
+    target_type: str,
+    target_id: str,
+    scope: str,
+    relation_type: str = "",
+    direct: bool = True,
+) -> Dict[str, Any]:
+    source_domains = _conflict_source_domains(receipt)
+    return {
+        "field_name": field_name,
+        "value": value,
+        "normalized_value": _conflict_normalize_value(field_name, value) or value,
+        "target_type": target_type,
+        "target_id": target_id,
+        "scope": scope,
+        "relation_type": relation_type,
+        "tool_name": receipt.tool_name,
+        "receipt_key": _conflict_receipt_key(receipt),
+        "source_domains": source_domains,
+        "source_urls": _receipt_source_urls(receipt),
+        "direct": bool(direct),
+        "official": _conflict_is_authoritative(receipt.tool_name, source_domains),
+        "refs": _receipt_conflict_refs(receipt),
+        "summary": receipt.summary,
+        "graph_entity_ids": list(receipt.graph_upserts.get("entityIds", [])) if isinstance(receipt.graph_upserts, dict) else [],
+        "graph_relation_ids": list(receipt.graph_upserts.get("relationIds", [])) if isinstance(receipt.graph_upserts, dict) else [],
+    }
+
+
+def _extract_primary_conflict_observations(
+    receipts: List[ToolReceipt],
+    primary_person_targets: List[str],
+    primary_entity_id: str,
+) -> List[Dict[str, Any]]:
+    observations: List[Dict[str, Any]] = []
+    primary_aliases = list(primary_person_targets or [])
+
+    field_key_aliases = {
+        "canonical_name": {"canonical_name", "canonicalName", "name", "display_name"},
+        "affiliation": {"affiliation", "affiliations", "current_affiliation", "currentAffiliation"},
+        "organization": {"organization", "organizations", "company", "companies", "employer", "employers", "institution", "institutions", "lab", "labs"},
+        "role_title": {"role", "roles", "title", "titles", "position", "positions", "headline", "occupation"},
+        "education": {"education", "schools", "school", "degrees", "degree", "universities", "university"},
+        "timeline_date": {"date", "dates", "start_date", "end_date", "year", "years", "tenure_start", "tenure_end"},
+    }
+
+    for receipt in [item for item in receipts if item.ok]:
+        mentions_primary = _receipt_mentions_primary_target(receipt, primary_aliases) or _receipt_invoked_with_primary_target(receipt, primary_aliases)
+        if not mentions_primary:
+            continue
+
+        for fact in receipt.key_facts:
+            if not isinstance(fact, dict):
+                continue
+            for field_name, key_aliases in field_key_aliases.items():
+                for key, value in fact.items():
+                    if str(key).strip() not in key_aliases:
+                        continue
+                    for candidate in _conflict_value_candidates(field_name, value)[:4]:
+                        observations.append(
+                            _conflict_observation(
+                                receipt=receipt,
+                                field_name=field_name,
+                                value=candidate,
+                                target_type="entity",
+                                target_id=primary_entity_id,
+                                scope="primary",
+                                direct=True,
+                            )
+                        )
+
+            if isinstance(fact.get("canonical_identity"), dict):
+                canonical_identity = fact.get("canonical_identity") or {}
+                candidate = _conflict_normalize_value("canonical_name", canonical_identity.get("canonical_name"))
+                if candidate:
+                    observations.append(
+                        _conflict_observation(
+                            receipt=receipt,
+                            field_name="canonical_name",
+                            value=candidate,
+                            target_type="entity",
+                            target_id=primary_entity_id,
+                            scope="primary",
+                            direct=True,
+                        )
+                    )
+
+        if _receipt_has_publication_signal(receipt):
+            observations.append(
+                _conflict_observation(
+                    receipt=receipt,
+                    field_name="publication_presence",
+                    value="present",
+                    target_type="entity",
+                    target_id=primary_entity_id,
+                    scope="primary",
+                    direct=True,
+                )
+            )
+        if _receipt_reports_no_arxiv_results(receipt):
+            observations.append(
+                _conflict_observation(
+                    receipt=receipt,
+                    field_name="publication_presence",
+                    value="absent",
+                    target_type="entity",
+                    target_id=primary_entity_id,
+                    scope="primary",
+                    direct=True,
+                )
+            )
+
+        coauthors = []
+        for item in _fact_list(receipt, "coauthors"):
+            if isinstance(item, dict):
+                candidate = _conflict_normalize_value("canonical_name", item.get("name"))
+                if candidate:
+                    coauthors.append(candidate)
+            elif isinstance(item, str):
+                candidate = _conflict_normalize_value("canonical_name", item)
+                if candidate:
+                    coauthors.append(candidate)
+        for publication in _receipt_publication_records(receipt):
+            authors = publication.get("authors") if isinstance(publication, dict) else []
+            if isinstance(authors, list):
+                for author in authors:
+                    candidate = _conflict_normalize_value("canonical_name", author)
+                    if candidate and _primary_target_match_score(candidate, primary_aliases) <= 0:
+                        coauthors.append(candidate)
+        coauthors = _dedupe(coauthors)
+        if coauthors:
+            observations.append(
+                _conflict_observation(
+                    receipt=receipt,
+                    field_name="relation_presence",
+                    value="present",
+                    target_type="relation",
+                    target_id=(list(receipt.graph_upserts.get("relationIds", []))[0] if isinstance(receipt.graph_upserts, dict) and receipt.graph_upserts.get("relationIds") else ""),
+                    scope="first_hop",
+                    relation_type="COAUTHORED_WITH",
+                    direct=True,
+                )
+            )
+        if _receipt_reports_no_relationships(receipt):
+            observations.append(
+                _conflict_observation(
+                    receipt=receipt,
+                    field_name="relation_presence",
+                    value="absent",
+                    target_type="relation",
+                    target_id="",
+                    scope="first_hop",
+                    relation_type="COAUTHORED_WITH",
+                    direct=True,
+                )
+            )
+
+        for key, relation_type in (
+            ("advisor", "ADVISED_BY"),
+            ("advisors", "ADVISED_BY"),
+            ("officer", "OFFICER_OF"),
+            ("officers", "OFFICER_OF"),
+            ("director", "DIRECTOR_OF"),
+            ("directors", "DIRECTOR_OF"),
+        ):
+            if not _fact_list(receipt, key):
+                continue
+            observations.append(
+                _conflict_observation(
+                    receipt=receipt,
+                    field_name="relation_presence",
+                    value="present",
+                    target_type="relation",
+                    target_id=(list(receipt.graph_upserts.get("relationIds", []))[0] if isinstance(receipt.graph_upserts, dict) and receipt.graph_upserts.get("relationIds") else ""),
+                    scope="first_hop",
+                    relation_type=relation_type,
+                    direct=True,
+                )
+            )
+
+        relation_field_values = [
+            ("organization", "WORKS_AT"),
+            ("affiliation", "AFFILIATED_WITH"),
+            ("education", "STUDIED_AT"),
+        ]
+        for field_name, relation_type in relation_field_values:
+            matches = [item for item in observations if item["field_name"] == field_name and item["receipt_key"] == _conflict_receipt_key(receipt)]
+            if matches:
+                observations.append(
+                    _conflict_observation(
+                        receipt=receipt,
+                        field_name="relation_presence",
+                        value="present",
+                        target_type="relation",
+                        target_id=(list(receipt.graph_upserts.get("relationIds", []))[0] if isinstance(receipt.graph_upserts, dict) and receipt.graph_upserts.get("relationIds") else ""),
+                        scope="first_hop",
+                        relation_type=relation_type,
+                        direct=True,
+                    )
+                )
+
+    return observations
+
+
+def _candidate_score_from_observations(
+    value: str,
+    observations: List[Dict[str, Any]],
+    evidence_count: int,
+) -> ConflictCandidateValueModel:
+    source_tools = _dedupe([str(item.get("tool_name") or "").strip() for item in observations if str(item.get("tool_name") or "").strip()])
+    source_domains = _dedupe([domain for item in observations for domain in item.get("source_domains", []) if isinstance(domain, str) and domain.strip()])
+    receipt_keys = _dedupe([str(item.get("receipt_key") or "").strip() for item in observations if str(item.get("receipt_key") or "").strip()])
+    direct_source_count = len([item for item in observations if item.get("direct")])
+    official_source_count = len([item for item in observations if item.get("official")])
+    source_count = len(receipt_keys)
+
+    score = 0.22 * min(1.0, source_count / 2.0)
+    score += 0.18 * min(1.0, direct_source_count / 1.0)
+    score += 0.18 * min(1.0, official_source_count / 1.0)
+    score += 0.16 * min(1.0, max(len(source_domains), len(source_tools)) / 2.0)
+    score += 0.16 * min(1.0, max(source_count - 1, 0) / 2.0)
+    score += 0.10 * min(1.0, evidence_count / 3.0)
+
+    return ConflictCandidateValueModel(
+        value=value,
+        normalized_value=str(observations[0].get("normalized_value") or value),
+        score=min(0.97, score),
+        source_count=source_count,
+        direct_source_count=direct_source_count,
+        official_source_count=official_source_count,
+        source_tools=source_tools,
+        source_domains=source_domains,
+        receipt_keys=receipt_keys,
+        evidence_ids=[],
+    )
+
+
+def _conflict_lookup_exact_evidence(
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    observation: Dict[str, Any],
+    case_id: str,
+    evidence_index: int,
+) -> List[ConflictEvidenceRefModel]:
+    refs = observation.get("refs", []) if isinstance(observation.get("refs", []), list) else []
+    rows: List[Dict[str, Any]] = []
+    if refs and hasattr(mcp_client, "call_tool"):
+        result = mcp_client.call_tool(
+            "vector_lookup_refs",
+            {"runId": run_id, "refsJson": json.dumps(refs)},
+        )
+        if result.ok:
+            items = _pick_list(result.content, ["results", "hits", "items"])
+            rows = [item for item in items if isinstance(item, dict)]
+
+    if not rows:
+        fallback_url = next((item for item in observation.get("source_urls", []) if isinstance(item, str) and item.strip()), None)
+        rows = [
+            {
+                "document_id": str(refs[0].get("documentId") or "") if refs else "",
+                "chunk_id": str(refs[0].get("chunkId") or "") if refs else "",
+                "snippet": str(observation.get("summary") or "")[:400],
+                "sourceUrl": fallback_url,
+                "sourceDomain": _domain_from_url(fallback_url or "") if fallback_url else None,
+                "objectRef": refs[0].get("objectRef", {}) if refs else {},
+            }
+        ]
+
+    evidence: List[ConflictEvidenceRefModel] = []
+    for offset, row in enumerate(rows[:STAGE1_CONFLICT_MAX_EVIDENCE_ROWS]):
+        evidence.append(
+            ConflictEvidenceRefModel(
+                evidence_id=f"{case_id}:e{evidence_index + offset}",
+                case_id=case_id,
+                candidate_value=str(observation.get("value") or ""),
+                polarity="supporting",
+                document_id=str(row.get("document_id") or row.get("documentId") or "") or None,
+                chunk_id=str(row.get("chunk_id") or row.get("chunkId") or "") or None,
+                object_ref=dict(row.get("objectRef") or row.get("object_ref") or {}),
+                source_url=str(row.get("sourceUrl") or row.get("source_url") or "") or None,
+                source_domain=str(row.get("sourceDomain") or row.get("source_domain") or "") or None,
+                snippet=str(row.get("snippet") or row.get("text") or observation.get("summary") or "")[:500],
+                source_tool=str(observation.get("tool_name") or ""),
+                retrieved_at=str(row.get("retrievedAt") or row.get("retrieved_at") or "") or None,
+                score=float(row.get("score") or 0.0),
+            )
+        )
+    return evidence
+
+
+def _conflict_case_id(
+    run_id: str,
+    target_type: str,
+    target_id: str,
+    field_name: str,
+    relation_type: str = "",
+) -> str:
+    digest = hashlib.sha1(f"{run_id}|{target_type}|{target_id}|{field_name}|{relation_type}".encode("utf-8")).hexdigest()[:16]
+    return f"conflict:{digest}"
+
+
+def _candidate_supports_auto_apply(candidate: ConflictCandidateValueModel) -> bool:
+    if candidate.official_source_count >= 1 and candidate.direct_source_count >= 1:
+        return True
+    independent_sources = max(len(candidate.source_domains), len(candidate.source_tools))
+    return independent_sources >= 2
+
+
+def _llm_detect_graph_conflict_candidates(
+    *,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    graph_export: Dict[str, Any],
+    graph_state_snapshot: Dict[str, Any],
+    primary_person_targets: List[str],
+) -> List[Dict[str, Any]] | None:
+    normalized_export = _normalize_graph_export_json(graph_export)
+    if llm is None or not normalized_export.get("generated", False):
+        return None
+    if str(normalized_export.get("status", "")).strip().lower() in {"tool_unavailable", "error", "uninitialized"}:
+        return None
+
+    compact_export = _compact_graph_export_for_conflict_detection(normalized_export)
+    payload = {
+        "primary_targets": list(primary_person_targets[:6]),
+        "resolved_entity_ids": list(
+            graph_state_snapshot.get("resolved_entity_ids", [])[:STAGE1_GRAPH_ENTITY_LIMIT]
+            if isinstance(graph_state_snapshot.get("resolved_entity_ids", []), list)
+            else []
+        ),
+        "blocking_entity_fields": sorted(CONFLICT_BLOCKING_ENTITY_FIELDS),
+        "blocking_relation_types": sorted(CONFLICT_BLOCKING_RELATION_TYPES),
+        "instructions": [
+            "Inspect the run-scoped graph JSON and detect possible contradictions or canonical fact conflicts.",
+            "Focus only on the primary target and first-hop relationships unless a secondary conflict is clearly material.",
+            "Do not flag simple multiplicity that can be explained by timeline progression, multiple legitimate accounts, or non-conflicting aliases.",
+            "Flag a conflict only when the graph plausibly contains incompatible canonical facts, duplicate entities that disagree, or relation presence contradictions that need evidence adjudication.",
+            "If there are no plausible conflicts, return an empty conflicts array.",
+        ],
+        "output_schema": {
+            "conflicts": [
+                {
+                    "target_type": "entity|relation",
+                    "target_id": "string",
+                    "field_name": "string",
+                    "relation_type": "string",
+                    "scope": "primary|first_hop|secondary",
+                    "blocking": "boolean",
+                    "candidate_values": ["string"],
+                    "reason": "string",
+                }
+            ]
+        },
+        "graph": compact_export,
+    }
+    try:
+        result = invoke_complete_json(
+            llm,
+            "You inspect graph JSON for possible canonical fact conflicts. Return JSON only.",
+            payload,
+            temperature=0.1,
+            timeout=_env_float("OPENROUTER_PLANNER_TIMEOUT_SECONDS", 120.0),
+            run_id=run_id,
+            operation="planner.detect_graph_conflicts",
+            metadata={
+                "nodeCount": compact_export.get("nodeCount", 0),
+                "relationCount": compact_export.get("relationCount", 0),
+            },
+        )
+    except Exception:
+        getattr(logger, "exception", logger.warning)(
+            "Graph-first conflict detection LLM call failed",
+            extra={"run_id": run_id},
+        )
+        return None
+
+    raw_conflicts = _pick_list(result, ["conflicts", "cases", "items"])
+    normalized_conflicts: List[Dict[str, Any]] = []
+    for raw in raw_conflicts:
+        if not isinstance(raw, dict):
+            continue
+        target_type = str(raw.get("target_type") or raw.get("targetType") or "").strip().lower()
+        if target_type not in {"entity", "relation"}:
+            continue
+        field_name = str(raw.get("field_name") or raw.get("fieldName") or "").strip().lower()
+        relation_type = str(raw.get("relation_type") or raw.get("relationType") or "").strip().upper()
+        if target_type == "entity":
+            if field_name not in CONFLICT_BLOCKING_ENTITY_FIELDS:
+                continue
+        else:
+            field_name = "relation_presence"
+            if relation_type not in CONFLICT_BLOCKING_RELATION_TYPES:
+                continue
+        scope = str(raw.get("scope") or "primary").strip().lower()
+        if scope not in {"primary", "first_hop", "secondary"}:
+            scope = "primary" if target_type == "entity" else "first_hop"
+        blocking = raw.get("blocking")
+        if not isinstance(blocking, bool):
+            blocking = field_name in CONFLICT_BLOCKING_ENTITY_FIELDS if target_type == "entity" else relation_type in CONFLICT_BLOCKING_RELATION_TYPES
+        candidate_values: List[str] = []
+        for item in raw.get("candidate_values", []) if isinstance(raw.get("candidate_values"), list) else raw.get("candidateValues", []) if isinstance(raw.get("candidateValues"), list) else []:
+            if target_type == "relation":
+                value = str(item or "").strip().lower()
+                if value in {"present", "absent"}:
+                    candidate_values.append(value)
+            else:
+                normalized_value = _conflict_normalize_value(field_name, item)
+                if normalized_value:
+                    candidate_values.append(normalized_value)
+        normalized_conflicts.append(
+            {
+                "target_type": target_type,
+                "target_id": str(raw.get("target_id") or raw.get("targetId") or "").strip(),
+                "field_name": field_name,
+                "relation_type": relation_type,
+                "scope": scope,
+                "blocking": bool(blocking),
+                "candidate_values": _dedupe(candidate_values),
+                "reason": str(raw.get("reason") or raw.get("rationale") or "").strip(),
+            }
+        )
+    return normalized_conflicts
+
+
+def _compact_graph_export_for_conflict_detection(graph_export: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_graph_export_json(graph_export)
+    compact_nodes: List[Dict[str, Any]] = []
+    for node in normalized.get("nodes", []) if isinstance(normalized.get("nodes", []), list) else []:
+        if not isinstance(node, dict):
+            continue
+        props = _graph_export_entity_props(node)
+        compact_props: Dict[str, Any] = {}
+        for key in (
+            "node_id",
+            "canonical_id",
+            "canonical_name",
+            "type",
+            "entity_type",
+            "is_primary_root",
+            "suppressed",
+            "merged_into",
+        ):
+            value = props.get(key)
+            if isinstance(value, (str, bool, int, float)) and value not in {"", None}:
+                compact_props[key] = value
+        alt_names = props.get("alt_names")
+        if isinstance(alt_names, list):
+            compact_props["alt_names"] = [str(item).strip() for item in alt_names[:4] if str(item).strip()]
+        merge_keys = props.get("merge_keys")
+        if isinstance(merge_keys, list):
+            compact_props["merge_keys"] = [str(item).strip() for item in merge_keys[:4] if str(item).strip()]
+        compact_nodes.append(
+            {
+                "entityId": _graph_entity_id_from_payload(node),
+                "labels": [str(item).strip() for item in _pick_list(node, ["labels"])[:4] if str(item).strip()],
+                "properties": compact_props,
+            }
+        )
+
+    compact_relations: List[Dict[str, Any]] = []
+    for relation in normalized.get("relations", []) if isinstance(normalized.get("relations", []), list) else []:
+        if not isinstance(relation, dict):
+            continue
+        props = _pick_dict(relation, ["properties", "props"])
+        compact_props: Dict[str, Any] = {}
+        for key in ("edge_id", "rel_type", "canonical_name", "suppressed"):
+            value = props.get(key)
+            if isinstance(value, (str, bool)) and value not in {"", None}:
+                compact_props[key] = value
+        compact_relations.append(
+            {
+                "edgeId": _graph_relation_id_from_payload(relation),
+                "srcEntityId": _pick_str(relation, ["srcEntityId", "src_id"]) or _graph_relation_endpoints(relation)[0],
+                "dstEntityId": _pick_str(relation, ["dstEntityId", "dst_id"]) or _graph_relation_endpoints(relation)[1],
+                "relType": _graph_relation_type(relation),
+                "properties": compact_props,
+            }
+        )
+
+    return {
+        **normalized,
+        "nodes": compact_nodes,
+        "relations": compact_relations,
+        "nodeCount": len(compact_nodes),
+        "relationCount": len(compact_relations),
+    }
+
+
+def _filter_conflict_observations_for_candidate(
+    observations: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    primary_entity_id: str,
+) -> List[Dict[str, Any]]:
+    target_type = str(candidate.get("target_type") or "").strip().lower()
+    field_name = str(candidate.get("field_name") or "").strip().lower()
+    relation_type = str(candidate.get("relation_type") or "").strip().upper()
+    target_id = str(candidate.get("target_id") or "").strip()
+    candidate_values = {
+        str(item).strip().casefold()
+        for item in candidate.get("candidate_values", [])
+        if isinstance(item, str) and str(item).strip()
+    }
+    matched: List[Dict[str, Any]] = []
+    for observation in observations:
+        if str(observation.get("target_type") or "").strip().lower() != target_type:
+            continue
+        if target_type == "entity":
+            if str(observation.get("field_name") or "").strip().lower() != field_name:
+                continue
+            observation_target_id = str(observation.get("target_id") or "").strip()
+            if target_id:
+                if observation_target_id and observation_target_id != target_id:
+                    continue
+            elif primary_entity_id and observation_target_id and observation_target_id != primary_entity_id:
+                continue
+        else:
+            if str(observation.get("field_name") or "").strip().lower() != "relation_presence":
+                continue
+            if str(observation.get("relation_type") or "").strip().upper() != relation_type:
+                continue
+            observation_target_id = str(observation.get("target_id") or "").strip()
+            if target_id and observation_target_id and observation_target_id != target_id:
+                continue
+        matched.append(observation)
+
+    if candidate_values:
+        filtered = [
+            item
+            for item in matched
+            if str(item.get("normalized_value") or item.get("value") or "").strip().casefold() in candidate_values
+        ]
+        unique_values = {
+            str(item.get("normalized_value") or item.get("value") or "").strip().casefold()
+            for item in filtered
+            if str(item.get("normalized_value") or item.get("value") or "").strip()
+        }
+        if len(unique_values) >= 2 or unique_values == {"present", "absent"}:
+            return filtered
+    return matched
+
+
+def _build_entity_conflict_case_from_observations(
+    *,
+    mcp_client: McpClientProtocol,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    target_id: str,
+    field_name: str,
+    group: List[Dict[str, Any]],
+    scope: str,
+    blocking: bool,
+    notes: List[str] | None = None,
+) -> GraphConflictCaseModel | None:
+    values_by_normalized: Dict[str, List[Dict[str, Any]]] = {}
+    for item in group:
+        values_by_normalized.setdefault(str(item["normalized_value"]), []).append(item)
+    if len(values_by_normalized) < 2:
+        return None
+    case_id = _conflict_case_id(run_id, "entity", target_id, field_name)
+    evidence: List[ConflictEvidenceRefModel] = []
+    candidate_values: List[ConflictCandidateValueModel] = []
+    evidence_offset = 0
+    for value, value_observations in values_by_normalized.items():
+        value_evidence: List[ConflictEvidenceRefModel] = []
+        for observation in value_observations[:3]:
+            looked_up = _conflict_lookup_exact_evidence(mcp_client, run_id, observation, case_id, evidence_offset)
+            evidence_offset += len(looked_up)
+            value_evidence.extend(looked_up)
+        candidate = _candidate_score_from_observations(value, value_observations, len(value_evidence))
+        candidate.evidence_ids = [item.evidence_id for item in value_evidence]
+        candidate_values.append(candidate)
+        evidence.extend(value_evidence)
+    candidate_values.sort(key=lambda item: item.score, reverse=True)
+    best = candidate_values[0]
+    second = candidate_values[1] if len(candidate_values) > 1 else None
+    confidence = best.score
+    status = "resolved" if confidence >= STAGE1_CONFLICT_AUTO_APPLY_CONFIDENCE and (second is None or best.score - second.score >= 0.10) else "unresolved"
+    case = GraphConflictCaseModel(
+        case_id=case_id,
+        run_id=run_id,
+        target_type="entity",
+        target_id=target_id,
+        field_name=field_name,
+        scope=scope if scope in {"primary", "first_hop", "secondary"} else "primary",
+        status=status,
+        blocking=blocking,
+        chosen_value=best.value if status == "resolved" else None,
+        deterministic_winner=best.value,
+        confidence=confidence,
+        rationale=f"Deterministic adjudication picked `{best.value}` for {field_name} with score {best.score:.2f}.",
+        candidate_values=candidate_values,
+        evidence=evidence[:STAGE1_CONFLICT_MAX_EVIDENCE_ROWS],
+        source_tools=_dedupe([tool for item in candidate_values for tool in item.source_tools]),
+        source_domains=_dedupe([domain for item in candidate_values for domain in item.source_domains]),
+        graph_entity_ids=[target_id] if target_id else [],
+        graph_relation_ids=[],
+        notes=list(notes or []),
+    )
+    llm_result = _llm_adjudicate_conflict_case(llm=llm, run_id=run_id, case=case)
+    llm_choice = str(llm_result.get("chosen_value") or "").strip()
+    llm_status = str(llm_result.get("status") or "").strip().lower()
+    llm_confidence = float(llm_result.get("confidence", case.confidence) or case.confidence)
+    if llm_choice and any(item.value == llm_choice for item in case.candidate_values):
+        case.chosen_value = llm_choice
+        case.deterministic_winner = llm_choice
+    if llm_status in {"resolved", "unresolved"}:
+        case.status = llm_status
+    case.confidence = max(0.0, min(1.0, llm_confidence))
+    if str(llm_result.get("rationale") or "").strip():
+        case.rationale = str(llm_result.get("rationale") or "").strip()
+    return case
+
+
+def _build_relation_conflict_case_from_observations(
+    *,
+    mcp_client: McpClientProtocol,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    relation_type: str,
+    target_id: str,
+    primary_entity_id: str,
+    group: List[Dict[str, Any]],
+    scope: str,
+    blocking: bool,
+    notes: List[str] | None = None,
+) -> GraphConflictCaseModel | None:
+    relation_values = {str(item["normalized_value"]) for item in group}
+    if relation_values != {"present", "absent"}:
+        return None
+    positive = [item for item in group if str(item["normalized_value"]) == "present"]
+    negative = [item for item in group if str(item["normalized_value"]) == "absent"]
+    effective_target_id = target_id or next(
+        (str(item.get("target_id") or "").strip() for item in positive if str(item.get("target_id") or "").strip()),
+        "",
+    )
+    case_id = _conflict_case_id(run_id, "relation", effective_target_id or relation_type, "relation_presence", relation_type)
+    evidence: List[ConflictEvidenceRefModel] = []
+    evidence_offset = 0
+    candidate_values: List[ConflictCandidateValueModel] = []
+    for value, value_observations in (("present", positive), ("absent", negative)):
+        value_evidence: List[ConflictEvidenceRefModel] = []
+        for observation in value_observations[:3]:
+            looked_up = _conflict_lookup_exact_evidence(mcp_client, run_id, observation, case_id, evidence_offset)
+            evidence_offset += len(looked_up)
+            value_evidence.extend(looked_up)
+        candidate = _candidate_score_from_observations(value, value_observations, len(value_evidence))
+        candidate.evidence_ids = [item.evidence_id for item in value_evidence]
+        candidate_values.append(candidate)
+        evidence.extend(value_evidence)
+    candidate_values.sort(key=lambda item: item.score, reverse=True)
+    best = candidate_values[0]
+    second = candidate_values[1] if len(candidate_values) > 1 else None
+    status = "resolved" if best.score >= STAGE1_CONFLICT_AUTO_APPLY_CONFIDENCE and (second is None or best.score - second.score >= 0.10) else "unresolved"
+    case = GraphConflictCaseModel(
+        case_id=case_id,
+        run_id=run_id,
+        target_type="relation",
+        target_id=effective_target_id,
+        field_name="relation_presence",
+        relation_type=relation_type,
+        scope=scope if scope in {"primary", "first_hop", "secondary"} else "first_hop",
+        status=status,
+        blocking=blocking,
+        chosen_value=best.value if status == "resolved" else None,
+        deterministic_winner=best.value,
+        confidence=best.score,
+        rationale=f"Deterministic adjudication picked `{best.value}` for {relation_type}.",
+        candidate_values=candidate_values,
+        evidence=evidence[:STAGE1_CONFLICT_MAX_EVIDENCE_ROWS],
+        source_tools=_dedupe([tool for item in candidate_values for tool in item.source_tools]),
+        source_domains=_dedupe([domain for item in candidate_values for domain in item.source_domains]),
+        graph_entity_ids=[primary_entity_id] if primary_entity_id else [],
+        graph_relation_ids=[effective_target_id] if effective_target_id else [],
+        notes=list(notes or []),
+    )
+    llm_result = _llm_adjudicate_conflict_case(llm=llm, run_id=run_id, case=case)
+    llm_choice = str(llm_result.get("chosen_value") or "").strip()
+    llm_status = str(llm_result.get("status") or "").strip().lower()
+    llm_confidence = float(llm_result.get("confidence", case.confidence) or case.confidence)
+    if llm_choice in {"present", "absent"}:
+        case.chosen_value = llm_choice
+        case.deterministic_winner = llm_choice
+    if llm_status in {"resolved", "unresolved"}:
+        case.status = llm_status
+    case.confidence = max(0.0, min(1.0, llm_confidence))
+    if str(llm_result.get("rationale") or "").strip():
+        case.rationale = str(llm_result.get("rationale") or "").strip()
+    return case
+
+
+def _synthetic_conflict_case_from_graph_candidate(
+    *,
+    run_id: str,
+    candidate: Dict[str, Any],
+    primary_entity_id: str,
+) -> GraphConflictCaseModel:
+    target_type = str(candidate.get("target_type") or "entity").strip().lower()
+    target_id = str(candidate.get("target_id") or "").strip()
+    field_name = str(candidate.get("field_name") or "canonical_name").strip().lower()
+    relation_type = str(candidate.get("relation_type") or "").strip().upper()
+    case_id = _conflict_case_id(
+        run_id,
+        target_type if target_type in {"entity", "relation"} else "synthetic",
+        target_id or primary_entity_id or relation_type or field_name,
+        field_name,
+        relation_type,
+    )
+    candidate_values = [
+        ConflictCandidateValueModel(
+            value=value,
+            normalized_value=value,
+            score=0.0,
+        )
+        for value in _dedupe(
+            [
+                str(item).strip()
+                for item in candidate.get("candidate_values", [])
+                if isinstance(item, str) and str(item).strip()
+            ]
+        )
+    ]
+    return GraphConflictCaseModel(
+        case_id=case_id,
+        run_id=run_id,
+        target_type=target_type if target_type in {"entity", "relation"} else "synthetic",
+        target_id=target_id,
+        field_name=field_name,
+        relation_type=relation_type,
+        scope=str(candidate.get("scope") or "primary").strip().lower() or "primary",
+        status="unresolved",
+        blocking=bool(candidate.get("blocking", False)),
+        chosen_value=None,
+        deterministic_winner=None,
+        confidence=0.25,
+        rationale=str(candidate.get("reason") or "Graph-first detector flagged a possible conflict.").strip(),
+        candidate_values=candidate_values,
+        evidence=[],
+        source_tools=[],
+        source_domains=[],
+        graph_entity_ids=[primary_entity_id] if target_type == "relation" and primary_entity_id else ([target_id] if target_id else []),
+        graph_relation_ids=[target_id] if target_type == "relation" and target_id else [],
+        notes=["Graph-first detector flagged a possible conflict but no receipt-linked evidence references were available."],
+    )
+
+
+def _build_conflict_cases_from_graph_candidates(
+    *,
+    mcp_client: McpClientProtocol,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    observations: List[Dict[str, Any]],
+    graph_candidates: List[Dict[str, Any]],
+    primary_entity_id: str,
+) -> List[GraphConflictCaseModel]:
+    cases: List[GraphConflictCaseModel] = []
+    seen_case_ids: set[str] = set()
+    for candidate in graph_candidates:
+        filtered_group = _filter_conflict_observations_for_candidate(observations, candidate, primary_entity_id)
+        reason_note = str(candidate.get("reason") or "").strip()
+        notes = [reason_note] if reason_note else []
+        case: GraphConflictCaseModel | None
+        if str(candidate.get("target_type") or "").strip().lower() == "entity":
+            case = _build_entity_conflict_case_from_observations(
+                mcp_client=mcp_client,
+                llm=llm,
+                run_id=run_id,
+                target_id=str(candidate.get("target_id") or primary_entity_id or "").strip(),
+                field_name=str(candidate.get("field_name") or "").strip().lower(),
+                group=filtered_group,
+                scope=str(candidate.get("scope") or "primary").strip().lower(),
+                blocking=bool(candidate.get("blocking", False)),
+                notes=notes,
+            )
+        else:
+            case = _build_relation_conflict_case_from_observations(
+                mcp_client=mcp_client,
+                llm=llm,
+                run_id=run_id,
+                relation_type=str(candidate.get("relation_type") or "").strip().upper(),
+                target_id=str(candidate.get("target_id") or "").strip(),
+                primary_entity_id=primary_entity_id,
+                group=filtered_group,
+                scope=str(candidate.get("scope") or "first_hop").strip().lower(),
+                blocking=bool(candidate.get("blocking", False)),
+                notes=notes,
+            )
+        if case is None:
+            case = _synthetic_conflict_case_from_graph_candidate(
+                run_id=run_id,
+                candidate=candidate,
+                primary_entity_id=primary_entity_id,
+            )
+        if case.case_id in seen_case_ids:
+            continue
+        seen_case_ids.add(case.case_id)
+        cases.append(case)
+    return cases
+
+
+def _llm_adjudicate_conflict_case(
+    *,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    case: GraphConflictCaseModel,
+) -> Dict[str, Any]:
+    if llm is None or not case.evidence:
+        return {}
+    payload = {
+        "case": {
+            "case_id": case.case_id,
+            "target_type": case.target_type,
+            "field_name": case.field_name,
+            "relation_type": case.relation_type,
+            "candidate_values": [
+                {
+                    "value": item.value,
+                    "score": item.score,
+                    "source_count": item.source_count,
+                    "direct_source_count": item.direct_source_count,
+                    "official_source_count": item.official_source_count,
+                }
+                for item in case.candidate_values
+            ],
+            "evidence": [
+                {
+                    "evidence_id": item.evidence_id,
+                    "candidate_value": item.candidate_value,
+                    "source_tool": item.source_tool,
+                    "source_url": item.source_url,
+                    "snippet": item.snippet,
+                }
+                for item in case.evidence[:STAGE1_CONFLICT_MAX_EVIDENCE_ROWS]
+            ],
+        },
+        "instructions": [
+            "Choose the strongest supported candidate value only if the evidence clearly wins.",
+            "Do not invent facts outside the evidence snippets.",
+            "Use status=unresolved when evidence remains materially ambiguous or contradictory.",
+        ],
+        "output_schema": {
+            "chosen_value": "string|null",
+            "status": "resolved|unresolved",
+            "confidence": "number",
+            "rationale": "string",
+            "evidence_ids": ["string"],
+        },
+    }
+    try:
+        return invoke_complete_json(
+            llm,
+            "You adjudicate graph conflicts. Return JSON only.",
+            payload,
+            temperature=0.1,
+            timeout=_env_float("OPENROUTER_PLANNER_TIMEOUT_SECONDS", 120.0),
+            run_id=run_id,
+            operation="planner.resolve_graph_conflicts",
+            metadata={"caseId": case.case_id, "fieldName": case.field_name},
+        )
+    except Exception:
+        getattr(logger, "exception", logger.warning)(
+            "Conflict adjudication LLM call failed",
+            extra={"run_id": run_id, "case_id": case.case_id},
+        )
+        return {}
+
+
+def _build_conflict_cases(
+    *,
+    mcp_client: McpClientProtocol,
+    llm: OpenRouterLLM | None,
+    run_id: str,
+    receipts: List[ToolReceipt],
+    graph_state_snapshot: Dict[str, Any],
+    primary_person_targets: List[str],
+    entity_rewrites: Dict[str, str] | None = None,
+) -> List[GraphConflictCaseModel]:
+    primary_entity_id = ""
+    resolved_entity_ids = graph_state_snapshot.get("resolved_entity_ids", []) if isinstance(graph_state_snapshot.get("resolved_entity_ids", []), list) else []
+    if resolved_entity_ids:
+        primary_entity_id = str(resolved_entity_ids[0] or "").strip()
+
+    observations = _extract_primary_conflict_observations(receipts, primary_person_targets, primary_entity_id)
+    rewrite_map = {str(key).strip(): str(value).strip() for key, value in (entity_rewrites or {}).items() if str(key).strip() and str(value).strip()}
+    if rewrite_map:
+        rewritten_observations: List[Dict[str, Any]] = []
+        for item in observations:
+            rewritten = dict(item)
+            target_id = str(rewritten.get("target_id") or "").strip()
+            if target_id in rewrite_map:
+                rewritten["target_id"] = rewrite_map[target_id]
+            graph_entity_ids = rewritten.get("graph_entity_ids")
+            if isinstance(graph_entity_ids, list):
+                rewritten["graph_entity_ids"] = [rewrite_map.get(str(entity_id).strip(), str(entity_id).strip()) for entity_id in graph_entity_ids]
+            rewritten_observations.append(rewritten)
+        observations = rewritten_observations
+    graph_export = _empty_graph_export_json()
+    if llm is not None:
+        graph_export = _fetch_graph_export_json(mcp_client, run_id)
+        graph_candidates = _llm_detect_graph_conflict_candidates(
+            llm=llm,
+            run_id=run_id,
+            graph_export=graph_export,
+            graph_state_snapshot=graph_state_snapshot,
+            primary_person_targets=primary_person_targets,
+        )
+        if graph_candidates is not None:
+            graph_first_cases = _build_conflict_cases_from_graph_candidates(
+                mcp_client=mcp_client,
+                llm=llm,
+                run_id=run_id,
+                observations=observations,
+                graph_candidates=graph_candidates,
+                primary_entity_id=primary_entity_id,
+            )
+            return sorted(
+                graph_first_cases,
+                key=lambda item: (not item.blocking, -item.confidence, item.case_id),
+            )[:STAGE1_CONFLICT_MAX_CASES]
+
+    entity_groups: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    relation_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for item in observations:
+        if item["target_type"] == "entity":
+            entity_groups.setdefault((str(item["target_id"]), str(item["field_name"])), []).append(item)
+        else:
+            relation_groups.setdefault(str(item["relation_type"]), []).append(item)
+
+    cases: List[GraphConflictCaseModel] = []
+    for (target_id, field_name), group in entity_groups.items():
+        case = _build_entity_conflict_case_from_observations(
+            mcp_client=mcp_client,
+            llm=llm,
+            run_id=run_id,
+            target_id=target_id,
+            field_name=field_name,
+            group=group,
+            scope="primary",
+            blocking=field_name in CONFLICT_BLOCKING_ENTITY_FIELDS,
+        )
+        if case is not None:
+            cases.append(case)
+
+    for relation_type, group in relation_groups.items():
+        case = _build_relation_conflict_case_from_observations(
+            mcp_client=mcp_client,
+            llm=llm,
+            run_id=run_id,
+            relation_type=relation_type,
+            target_id="",
+            primary_entity_id=primary_entity_id,
+            group=group,
+            scope="first_hop",
+            blocking=relation_type in CONFLICT_BLOCKING_RELATION_TYPES,
+        )
+        if case is not None:
+            cases.append(case)
+
+    return sorted(cases, key=lambda item: (not item.blocking, -item.confidence, item.case_id))[:STAGE1_CONFLICT_MAX_CASES]
+
+
+def _apply_resolved_conflicts(
+    *,
+    mcp_client: McpClientProtocol,
+    run_id: str,
+    conflict_cases: List[GraphConflictCaseModel],
+) -> tuple[List[GraphConflictCaseModel], List[str]]:
+    normalized_cases = [
+        (
+            item
+            if item.target_id or item.status != "resolved"
+            else item.model_copy(
+                update={
+                    "status": "unresolved",
+                    "notes": list(item.notes) + ["Resolved evidence could not be mapped to a run-scoped graph target; graph update skipped."],
+                }
+            )
+        )
+        for item in conflict_cases
+    ]
+    resolved = [
+        item
+        for item in normalized_cases
+        if item.status == "resolved"
+        and item.chosen_value is not None
+        and item.target_id
+        and any(candidate.value == item.chosen_value and _candidate_supports_auto_apply(candidate) for candidate in item.candidate_values)
+        and item.confidence >= STAGE1_CONFLICT_AUTO_APPLY_CONFIDENCE
+    ]
+    if not resolved or not hasattr(mcp_client, "call_tool"):
+        return normalized_cases, []
+
+    payload = [
+        {
+            "caseId": item.case_id,
+            "targetType": item.target_type,
+            "targetId": item.target_id,
+            "fieldName": "relation_type" if item.target_type == "relation" else item.field_name,
+            "chosenValue": item.chosen_value,
+            "confidence": item.confidence,
+            "status": "applied",
+            "unresolvedFields": [],
+        }
+        for item in resolved
+    ]
+    result = mcp_client.call_tool(
+        "graph_apply_adjudications",
+        {"runId": run_id, "resolutionsJson": json.dumps(payload)},
+    )
+    if not result.ok:
+        return conflict_cases, ["Graph adjudication apply step failed; blocking conflicts remain unresolved."]
+
+    applied_case_ids = {item.case_id for item in resolved}
+    rewritten: List[GraphConflictCaseModel] = []
+    for item in normalized_cases:
+        if item.case_id in applied_case_ids:
+            rewritten.append(item.model_copy(update={"status": "applied"}))
+        else:
+            rewritten.append(item)
+    return rewritten, [f"Applied {len(applied_case_ids)} resolved graph conflict(s) to the run-scoped knowledge graph."]
+
+
+def _profile_candidate_matches_primary_targets(
+    receipt: ToolReceipt,
+    profile: Dict[str, Any],
+    primary_person_targets: List[str],
+    *,
+    approved_handles: List[str] | None = None,
+) -> bool:
+    del receipt
+    normalized_handles = {
+        str(item).strip().casefold().lstrip("@")
+        for item in (approved_handles or [])
+        if str(item).strip()
+    }
+    if not primary_person_targets and not normalized_handles:
+        return True
+    profile_name = str(profile.get("name") or "").strip()
+    if profile_name and _primary_target_match_score(profile_name, primary_person_targets) > 0:
+        return True
+    target_name_signatures = {
+        _person_name_signature(value)
+        for value in primary_person_targets
+        if _person_name_signature(value)
+    }
+    target_compacts = {
+        _compact_alpha_signature(value)
+        for value in primary_person_targets
+        if _compact_alpha_signature(value)
+    }
+    identifiers: List[str] = []
+    username = str(profile.get("username") or "").strip()
+    if username:
+        identifiers.append(username)
+    for key in ("profile_url", "site", "url"):
+        extracted = _extract_username_from_profile_url(str(profile.get(key) or "").strip())
+        if extracted:
+            identifiers.append(extracted)
+    for identifier in _dedupe([item.lstrip("@") for item in identifiers if item.strip()]):
+        normalized = identifier.casefold()
+        if normalized in normalized_handles:
+            return True
+        separator_tokens = [token for token in re.split(r"[^a-z0-9]+", normalized) if token]
+        alpha_tokens = [token for token in separator_tokens if token.isalpha()]
+        if alpha_tokens:
+            alpha_signature = " ".join(alpha_tokens)
+            alpha_compact = "".join(alpha_tokens)
+            if alpha_signature in target_name_signatures or alpha_compact in target_compacts:
+                return True
+        compact = _compact_alpha_signature(normalized)
+        if compact and compact in target_compacts:
+            return True
+    return False
+
+
+def _profile_candidates_from_receipts(
+    receipts: List[ToolReceipt],
+    *,
+    primary_person_targets: List[str] | None = None,
+    approved_handles: List[str] | None = None,
+) -> List[Dict[str, Any]]:
     profiles: List[Dict[str, Any]] = []
+    primary_person_targets = list(primary_person_targets or [])
     for receipt in receipts:
         profile: Dict[str, Any] = {"platform": receipt.tool_name}
         for fact in receipt.key_facts:
@@ -5708,7 +9344,12 @@ def _profile_candidates_from_receipts(receipts: List[ToolReceipt]) -> List[Dict[
                                 publications.append({"title": evidence["snippet"].strip()})
                         if publications:
                             profile["publications"] = publications
-        if len(profile) > 1:
+        if len(profile) > 1 and _profile_candidate_matches_primary_targets(
+            receipt,
+            profile,
+            primary_person_targets,
+            approved_handles=approved_handles,
+        ):
             profiles.append(profile)
     deduped: Dict[str, Dict[str, Any]] = {}
     for profile in profiles:
@@ -5722,20 +9363,30 @@ def _derive_entity_resolution_follow_up_tasks(
     *,
     run_id: str,
     receipts: List[ToolReceipt],
+    primary_person_targets: List[str],
+    primary_target_contract: PrimaryTargetContractModel,
     iteration: int,
     dedupe_store: Dict[str, int],
 ):
     dedupe_store = prune_dedupe_store(dedupe_store, iteration)
     tasks = []
     notes: List[str] = []
-    profiles = _profile_candidates_from_receipts(receipts)
+    profiles = _profile_candidates_from_receipts(
+        receipts,
+        primary_person_targets=primary_person_targets,
+        approved_handles=primary_target_contract.approved_handles,
+    )
     if len(profiles) >= 2:
         add_task_if_new(
             tasks,
             dedupe_store,
             iteration,
             tool_name="cross_platform_profile_resolver",
-            payload={"runId": run_id, "profiles": profiles[:8]},
+            payload={
+                "runId": run_id,
+                "profiles": profiles[:8],
+                "target_contract": primary_target_contract.model_dump(),
+            },
             priority=PRIORITY_HIGH,
             reason="Resolve whether discovered academic/social/code profiles map to one canonical identity.",
         )
@@ -5759,6 +9410,8 @@ def _derive_related_entity_expansion_follow_up_tasks(
     receipts: List[ToolReceipt],
     candidates: List[Dict[str, Any]],
     primary_person_targets: List[str],
+    secondary_person_names: List[str],
+    coauthor_person_names: List[str],
     iteration: int,
     dedupe_store: Dict[str, int],
     allow_related_person_depth: bool,
@@ -5768,48 +9421,58 @@ def _derive_related_entity_expansion_follow_up_tasks(
     tasks = []
     notes: List[str] = []
     primary_name = primary_person_targets[:1][0] if primary_person_targets else ""
+    budgeted_secondary_names = list(secondary_person_names)
+    budgeted_coauthor_names = list(coauthor_person_names)
     for candidate in candidates:
         entity_name = str(candidate.get("entity_name") or "").strip()
         entity_type = str(candidate.get("entity_type") or "").strip()
         if not entity_name or not entity_type:
+            continue
+        if entity_type not in {"person", "organization", "topic"}:
             continue
         relationship_types = {str(item).strip() for item in candidate.get("relationship_types", []) if str(item).strip()}
         supporting_tools = {str(item).strip() for item in candidate.get("supporting_tools", []) if str(item).strip()}
         if _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
             continue
         if entity_type == "person":
+            normalized_entity_name = normalize_person_candidate(entity_name) or entity_name
+            if not bool(candidate.get("anchored", False)):
+                notes.append(
+                    f"Skipped secondary-person depth for {entity_name}: candidate is not anchored to the primary target."
+                )
+                continue
             if not bool(candidate.get("expandable", False)):
                 notes.append(
                     f"Skipped secondary-person depth for {entity_name}: {candidate.get('adjudication_reason') or 'candidate not expandable'}."
                 )
                 continue
             if not allow_related_person_depth and not (
-                _candidate_has_structured_person_support(candidate)
-                or bool(candidate.get("anchor_types"))
-                or relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH", "ADVISED_BY", "COLLABORATED_WITH", "MENTORED_BY", "OFFICER_OF", "DIRECTOR_OF"}
+                bool(candidate.get("anchored", False))
+                and (
+                    _candidate_has_structured_person_support(candidate)
+                    or bool(candidate.get("anchor_types"))
+                    or relationship_types & STRUCTURED_PERSON_RELATION_TYPES
+                )
             ):
                 notes.append(
                     f"Deferred secondary-person depth for {entity_name}: simple scholar mode requires stronger relationship or anchor evidence."
                 )
                 continue
-            add_task_if_new(
-                tasks,
-                dedupe_store,
-                iteration,
-                tool_name="tavily_person_search",
-                payload={"runId": run_id, "target_name": entity_name, "query": _tavily_github_query(entity_name), "max_results": 5},
-                priority=PRIORITY_HIGH,
-                reason=f"Depth expansion: discover GitHub account/profile evidence for related person {entity_name} before repo-native code identity resolution.",
-            )
-            add_task_if_new(
-                tasks,
-                dedupe_store,
-                iteration,
-                tool_name="tavily_research",
-                payload={"runId": run_id, "input": _tavily_person_research_query(entity_name), "timeout_seconds": 180},
-                priority=PRIORITY_HIGH,
-                reason=f"Depth expansion: investigate secondary person {entity_name} beyond mention-level coverage.",
-            )
+            if normalized_entity_name not in budgeted_secondary_names and len(budgeted_secondary_names) >= STAGE1_SECONDARY_PERSON_BUDGET:
+                notes.append(
+                    f"Skipped secondary-person depth for {entity_name}: secondary-person budget {STAGE1_SECONDARY_PERSON_BUDGET} reached."
+                )
+                continue
+            if normalized_entity_name not in budgeted_secondary_names:
+                budgeted_secondary_names.append(normalized_entity_name)
+            if relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH"}:
+                if normalized_entity_name not in budgeted_coauthor_names and len(budgeted_coauthor_names) >= STAGE1_COAUTHOR_PERSON_BUDGET:
+                    notes.append(
+                        f"Skipped secondary-person depth for {entity_name}: coauthor budget {STAGE1_COAUTHOR_PERSON_BUDGET} reached."
+                    )
+                    continue
+                if normalized_entity_name not in budgeted_coauthor_names:
+                    budgeted_coauthor_names.append(normalized_entity_name)
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -5849,15 +9512,6 @@ def _derive_related_entity_expansion_follow_up_tasks(
                     reason=f"Depth expansion: resolve broader company-role history for management-related person {entity_name}.",
                 )
         elif entity_type == "organization":
-            add_task_if_new(
-                tasks,
-                dedupe_store,
-                iteration,
-                tool_name="tavily_research",
-                payload={"runId": run_id, "input": _tavily_org_research_query(entity_name), "timeout_seconds": 180},
-                priority=PRIORITY_HIGH,
-                reason=f"Depth expansion: investigate what related organization {entity_name} does and its public footprint.",
-            )
             add_task_if_new(
                 tasks,
                 dedupe_store,
@@ -5923,16 +9577,6 @@ def _derive_related_entity_expansion_follow_up_tasks(
                     f"Skipped secondary-topic depth for {entity_name}: simple scholar mode requires anchored evidence for Tavily-derived topic fanout."
                 )
                 continue
-            topic_query = _tavily_topic_research_query(entity_name, primary_name)
-            add_task_if_new(
-                tasks,
-                dedupe_store,
-                iteration,
-                tool_name="tavily_research",
-                payload={"runId": run_id, "input": topic_query, "timeout_seconds": 180},
-                priority=PRIORITY_HIGH,
-                reason=f"Depth expansion: investigate how topic {entity_name} connects back to people, organizations, and publications in scope.",
-            )
             if primary_name:
                 add_task_if_new(
                     tasks,
@@ -6054,6 +9698,10 @@ def _planner_has_sufficient_related_entity_depth(state: PlannerState) -> bool:
         entity_name = str(candidate.get("entity_name") or "").strip()
         entity_type = str(candidate.get("entity_type") or "").strip()
         if not entity_name or not entity_type:
+            continue
+        if entity_type not in {"person", "organization", "topic"}:
+            continue
+        if entity_type == "person" and not bool(candidate.get("anchored", False)):
             continue
         if not _related_entity_has_depth_investigation(receipts, entity_name, entity_type):
             unresolved += 1
@@ -6188,6 +9836,91 @@ def _extract_fetch_receipt_url(receipt: ToolReceipt) -> str | None:
     return None
 
 
+def _fetch_url_receipt_for_url(state: PlannerState, url: str) -> ToolReceipt | None:
+    normalized_url = _normalize_crawl_url(url)
+    if not normalized_url:
+        return None
+    for receipt in state.get("tool_receipts", []):
+        if receipt.tool_name != "fetch_url":
+            continue
+        receipt_url = _extract_fetch_receipt_url(receipt)
+        if receipt_url and receipt_url == normalized_url:
+            return receipt
+        arguments = receipt.arguments if isinstance(receipt.arguments, dict) else {}
+        argument_url = arguments.get("url")
+        if isinstance(argument_url, str):
+            normalized_argument_url = _normalize_crawl_url(argument_url)
+            if normalized_argument_url and normalized_argument_url == normalized_url:
+                return receipt
+    return None
+
+
+def _fetch_url_receipt_is_meaningful(receipt: ToolReceipt | None) -> bool:
+    if receipt is None or not receipt.ok or not receipt.document_ids:
+        return False
+    size_bytes = 0
+    status_code = 0
+    title = ""
+    content_type = ""
+    for fact in receipt.key_facts:
+        if not isinstance(fact, dict):
+            continue
+        if isinstance(fact.get("title"), str):
+            title = str(fact.get("title") or "").strip()
+        if isinstance(fact.get("sizeBytes"), (int, float)):
+            size_bytes = max(size_bytes, int(fact.get("sizeBytes") or 0))
+        if isinstance(fact.get("statusCode"), (int, float)):
+            status_code = int(fact.get("statusCode") or 0)
+        if isinstance(fact.get("contentType"), str):
+            content_type = str(fact.get("contentType") or "").strip().lower()
+    if status_code >= 400:
+        return False
+    if title:
+        return True
+    if size_bytes >= 1500:
+        return True
+    return content_type.startswith("text/") or "html" in content_type or "xml" in content_type or "json" in content_type
+
+
+def _rewrite_crawl_plan_with_fetch_fallback(state: PlannerState, plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
+    rewritten: List[ToolPlanItem] = []
+    fetch_urls_in_plan: set[str] = set()
+    for item in plan:
+        if item.tool == "fetch_url":
+            normalized_url = _normalize_crawl_url(str(item.arguments.get("url") or ""))
+            if normalized_url:
+                fetch_urls_in_plan.add(normalized_url)
+            rewritten.append(item)
+            continue
+
+        if item.tool != "crawl_webpage":
+            rewritten.append(item)
+            continue
+
+        crawl_url = _normalize_crawl_url(str(item.arguments.get("url") or ""))
+        if not crawl_url:
+            rewritten.append(item)
+            continue
+
+        prior_fetch_receipt = _fetch_url_receipt_for_url(state, crawl_url)
+        if _fetch_url_receipt_is_meaningful(prior_fetch_receipt):
+            continue
+        if prior_fetch_receipt is None:
+            if crawl_url not in fetch_urls_in_plan:
+                fetch_urls_in_plan.add(crawl_url)
+                rewritten.append(
+                    ToolPlanItem(
+                        tool="fetch_url",
+                        arguments={"runId": state["run_id"], "url": crawl_url},
+                        rationale=f"Probe URL with direct fetch before escalating to Tavily crawl: {crawl_url}",
+                    )
+                )
+            continue
+
+        rewritten.append(item)
+    return rewritten
+
+
 def _dedupe(items: List[str]) -> List[str]:
     seen: set[str] = set()
     ordered: List[str] = []
@@ -6234,6 +9967,13 @@ def _normalize_llm_tool_plan(
             arguments,
             fallback_person_targets=fallback_person_targets,
         )
+        if tool == "tavily_research":
+            person_target = _extract_tavily_research_person_target(arguments)
+            if not person_target:
+                continue
+            if fallback_person_targets and _primary_target_match_score(person_target, fallback_person_targets) <= 0:
+                continue
+            arguments["target_name"] = person_target
 
         rationale = item.get("rationale") or item.get("reasoning") or f"LLM selected {tool}."
         normalized_plan.append(
@@ -6248,11 +9988,13 @@ def _normalize_llm_tool_plan(
 
 
 def _tool_source_preference_rank(tool_name: str) -> int:
-    if tool_name in {"tavily_research", "tavily_person_search"}:
+    if tool_name == "fetch_url":
         return 0
+    if tool_name in {"tavily_research", "tavily_person_search"}:
+        return 1
     if tool_name.startswith("osint_"):
         return 2
-    return 1
+    return 3
 
 
 def _prefer_research_tool_sources(plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
@@ -6305,6 +10047,81 @@ def _filter_completed_tool_plan(state: PlannerState, plan: List[ToolPlanItem]) -
     return filtered
 
 
+def _secondary_person_relationship_types(state: PlannerState, person_name: str) -> set[str]:
+    normalized_name = (normalize_person_candidate(person_name) or person_name).casefold()
+    for candidate in state.get("related_entity_candidates", []):
+        candidate_name = normalize_person_candidate(str(candidate.get("entity_name") or "").strip()) or str(candidate.get("entity_name") or "").strip()
+        if candidate_name.casefold() != normalized_name:
+            continue
+        return {
+            str(item).strip()
+            for item in candidate.get("relationship_types", [])
+            if str(item).strip()
+        }
+    return set()
+
+
+def _filter_tool_plan_for_budgets(state: PlannerState, plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
+    if not plan:
+        return []
+    filtered: List[ToolPlanItem] = []
+    primary_aliases = _target_contract_aliases(state.get("primary_target_contract") or PrimaryTargetContractModel())
+    secondary_names = [
+        normalize_person_candidate(item) or item
+        for item in state.get("secondary_person_names", [])
+        if (normalize_person_candidate(item) or item)
+    ]
+    coauthor_names = [
+        normalize_person_candidate(item) or item
+        for item in state.get("coauthor_person_names", [])
+        if (normalize_person_candidate(item) or item)
+    ]
+    tavily_call_counter = int(state.get("tavily_call_counter", 0) or 0)
+    tavily_person_counter = dict(state.get("tavily_person_counter", {}))
+    tavily_crawl_counter = dict(state.get("tavily_crawl_counter", {}))
+    for item in plan:
+        tool_name = item.tool
+        person_target = _llm_plan_related_person_target(item)
+        normalized_person_target = (normalize_person_candidate(person_target) or person_target) if person_target else ""
+        is_primary_person = bool(normalized_person_target and _primary_target_match_score(normalized_person_target, primary_aliases) > 0)
+
+        if tool_name in PERSON_TARGET_REQUIRED_TOOLS and not normalized_person_target:
+            continue
+
+        if tool_name in {"person_search", "github_identity_search", "semantic_scholar_search", "company_officer_search"} and normalized_person_target and not is_primary_person:
+            if normalized_person_target not in secondary_names:
+                if len(secondary_names) >= STAGE1_SECONDARY_PERSON_BUDGET:
+                    continue
+                secondary_names.append(normalized_person_target)
+            relationship_types = _secondary_person_relationship_types(state, normalized_person_target)
+            if relationship_types & {"COAUTHORED_WITH", "AUTHORED_WITH"} and normalized_person_target not in coauthor_names:
+                if len(coauthor_names) >= STAGE1_COAUTHOR_PERSON_BUDGET:
+                    continue
+                coauthor_names.append(normalized_person_target)
+
+        if tool_name in {"tavily_research", "tavily_person_search", "extract_webpage", "crawl_webpage", "map_webpage"}:
+            if tavily_call_counter >= STAGE1_TAVILY_TOTAL_BUDGET:
+                continue
+            if tool_name in {"tavily_research", "tavily_person_search"} and normalized_person_target:
+                person_key = normalized_person_target.casefold()
+                current_count = int(tavily_person_counter.get(person_key, 0) or 0)
+                if current_count >= STAGE1_TAVILY_PER_PERSON_BUDGET:
+                    continue
+                tavily_person_counter[person_key] = current_count + 1
+            if tool_name == "crawl_webpage":
+                crawl_url = _normalize_crawl_url(str(item.arguments.get("url") or ""))
+                if crawl_url:
+                    crawl_key = crawl_url.casefold()
+                    current_count = int(tavily_crawl_counter.get(crawl_key, 0) or 0)
+                    if current_count >= STAGE1_TAVILY_CRAWL_PER_URL_BUDGET:
+                        continue
+                    tavily_crawl_counter[crawl_key] = current_count + 1
+            tavily_call_counter += 1
+
+        filtered.append(item)
+    return filtered
+
+
 def _dedupe_tool_plan(plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
     seen: Dict[str, int] = {}
     deduped: List[ToolPlanItem] = []
@@ -6319,8 +10136,8 @@ def _dedupe_tool_plan(plan: List[ToolPlanItem]) -> List[ToolPlanItem]:
     return deduped
 
 
-def _queued_task_priorities(state: PlannerState) -> Dict[str, int]:
-    priorities: Dict[str, int] = {}
+def _queued_task_priorities(state: PlannerState) -> Dict[str, Dict[str, Any]]:
+    priorities: Dict[str, Dict[str, Any]] = {}
     for task in state.get("queued_tasks", []):
         tool_name = task.get("tool_name")
         payload = task.get("payload")
@@ -6328,7 +10145,14 @@ def _queued_task_priorities(state: PlannerState) -> Dict[str, int]:
             continue
         signature = tool_argument_signature(tool_name, payload)
         value = int(task.get("priority", 0) or 0)
-        priorities[signature] = max(priorities.get(signature, 0), value)
+        current = priorities.get(signature, {})
+        current_priority = int(current.get("priority", 0) or 0)
+        if value >= current_priority:
+            priorities[signature] = {
+                "priority": value,
+                "scope": str(task.get("scope") or "primary"),
+                "anchored": bool(task.get("anchored", False)),
+            }
     return priorities
 
 
@@ -6391,8 +10215,10 @@ def _plan_item_priority(state: PlannerState, item: ToolPlanItem) -> int:
     signature = tool_argument_signature(tool_name, item.arguments or {})
     queued_priority = _queued_task_priorities(state).get(signature)
     if queued_priority is not None:
-        # Deterministic follow-ups already have an external priority signal; keep them near the top.
-        base += 150 + int(queued_priority)
+        queued_scope = str(queued_priority.get("scope") or "primary")
+        queued_bonus = 150 if queued_scope == "primary" else (40 if queued_priority.get("anchored", False) else 0)
+        # Deterministic follow-ups already have an external priority signal; keep primary-anchor work above secondary depth.
+        base += queued_bonus + int(queued_priority.get("priority", 0) or 0)
 
     if has_primary_person_targets:
         if tool_name in {"osint_amass_domain", "osint_sublist3r_domain", "osint_whatweb_target"}:
@@ -6601,8 +10427,12 @@ def _tool_plan_dedupe_key(tool_name: str, arguments: Dict[str, Any]) -> str:
         semantic_value = text_key("email", "username", "person_name")
     elif tool_name in {"osint_phoneinfoga_number"}:
         semantic_value = text_key("number", "phone", "target")
+    elif tool_name == "tavily_research":
+        semantic_value = _extract_tavily_research_person_target(normalized)
+    elif tool_name == "tavily_person_search":
+        semantic_value = _extract_tavily_person_search_target(normalized)
     elif tool_name in {"google_serp_person_search"}:
-        semantic_value = text_key("target_name", "query")
+        semantic_value = _extract_google_serp_person_target(normalized) or text_key("target_name", "query")
     elif tool_name in {"person_search"}:
         semantic_value = text_key("name", "query")
     elif tool_name in {"arxiv_search_and_download"}:

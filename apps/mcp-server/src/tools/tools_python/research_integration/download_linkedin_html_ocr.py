@@ -57,6 +57,30 @@ load_env_file()
 EMAIL_IN_TEXT_REGEX = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 PHONE_IN_TEXT_REGEX = re.compile(r"(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]){2,}\d{2,4}")
 PHONE_DATEISH_REGEX = re.compile(r"^\d{4}\s*[-/]\s*\d{4}$")
+USERNAME_CANDIDATE_REGEX = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{1,61}[A-Za-z0-9])?$")
+USERNAME_RESERVED_SEGMENTS = {
+    "about",
+    "blog",
+    "company",
+    "contact",
+    "explore",
+    "help",
+    "home",
+    "in",
+    "jobs",
+    "join",
+    "login",
+    "notifications",
+    "org",
+    "orgs",
+    "organizations",
+    "people",
+    "profile",
+    "profiles",
+    "pub",
+    "search",
+    "settings",
+}
 
 
 def dedupe_strings(values):
@@ -112,6 +136,134 @@ def classify_http_link(href):
     return "website", normalized
 
 
+def is_valid_username_candidate(value):
+    text = str(value or "").strip().lstrip("@")
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in USERNAME_RESERVED_SEGMENTS:
+        return False
+    if text.startswith((".", "-")) or text.endswith((".", "-")):
+        return False
+    return bool(USERNAME_CANDIDATE_REGEX.fullmatch(text))
+
+
+def extract_profile_identity(href):
+    text = str(href or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return None
+
+    parsed = urlparse(text)
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path_parts = [segment for segment in parsed.path.split("/") if segment]
+    if not path_parts:
+        return None
+
+    platform = ""
+    username = ""
+    if host.endswith("linkedin.com") and len(path_parts) >= 2 and path_parts[0].casefold() in {"in", "pub"}:
+        platform = "linkedin"
+        username = path_parts[1]
+    elif host in {"github.com", "gitlab.com", "x.com", "twitter.com", "instagram.com"}:
+        platform = host.split(".", 1)[0]
+        username = path_parts[0]
+    elif host == "medium.com" and path_parts[0].startswith("@"):
+        platform = "medium"
+        username = path_parts[0][1:]
+    else:
+        return None
+
+    username = username.strip().lstrip("@")
+    if not is_valid_username_candidate(username):
+        return None
+
+    normalized_kind, normalized_url = classify_http_link(text)
+    if normalized_kind != "profile":
+        normalized_url = text
+
+    return {
+        "platform": platform,
+        "username": username,
+        "url": normalized_url,
+    }
+
+
+def derive_identity_pivots(profile_url, contact_info):
+    seed_urls = [profile_url]
+    if isinstance(contact_info, dict):
+        seed_urls.extend(contact_info.get("profiles", []))
+        seed_urls.extend(contact_info.get("websites", []))
+        for section in contact_info.get("sections", []):
+            if isinstance(section, dict):
+                seed_urls.extend(section.get("links", []))
+
+    profiles = []
+    seen_profiles = set()
+    for href in seed_urls:
+        identity = extract_profile_identity(href)
+        if not identity:
+            continue
+        key = (
+            identity["platform"].casefold(),
+            identity["username"].casefold(),
+            identity["url"].casefold(),
+        )
+        if key in seen_profiles:
+            continue
+        seen_profiles.add(key)
+        profiles.append(identity)
+
+    usernames = []
+    seen_usernames = set()
+    for identity in profiles:
+        lowered = identity["username"].casefold()
+        if lowered in seen_usernames:
+            continue
+        seen_usernames.add(lowered)
+        usernames.append(identity["username"])
+
+    linkedin_username = ""
+    for identity in profiles:
+        if identity["platform"] == "linkedin":
+            linkedin_username = identity["username"]
+            break
+
+    email_domains = []
+    for email in (contact_info or {}).get("emails", []):
+        _, _, domain = str(email).strip().partition("@")
+        domain = domain.strip().lower()
+        if domain and domain not in email_domains:
+            email_domains.append(domain)
+
+    return {
+        "linkedin_username": linkedin_username,
+        "username_candidates": usernames,
+        "cross_platform_profiles": profiles,
+        "email_domains": email_domains,
+    }
+
+
+def discover_contact_overlay_url(page, profile_url):
+    expected_url = f"{profile_url}/overlay/contact-info/"
+    try:
+        overlay_links = page.locator('a[href*="/overlay/contact-info/"]')
+        overlay_count = min(overlay_links.count(), 5)
+        for idx in range(overlay_count):
+            href = overlay_links.nth(idx).get_attribute("href")
+            if not isinstance(href, str) or not href.strip():
+                continue
+            href = href.strip()
+            if href.startswith("/"):
+                return f"https://www.linkedin.com{href}"
+            if href.startswith(("http://", "https://")):
+                return href
+    except Exception:
+        pass
+    return expected_url
+
+
 def extract_contact_info(page):
     """Extract contact fields from LinkedIn contact overlay page."""
     contact = {
@@ -119,6 +271,8 @@ def extract_contact_info(page):
         "phones": [],
         "websites": [],
         "profiles": [],
+        "addresses": [],
+        "birthdays": [],
         "sections": [],
     }
 
@@ -191,10 +345,16 @@ def extract_contact_info(page):
                     contact["profiles"].append(normalized_href)
                 elif link_kind == "website":
                     contact["websites"].append(normalized_href)
+            lowered_label = lines[0].casefold()
+            values = lines[1:8]
+            if "address" in lowered_label:
+                contact["addresses"].extend(values)
+            elif "birthday" in lowered_label:
+                contact["birthdays"].extend(values)
             contact["sections"].append(
                 {
                     "label": lines[0],
-                    "values": lines[1:8],
+                    "values": values,
                     "links": dedupe_strings(section_links)[:8],
                 }
             )
@@ -205,6 +365,8 @@ def extract_contact_info(page):
     contact["phones"] = dedupe_strings(contact["phones"])
     contact["websites"] = dedupe_strings(contact["websites"])
     contact["profiles"] = dedupe_strings(contact["profiles"])
+    contact["addresses"] = dedupe_strings(contact["addresses"])
+    contact["birthdays"] = dedupe_strings(contact["birthdays"])
     contact["sections"] = contact["sections"][:20]
     return contact
 
@@ -506,8 +668,9 @@ def download_linkedin_html(profile_url, output_dir):
 
             contact_filename = None
             contact_json_filename = None
+            contact_info = {}
             if "/in/" in profile_url:
-                contact_url = f"{profile_url}/overlay/contact-info/"
+                contact_url = discover_contact_overlay_url(page, profile_url)
                 print(f"\n{'='*60}")
                 print(f"Navigating to contact overlay: {contact_url}")
                 print(f"{'='*60}")
@@ -525,6 +688,7 @@ def download_linkedin_html(profile_url, output_dir):
                     contact_info["overlay_url"] = contact_url
                     contact_info["captured_url"] = page.url
                     contact_info["captured_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+                    contact_info.update(derive_identity_pivots(profile_url, contact_info))
                     contact_json_filename = output_path / f"contact_info_{timestamp}.json"
                     with open(contact_json_filename, "w", encoding="utf-8") as f:
                         json.dump(contact_info, f, ensure_ascii=True, indent=2)
@@ -533,7 +697,8 @@ def download_linkedin_html(profile_url, output_dir):
                         f"  Parsed signals: emails={len(contact_info.get('emails', []))}, "
                         f"phones={len(contact_info.get('phones', []))}, "
                         f"websites={len(contact_info.get('websites', []))}, "
-                        f"profiles={len(contact_info.get('profiles', []))}"
+                        f"profiles={len(contact_info.get('profiles', []))}, "
+                        f"usernames={len(contact_info.get('username_candidates', []))}"
                     )
                 except Exception as e:
                     print(f"Warning: Failed to capture contact overlay ({str(e)})")
@@ -576,7 +741,15 @@ def download_linkedin_html(profile_url, output_dir):
             if contact_json_filename:
                 print(f"  - {contact_json_filename.name}")
 
-            return True
+            return {
+                "profile_url": profile_url,
+                "output_dir": str(output_path.absolute()),
+                "profile_html": str(profile_filename),
+                "activity_html": str(activity_filename),
+                "contact_html": str(contact_filename) if contact_filename else "",
+                "contact_json": str(contact_json_filename) if contact_json_filename else "",
+                "contact_info": contact_info,
+            }
 
     finally:
         print("\nClosing Browserbase session...")
@@ -618,9 +791,9 @@ def main():
 
     profile_url = normalize_linkedin_url(args.profile)
     
-    success = download_linkedin_html(profile_url, args.output_dir)
-    
-    if not success:
+    result = download_linkedin_html(profile_url, args.output_dir)
+
+    if not result:
         sys.exit(1)
 
 

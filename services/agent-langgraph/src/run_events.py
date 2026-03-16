@@ -23,12 +23,17 @@ def _load_env() -> None:
 def emit_run_event(run_id: str, event_type: str, payload: Dict[str, Any]) -> None:
     _load_env()
     dsn = os.getenv("DATABASE_URL", "postgresql://osint:osint@postgres:5432/osint")
-    with psycopg.connect(dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO run_events(run_id, type, ts, payload) VALUES (%s, %s, now(), %s::jsonb)",
-                (run_id, event_type, Jsonb(payload)),
-            )
-    if event_type not in {"RUN_HEARTBEAT", "RUN_STALLED"}:
-        notify_progress(event_type)
-    logger.info("Run event emitted", extra={"run_id": run_id, "type": event_type})
+    try:
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO run_events(run_id, type, ts, payload) VALUES (%s, %s, now(), %s::jsonb)",
+                    (run_id, event_type, Jsonb(payload)),
+                )
+    except Exception:
+        logger.exception("Run event emission failed", extra={"run_id": run_id, "type": event_type})
+    else:
+        logger.info("Run event emitted", extra={"run_id": run_id, "type": event_type})
+    finally:
+        if event_type not in {"RUN_HEARTBEAT", "RUN_STALLED"}:
+            notify_progress(event_type)

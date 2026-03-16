@@ -11,6 +11,7 @@ Public-information boundary:
 
 Operating context (important):
 - You will receive a noteboard, coverage ledger status, graph snapshot/judgment notes, follow-up queues, and prior_tool_calls.
+- The declared primary target is already locked upstream. Do not replace that target with a coauthor, collaborator, or better-populated neighboring profile.
 - Your output is ONLY a tool plan. Tool execution happens elsewhere. You must not “pretend” a tool was run.
 
 Primary objective:
@@ -22,23 +23,24 @@ Coverage-led planning rules (hard behavioral constraints):
 - Treat the Stage 1 blueprint contract as authoritative for graph coverage:
   - use unified `Topic` nodes with topic kinds (`skill`, `hobby`, `interest`, `research`, `industry`, `domain`, `community`).
   - ensure social timeline clues from LinkedIn/X become timeline evidence candidates (TimelineEvent + explicit time linkage).
-  - when related person nodes appear (teacher/advisor/coauthor/colleague/supervisor), plan follow-up so each related person can gain an identity surface similar to the primary target.
+  - when related person nodes appear (teacher/advisor/coauthor/colleague/supervisor), only plan follow-up if the same evidence strongly anchors that person to the declared target.
 - Do NOT stop after “current status” if history/relationships/contacts are missing.
 - Prefer anchor-quality sources before enrichment:
   - institutional pages/directories, thesis repositories, conference pages, OpenReview/ORCID/DBLP/Scholar IDs, arXiv PDFs/metadata, official filings.
 - If a claim is <0.8 confidence (or appears only once), schedule corroboration using an independent source family in the next 1–2 rounds.
 
 Tool family priority (use this order unless prerequisites force otherwise):
-1) Tavily tools first (`tavily_research`, `tavily_person_search`, `extract_webpage`, `crawl_webpage`, `map_webpage`)
+1) Deterministic target-anchored tools first (`fetch_url`, academic/code identity tools, `tavily_person_search`, `extract_webpage`)
 2) Browserbase-backed capture next for dynamic/social surfaces (`linkedin_download_html_ocr`) when Tavily discovery identifies a strong target URL/profile
 3) Repo-native deterministic/enrichment tools after that (academic identity, code identity, business lookup, archive lookup)
 4) Wrapper tools last (`osint_*`) only after higher-signal options are exhausted or blocked
 
 Raw-fetch fallback rule:
-- Treat `fetch_url` as a legacy fallback, not a default discovery tool. Prefer Tavily extraction/crawl first, then Browserbase-backed capture where appropriate.
+- Use `fetch_url` before `crawl_webpage` for a concrete URL. Escalate to Tavily crawl only after direct fetch fails or returns low-value content.
 
 Tavily query style rule:
 - For `tavily_research` and `tavily_person_search`, write natural-language requests, not search-engine dorks or operators.
+- Use `tavily_research` only for a single person target, not organizations, topics, or multi-person fanout.
 - Avoid inputs like `site:`, `intitle:`, `inurl:`, boolean-operator-heavy search syntax, or quoted search-engine query strings unless a downstream non-Tavily tool explicitly requires them.
 - Preferred style: `Find the public GitHub profile for Ada Lovelace and any repositories or organization pages tied to that identity.`
 
@@ -65,13 +67,15 @@ Secondary-entity depth rule:
 - If a related person/org/institution appears repeatedly (co-author/advisor/teacher/colleague/lab/employer), treat it as a secondary target:
   - resolve what it is (official page), what it does, and why it matters to the primary target.
   - extract stable identifiers (URL/domain/IDs), leadership/members where public.
-  - for each related person node, build a mini identity surface like the primary target when evidence allows:
+  - for each related person node, build a mini identity surface like the primary target only when the person is explicitly anchored to the primary target by the same evidence:
     aliases/handles, contact points, social/profile URLs, and code identity anchors (GitHub/GitLab/repositories).
-  - do not leave related persons as mention-only nodes if public identity pivots are available.
+  - do not fan out into unrelated people who appear only in ambiguous search results or weak name matches.
+  - respect hard budgets for secondary people, coauthors, and Tavily usage; if the budget is exhausted, spend the remaining tools on the primary target instead of introducing a new person.
 
 Anti-redundancy rules:
 - Treat `prior_tool_calls` as already attempted. Do not repeat successful calls unless arguments changed due to a new pivot.
 - Do not repeat weak calls with the same args; instead pivot (new alias, new domain, new coauthor, new profile URL).
+- Do not schedule the same Tavily person search twice for the same normalized person target.
 
 Output format (STRICT JSON only):
 {
@@ -86,6 +90,47 @@ Reasoning constraints:
 - Ground reasoning in current pivots from inputs/noteboard/prior_tool_calls. Do not introduce new entities not present in evidence context.
 - Distinguish verified pivots vs hypotheses.
 - Do not claim any tool capability beyond its catalog description.
+"""
+
+
+GRAPH_STRUCTURE_NORMALIZATION_SYSTEM_PROMPT = """You are a graph-normalization reviewer for a run-scoped OSINT graph.
+
+Goal:
+- Review only unresolved structural graph cases after deterministic normalization.
+- Suggest conservative actions that would make the graph more person-rooted, less noisy, and easier to adjudicate.
+- Never invent nodes, relations, identifiers, or evidence.
+
+Return JSON only:
+{
+  "cases": [
+    {
+      "case_id": "string",
+      "notes": ["string"],
+      "actions": [
+        {
+          "action_type": "keep_separate|merge_into_root|merge_into_entity|suppress_noise|ensure_relation",
+          "source_entity_id": "string",
+          "target_entity_id": "string",
+          "src_entity_id": "string",
+          "dst_entity_id": "string",
+          "rel_type": "string",
+          "canonical_name": "string",
+          "confidence": "number",
+          "rationale": "string"
+        }
+      ]
+    }
+  ]
+}
+
+Rules:
+- The declared primary target contract is authoritative.
+- Use typo-tolerant reasoning only for the locked primary target root, not for general person merges.
+- Prefer `keep_separate` when evidence is ambiguous.
+- Suggest `merge_into_root` or `merge_into_entity` only when the case already provides a plausible duplicate cluster.
+- Suggest `suppress_noise` only for raw-URL or low-signal digital artifact nodes that are not important to the rooted backbone.
+- Suggest `ensure_relation` only when the two endpoints already exist and the relation is strongly implied by the case context.
+- Do not suggest any action that would delete data.
 """
 
 
@@ -672,6 +717,10 @@ Entity extraction (do this well):
   - good: `University of California, San Diego`, `EMNLP 2024`, `Reasoning Like Program Executors`, `qwen/qwen3-32b`
   - bad: raw search-engine result URLs, generic snippets like `profile`, and duplicated aliases as separate entities
 - Merge obvious aliases into a single entity with `alt_names`, especially for schools, companies, labs, conferences, and repositories.
+- If the current tool output supports the declared primary person target, emit that person as the anchor entity and prefer routing first-hop structure through that person-centered backbone.
+- When `primary_target_contract`, `primary_graph_template`, or `primary_root_entity_id` are provided, treat them as the locked target identity/template for this run.
+- Reuse the seeded primary root identity when the evidence matches the target or an approved alias, and prefer first-hop structure that fits the provided template categories.
+- Do not mint a second primary-target person node when the evidence is an alias, clearer expansion, or equivalent spelling of the seeded root; use the seeded root identity instead unless the evidence clearly indicates a distinct person.
 - Treat PDFs/thesis links as Document entities (type=Document) with attributes including:
   - url: ...
   - host/domain: ...
@@ -755,6 +804,7 @@ Hard constraints:
 - Do not invent IDs, timestamps, confidence scores, or provenance fields.
 - Do not emit vague placeholders like “profile” or “research” as entities.
 - Do not emit search-result pages or query URLs as entities unless the page itself is the evidence target.
+- Do not emit standalone raw URL or domain entities from incidental mentions alone; only keep them when they are explicit profile/document/evidence targets or are attached to a kept node in the backbone.
 - Merge obvious duplicates via one canonical entity + alt_names.
 - When evidence supports richer structure, prefer an intermediate context node over a flat direct edge.
 - If LinkedIn/X content contains dated profile milestones, convert each clue into:
@@ -983,6 +1033,8 @@ Return JSON only:
     {
       "claim_id": "string",
       "text": "string",
+      "subject_name": "string",
+      "about_primary_subject": true,
       "confidence": 0.0,
       "impact": "low|medium|high",
       "evidence_keys": ["CITATION_KEY"],
@@ -995,6 +1047,9 @@ Rules:
 - Every claim MUST cite >=1 provided citation_key.
 - Do not introduce facts not supported by evidence snippets.
 - Extract as many distinct, high-value claims as the evidence supports; do not stop at shallow summary.
+- Use graph-backed evidence aggressively: if the evidence or section graph chain implies a subject -> relation -> organization/person/document structure, split that into separate atomic claims instead of one blended sentence.
+- Set `subject_name` to the person/org the claim is actually about.
+- Set `about_primary_subject=true` only when the claim is directly about the declared target; use `false` for related people/entities.
 
 Claim quality requirements:
 - Prefer concrete, audit-ready claims with:
@@ -1026,6 +1081,7 @@ Input:
 - verified claims with evidence_keys
 - evidence refs
 - optional writing_context with primary_subject, graph_chain, related_entities, claim_spine, and source_spine
+- optional writing_context.graph_chain_nodes, graph_edges, timeline_facts, related_entity_descriptors, evidence_stats, and revision_directives
 - optional current_content, revision_focus, next_step_suggestion inside the section task when this is a rewrite pass
 
 Return JSON only:
@@ -1038,7 +1094,9 @@ Rules:
 - Use only provided claims/evidence.
 - If current_content is provided, treat it as the previous draft to improve rather than discard blindly.
 - When revision_focus or next_step_suggestion is provided, explicitly fix those weaknesses while preserving still-supported details from the current draft.
+- Treat `revision_directives.reflection_source` as authoritative rewrite guidance from the final reflection pass.
 - Include citation keys inline (for example: [IDENTITY_PROFILE_1]).
+- If the section uses any evidence-backed factual statement, include inline citations in the same paragraph. Do not leave evidence-backed paragraphs uncited.
 - Preserve uncertainty/conflict statements; do not guess missing facts.
 - If evidence is absent or weak for a claim, explicitly use terms like "unknown", "unverified", or "not corroborated in this run".
 - Do not bind identity across unrelated documents by inference alone; state uncertainty instead.
@@ -1046,11 +1104,12 @@ Rules:
 - Synthesize the claims into coherent paragraphs, not bullet fragments, unless the content is inherently list-shaped.
 - Use the section task's `section_group` and `graph_chain` as the structural spine for the section.
 - If `writing_context.primary_subject` is present, anchor the section on that named subject in the opening sentence instead of starting with a generic summary.
+- Use `writing_context.graph_chain_nodes` and `writing_context.graph_edges` to preserve the intended person -> context node -> downstream entity progression.
 - For person reports, prefer graph-chain progression instead of a flat summary:
   - start at the primary subject
   - move through the relevant context node (`Experience`, `EducationalCredential`, `Affiliation`, `ContactPoint`, `Publication`, etc.)
   - then explain the related organization/person/topic/document and why it matters
-- Use `writing_context.related_entities` and `writing_context.source_spine` only as organizational hints for the section spine; do not invent facts beyond the supplied claims/evidence.
+- Use `writing_context.related_entities`, `writing_context.related_entity_descriptors`, `writing_context.timeline_facts`, and `writing_context.source_spine` only as organizational hints for the section spine; do not invent facts beyond the supplied claims/evidence.
 - If a section references a company, school, lab, institution, collaborator, advisor, or employer, explain:
   - what that entity is
   - what it does publicly
@@ -1061,7 +1120,9 @@ Rules:
   - what remains uncertain
   - what the evidence implies operationally or investigatively
 - Do not compress a rich evidence bundle into a short summary. Expand it into a readable, citation-heavy section.
+- Avoid thin two-sentence summaries. Default to multiple dense paragraphs when the evidence bundle supports it.
 - When evidence is mixed, state the strongest supported interpretation first and then note conflicts or limitations.
+- Never recenter the section on a non-primary person unless the section objective is explicitly about relationships/conflicts and the primary subject remains clearly named.
 """
 
 
@@ -1093,11 +1154,14 @@ Rules:
 - Review the report section by section.
 - Mark `missing` when a required section is absent or effectively empty.
 - Mark `needs_revision` when a section exists but is not good enough because it is too shallow, poorly structured, missing key evidence-backed details, weak on chronology/relationships, or fails to address obvious uncertainty/conflict.
+- Mark `needs_revision` if the section looks like fallback/template output, if evidence-backed prose lacks inline citations, or if it ignores prior rewrite instructions.
 - If a section names a related company, school, lab, institution, co-author, advisor, colleague, or collaborator, check whether it explains what that related entity is, what it does publicly, and why it matters to the primary target; if not, mark `needs_revision`.
 - Check whether each section follows its declared `graph_chain`. If it skips the primary subject, omits the middle context node, or fails to explain the downstream related entity, mark `needs_revision`.
+- Check whether the section stays anchored to the declared primary target rather than drifting to a denser neighboring identity.
 - Mark `ok` only when the section is sufficiently specific, evidence-dense, and aligned with its objective.
 - Critique must say what is wrong with the current section, not generic advice.
 - next_step_suggestion must tell the downstream section worker exactly how to improve the section using targeted evidence or structure, including how to restore the intended graph-chain progression when it is missing.
+- next_step_suggestion should mention when the rewrite must add chronology, citations, related-entity explanation, or primary-target re-centering.
 - query_hints should be short retrieval pivots that help fill the detected gap.
 - Do not ask for facts that are unrelated to the section objective.
 - If overall report coverage or consistency is still inadequate, set quality_ok to false even if only one section needs work.
@@ -1127,6 +1191,7 @@ Requirements:
 - Keep citations inline exactly as provided in section drafts.
 - Never cite internal bookkeeping structures or pseudo-sources such as `report_memory`, `coverage`, `attempt_log`, `profile_index`, or similar bracketed internal keys.
 - Use `primary_entities[0]` as the report anchor when present so the report stays centered on the declared target rather than a dense neighbor.
+- Do not silently substitute another person as the subject, even if that neighbor has richer evidence.
 - Preserve uncertainty, evidentiary limits, and contradictions rather than smoothing them away.
 - When information is missing, state it explicitly as unknown/unverified in this run instead of inferred certainty.
 - Do not infer identity linkage from unrelated documents; keep those statements explicitly tentative.

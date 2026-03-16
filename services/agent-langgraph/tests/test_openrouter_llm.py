@@ -11,6 +11,7 @@ from openrouter_llm import OpenRouterLLM
 class _FakeResponse:
     def __init__(self, payload: dict) -> None:
         self._payload = payload
+        self.text = ""
 
     def raise_for_status(self) -> None:
         return None
@@ -78,3 +79,42 @@ def test_plan_tools_uses_env_configured_timeout(monkeypatch) -> None:
     llm.plan_tools("prompt", ["Ada"], [])
 
     assert captured["timeout"] == (10.0, 150.0)
+
+
+def test_complete_json_reports_progress_while_waiting(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    stages: list[str] = []
+
+    def _slow_post(*_, **__) -> _FakeResponse:
+        time.sleep(0.05)
+        return _FakeResponse({"choices": [{"message": {"content": "{\"ok\": true}"}}]})
+
+    monkeypatch.setattr("openrouter_llm.requests.post", _slow_post)
+    monkeypatch.setattr("openrouter_llm.progress_keepalive_seconds", lambda: 0.01)
+    monkeypatch.setattr("openrouter_llm.notify_progress", stages.append)
+
+    llm = OpenRouterLLM()
+    parsed = llm.complete_json("system", {"prompt": "test"}, timeout=0.2, operation="test.keepalive")
+
+    assert parsed == {"ok": True}
+    assert "LLM_CALL_WAIT:test.keepalive" in stages
+
+
+def test_complete_json_surfaces_http_response_body(monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    class _BadResponse(_FakeResponse):
+        def __init__(self) -> None:
+            super().__init__({})
+            self.text = "{\"error\":\"provider rejected payload\"}"
+
+        def raise_for_status(self) -> None:
+            raise requests.HTTPError("400 Client Error: Bad Request for url")
+
+    monkeypatch.setattr("openrouter_llm.requests.post", lambda *_, **__: _BadResponse())
+
+    llm = OpenRouterLLM()
+    with pytest.raises(requests.HTTPError) as excinfo:
+        llm.complete_json("system", {"prompt": "test"}, timeout=1)
+
+    assert "provider rejected payload" in str(excinfo.value)

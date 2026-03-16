@@ -22,6 +22,7 @@ from report_models import (
     EvidenceRefModel,
     NotFoundReasonModel,
     ProfileIndexItemModel,
+    PrimaryTargetContractModel,
     PublicationInventoryItemModel,
     ResearchThemeModel,
     ReportMemoryModel,
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 from openrouter_llm import get_openrouter_timeout, invoke_complete_json
 
 logger = get_logger(__name__)
+PRIMARY_TARGET_ANCHOR_NOTE_REGEX = re.compile(r"primary target anchor:\s*(.+?)(?:[\.\n]|$)", re.IGNORECASE)
 REPORT_RELATED_PERSON_REJECT_TOKENS = {
     "none",
     "null",
@@ -422,25 +424,64 @@ def _primary_identity_candidates_from_receipts(receipts: List[ToolReceipt], prom
     ]
 
 
+def _primary_anchor_candidates_from_noteboard(noteboard: List[str]) -> List[str]:
+    candidates: List[str] = []
+    for note in noteboard:
+        if not isinstance(note, str) or not note.strip():
+            continue
+        match = PRIMARY_TARGET_ANCHOR_NOTE_REGEX.search(note)
+        if not match:
+            continue
+        candidates.extend(extract_person_targets(match.group(1)))
+    return dedupe_str_list(candidates)
+
+
+def _normalize_primary_prompt_candidates(candidates: List[str]) -> List[str]:
+    normalized: List[str] = []
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        text = re.sub(r"^(?:on|for|about)\s+", "", text, flags=re.IGNORECASE)
+        if text:
+            normalized.append(text)
+    return dedupe_str_list(normalized)
+
+
 def pick_primary_entities(
     mcp_client: McpClientProtocol,
     run_id: str,
     prompt: str,
     noteboard: List[str],
     receipts: List[ToolReceipt],
+    primary_target_contract: PrimaryTargetContractModel | None = None,
 ) -> List[str]:
-    prompt_candidates = dedupe_str_list(
-        extract_person_targets(prompt)
-        + [item for note in noteboard for item in extract_person_targets(note)]
+    if primary_target_contract is not None:
+        contract_entities = dedupe_str_list(
+            [
+                primary_target_contract.canonical_name,
+                *primary_target_contract.prompt_targets,
+                *primary_target_contract.approved_aliases,
+            ]
+        )
+        if contract_entities:
+            return contract_entities[:4]
+    anchor_candidates = _primary_anchor_candidates_from_noteboard(noteboard)
+    prompt_candidates = _normalize_primary_prompt_candidates(
+        dedupe_str_list(extract_person_targets(prompt) + anchor_candidates)
     )
+    if not prompt_candidates:
+        prompt_candidates = _normalize_primary_prompt_candidates(
+            dedupe_str_list(
+                extract_person_targets(prompt)
+                + [item for note in noteboard for item in extract_person_targets(note)]
+            )
+        )
     receipt_candidates = _primary_identity_candidates_from_receipts(receipts, prompt_candidates)
     if not _env_flag("STAGE2_ENABLE_GRAPH_ENTITY_SEARCH", False):
         # Keep the default path cheap: use extracted hints directly instead of fuzzy graph scans.
         direct_candidates = dedupe_str_list(
-            receipt_candidates
-            + prompt_candidates
-            + extract_entity_hints_from_text(prompt)
-            + [item for note in noteboard for item in (extract_person_targets(note) + extract_entity_hints_from_text(note))]
+            receipt_candidates + prompt_candidates + extract_entity_hints_from_text(prompt)
         )
         return direct_candidates[:4]
 
@@ -457,9 +498,6 @@ def pick_primary_entities(
 
     candidates.extend(prompt_candidates)
     candidates.extend(extract_entity_hints_from_text(prompt))
-    for note in noteboard:
-        candidates.extend(extract_person_targets(note))
-        candidates.extend(extract_entity_hints_from_text(note))
     candidates = dedupe_str_list(candidates)[:6]
 
     stable_ids: List[str] = []
@@ -513,8 +551,17 @@ def graph_context_signals(
 
 def build_section_queries(task: SectionTaskModel, llm3: OpenRouterLLM | None, run_id: str | None = None) -> List[str]:
     base_queries = dedupe_str_list(
-        [task.title, task.objective, task.section_group, task.revision_focus, task.next_step_suggestion, " -> ".join(task.graph_chain)]
+        [
+            task.title,
+            task.objective,
+            task.section_group,
+            task.revision_focus,
+            task.next_step_suggestion,
+            " -> ".join(task.graph_chain),
+            task.reflection_source,
+        ]
         + task.query_hints
+        + task.revision_query_hints
         + task.entity_ids
         + task.graph_chain
     )
@@ -684,6 +731,276 @@ def _tokenize_relevance_terms(text: str) -> List[str]:
     return [token for token in tokens if token not in stopwords and len(token) >= 3]
 
 
+def _primary_target_aliases(entity_ids: List[str]) -> List[str]:
+    aliases: List[str] = []
+    for entity_id in entity_ids:
+        cleaned = str(entity_id or "").strip()
+        if not cleaned:
+            continue
+        aliases.append(cleaned)
+        aliases.extend(extract_person_targets(cleaned))
+    return dedupe_str_list([item for item in aliases if item.strip()])
+
+
+def is_conflict_or_methodology_section(task: SectionTaskModel | None) -> bool:
+    if task is None:
+        return False
+    section_id = str(task.section_id or "").strip().casefold()
+    if section_id in {"conflict_resolution", "methodological_limits"}:
+        return True
+    blob = " ".join(
+        [
+            task.section_id,
+            task.section_group,
+            task.title,
+            task.objective,
+        ]
+    ).casefold()
+    return "methodolog" in blob or "conflict" in blob or "contradict" in blob
+
+
+def section_allows_related_subjects(task: SectionTaskModel | None) -> bool:
+    if is_conflict_or_methodology_section(task):
+        return True
+    if task is None:
+        return False
+    section_id = str(task.section_id or "").strip().casefold()
+    if section_id in {"relationships_and_associates", "collaboration_clusters"}:
+        return True
+    blob = " ".join(
+        [
+            task.section_id,
+            task.section_group,
+            task.title,
+            task.objective,
+            " ".join(task.graph_chain),
+        ]
+    ).casefold()
+    return any(
+        token in blob
+        for token in (
+            "relationship",
+            "associate",
+            "collaboration",
+            "coauthor",
+            "advisor",
+            "mentor",
+            "colleague",
+            "network",
+            "cluster",
+        )
+    )
+
+
+def _text_mentions_primary_targets(text: str, primary_targets: List[str]) -> bool:
+    if not text or not primary_targets:
+        return False
+    normalized_text = f" {_name_signature(text)} "
+    for alias in _primary_target_aliases(primary_targets):
+        signature = _name_signature(alias)
+        if signature and f" {signature} " in normalized_text:
+            return True
+    return False
+
+
+def _person_name_candidates_from_text(text: str) -> List[str]:
+    raw_candidates = [candidate for candidate in extract_person_targets(text or "") if candidate.strip()]
+    raw_candidates.extend(re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", text or ""))
+    reject_tokens = {
+        "identity",
+        "notes",
+        "profile",
+        "report",
+        "section",
+        "methodological",
+        "limits",
+    }
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for candidate in raw_candidates:
+        signature = _name_signature(candidate)
+        tokens = signature.split()
+        if len(tokens) < 2 or len(tokens) > 4:
+            continue
+        if any(token in reject_tokens for token in tokens):
+            continue
+        if signature in seen:
+            continue
+        seen.add(signature)
+        candidates.append(candidate.strip())
+    return candidates
+
+
+def _first_non_primary_name(text: str, primary_targets: List[str]) -> str | None:
+    for candidate in _person_name_candidates_from_text(text):
+        if not _candidate_matches_primary_targets(candidate, primary_targets):
+            return candidate
+    return None
+
+
+def _dominant_non_primary_name(text: str, primary_targets: List[str]) -> str | None:
+    candidates = _person_name_candidates_from_text(text)
+    if not candidates:
+        return None
+    counts: Dict[str, int] = {}
+    display: Dict[str, str] = {}
+    primary_mentions = 0
+    for candidate in candidates:
+        if _candidate_matches_primary_targets(candidate, primary_targets):
+            primary_mentions += 1
+            continue
+        signature = _name_signature(candidate)
+        if not signature:
+            continue
+        counts[signature] = counts.get(signature, 0) + 1
+        display.setdefault(signature, candidate)
+    if not counts:
+        return None
+    dominant_signature, dominant_count = max(counts.items(), key=lambda item: (item[1], item[0]))
+    if dominant_count >= max(2, primary_mentions + 1):
+        return display[dominant_signature]
+    heading_parts = re.split(r"\n##\s+", text or "", maxsplit=2)
+    if len(heading_parts) >= 2:
+        opening_excerpt = f"{heading_parts[0]}\n## {heading_parts[1]}"[:220]
+    else:
+        opening_excerpt = (text or "")[:180]
+    opening_non_primary = _first_non_primary_name(opening_excerpt, primary_targets)
+    if opening_non_primary and not _text_mentions_primary_targets(opening_excerpt, primary_targets):
+        return opening_non_primary
+    return None
+
+
+def detect_section_anchor_drift(
+    task: SectionTaskModel,
+    draft_text: str,
+    claims: List[ClaimModel],
+    primary_entities: List[str],
+) -> str | None:
+    if section_allows_related_subjects(task) or not primary_entities:
+        return None
+    opening_excerpt = (draft_text or "")[:180]
+    opening_non_primary = _first_non_primary_name(opening_excerpt, primary_entities[:1])
+    if opening_non_primary and not _text_mentions_primary_targets(opening_excerpt, primary_entities[:1]):
+        return opening_non_primary
+
+    primary_claims = 0
+    non_primary_claim_counts: Dict[str, int] = {}
+    non_primary_subjects: Dict[str, str] = {}
+    for claim in claims:
+        subject_name = str(claim.subject_name or claim.subject_entity_id or "").strip()
+        if claim.about_primary_subject is True or (
+            subject_name and _candidate_matches_primary_targets(subject_name, primary_entities[:1])
+        ):
+            primary_claims += 1
+            continue
+        if not subject_name:
+            continue
+        signature = _name_signature(subject_name)
+        if not signature:
+            continue
+        non_primary_claim_counts[signature] = non_primary_claim_counts.get(signature, 0) + 1
+        non_primary_subjects.setdefault(signature, subject_name)
+    if non_primary_claim_counts:
+        dominant_signature, dominant_count = max(
+            non_primary_claim_counts.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        if dominant_count >= max(1, primary_claims + 1):
+            return non_primary_subjects[dominant_signature]
+    return _dominant_non_primary_name(draft_text, primary_entities[:1])
+
+
+def final_report_has_anchor_drift(report_text: str, primary_entities: List[str]) -> bool:
+    if not primary_entities:
+        return False
+    opening = (report_text or "")[:1200]
+    return _dominant_non_primary_name(opening, primary_entities[:1]) is not None
+
+
+def _flatten_row_text(value: Any) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        fragments: List[str] = []
+        for item in value[:20]:
+            fragments.extend(_flatten_row_text(item))
+        return fragments
+    if isinstance(value, dict):
+        fragments: List[str] = []
+        for item in list(value.values())[:20]:
+            fragments.extend(_flatten_row_text(item))
+        return fragments
+    return []
+
+
+def _row_target_match_details(
+    section_context: SectionTaskModel | None,
+    row: Dict[str, Any],
+) -> Dict[str, Any]:
+    if section_context is None:
+        return {
+            "score": 1.0,
+            "primary_match": True,
+            "related_match": False,
+            "explicit_relation": False,
+        }
+    primary_entities = list(section_context.entity_ids[:1])
+    related_entities = list(section_context.entity_ids[1:])
+    primary_aliases = _primary_target_aliases(primary_entities)
+    related_aliases = _primary_target_aliases(related_entities)
+    graph_ref = pick_dict(row, ["graph_ref"])
+    blob = " ".join(
+        _flatten_row_text(
+            {
+                "snippet": row.get("snippet") or row.get("text"),
+                "title": row.get("title") or row.get("document_title") or row.get("page_title"),
+                "source_url": row.get("sourceUrl") or row.get("source_url") or row.get("url"),
+                "metadata": pick_dict(row, ["metadata", "payload"]),
+                "graph_ref": graph_ref,
+            }
+        )
+    )
+    graph_ids = {
+        str(item).strip()
+        for item in [
+            row.get("graph_entity_id"),
+            graph_ref.get("entityId"),
+            graph_ref.get("entity_id"),
+            graph_ref.get("srcId"),
+            graph_ref.get("src_id"),
+            graph_ref.get("dstId"),
+            graph_ref.get("dst_id"),
+        ]
+        if str(item or "").strip()
+    }
+    primary_match = bool(primary_entities and any(entity_id in graph_ids for entity_id in primary_entities))
+    if not primary_match:
+        primary_match = _text_mentions_primary_targets(blob, primary_aliases)
+    related_match = False
+    if section_allows_related_subjects(section_context):
+        related_match = bool(related_entities and any(entity_id in graph_ids for entity_id in related_entities))
+        if not related_match and related_aliases:
+            related_match = _text_mentions_primary_targets(blob, related_aliases)
+    explicit_relation = bool(
+        re.search(
+            r"\b(coauthor|advisor|mentor|colleague|associate|collaborat|relationship|affiliat|publication|paper|lab|team|works at|studied at)\b",
+            blob,
+            re.IGNORECASE,
+        )
+    )
+    score = 0.0
+    if primary_match:
+        score += 1.2
+    if related_match and explicit_relation:
+        score += 0.7
+    return {
+        "score": score,
+        "primary_match": primary_match,
+        "related_match": related_match,
+        "explicit_relation": explicit_relation,
+    }
+
+
 def _evidence_relevance_score(
     section_context: SectionTaskModel | None,
     snippet: str,
@@ -729,13 +1046,18 @@ def pack_evidence(
     k: int,
     section_context: SectionTaskModel | None = None,
 ) -> List[EvidenceRefModel]:
-    sorted_rows = sorted(
-        [row for row in rows if _row_has_database_evidence(row)],
-        key=lambda item: float(item.get("score", 0.0) or 0.0),
+    scored_rows = []
+    for row in [item for item in rows if _row_has_database_evidence(item)]:
+        scored_rows.append((row, _row_target_match_details(section_context, row)))
+    scored_rows.sort(
+        key=lambda item: (
+            float(item[1]["score"]),
+            float(item[0].get("score", 0.0) or 0.0),
+        ),
         reverse=True,
-    )[:k]
+    )
     packed: List[EvidenceRefModel] = []
-    for idx, row in enumerate(sorted_rows, start=1):
+    for row, target_match in scored_rows:
         source_url = pick_str(row, ["sourceUrl", "source_url", "url"])
         metadata = pick_dict(row, ["metadata", "payload"])
         if not source_url and metadata:
@@ -762,16 +1084,24 @@ def pack_evidence(
                 source_url,
                 pick_str(row, ["title", "document_title", "page_title"]),
             )
-            if relevance_score < 0.06:
+            if is_conflict_or_methodology_section(section_context):
+                pass
+            elif section_allows_related_subjects(section_context):
+                if float(target_match["score"]) <= 0.0:
+                    continue
+            elif not bool(target_match["primary_match"]):
+                continue
+            if relevance_score < 0.06 and float(target_match["score"]) < 1.0:
                 continue
         else:
             relevance_score = 1.0
         if not source_url and not document_id and not object_ref and not graph_ref:
             # Do not cite tool receipts or internal artifacts as evidence.
             continue
+        citation_index = len(packed) + 1
         packed.append(
             EvidenceRefModel(
-                citation_key=f"{section_id.upper()}_{idx}",
+                citation_key=f"{section_id.upper()}_{citation_index}",
                 section_id=section_id,
                 document_id=document_id,
                 snippet=snippet,
@@ -789,11 +1119,14 @@ def pack_evidence(
                 evidence_object_key=evidence_object_key,
                 source_type=_infer_source_type(row),
                 score=float(row.get("score", 0.0) or 0.0),
+                target_match_score=float(target_match["score"]),
                 db_source=pick_str(row, ["db_source"]) or ("graph" if row.get("graph_entity_id") or row.get("graph_ref") else "vector"),
                 object_ref=object_ref,
                 graph_ref=graph_ref,
             )
         )
+        if len(packed) >= k:
+            break
     return packed
 
 
@@ -806,6 +1139,8 @@ def fallback_claims(task: SectionTaskModel, evidence: List[EvidenceRefModel]) ->
                 section_id=task.section_id,
                 text=f"Observed signal in {task.title}: {item.snippet[:200]}",
                 subject_entity_id=(task.entity_ids[0] if task.entity_ids else None),
+                subject_name=(task.entity_ids[0] if task.entity_ids else None),
+                about_primary_subject=True,
                 predicate=_default_predicate_for_section(task.section_id),
                 object=item.snippet[:200],
                 confidence=0.5,
@@ -837,13 +1172,59 @@ def _build_section_writing_context(
     source_spine = dedupe_str_list(
         [item.source_url or item.domain or item.title or "" for item in evidence[:5] if (item.source_url or item.domain or item.title)]
     )[:5]
+    graph_chain_nodes = [{"position": index + 1, "label": label} for index, label in enumerate(task.graph_chain)]
+    graph_edges: List[Dict[str, Any]] = []
+    for index in range(len(task.graph_chain) - 1):
+        graph_edges.append({"src": task.graph_chain[index], "dst": task.graph_chain[index + 1]})
+    timeline_facts = dedupe_str_list(
+        [
+            claim.text.strip()
+            for claim in claims
+            if claim.text.strip() and re.search(r"\b(?:19|20)\d{2}\b", claim.text)
+        ]
+        + [
+            item.snippet.strip()
+            for item in evidence
+            if item.snippet.strip() and re.search(r"\b(?:19|20)\d{2}\b", item.snippet)
+        ]
+    )[:6]
+    related_entity_descriptors = [
+        {
+            "title": item.title or "",
+            "domain": item.domain or "",
+            "source_url": item.source_url or "",
+            "graph_labels": list(item.graph_ref.get("labels", [])) if isinstance(item.graph_ref, dict) else [],
+            "relationship_types": list(item.graph_ref.get("relTypes", [])) if isinstance(item.graph_ref, dict) else [],
+        }
+        for item in evidence[:6]
+        if (item.title or item.domain or item.source_url)
+    ]
+    inline_citation_count = len(re.findall(r"\[[A-Z0-9_]+\]", " ".join(claim_spine)))
+    graph_evidence_count = len([item for item in evidence if isinstance(item.graph_ref, dict) and item.graph_ref])
     return {
         "primary_subject": primary_subject,
         "section_group": task.section_group,
         "graph_chain": list(task.graph_chain),
+        "graph_chain_nodes": graph_chain_nodes,
+        "graph_edges": graph_edges,
         "related_entities": related_entities,
+        "related_entity_descriptors": related_entity_descriptors,
         "claim_spine": claim_spine,
         "source_spine": source_spine,
+        "timeline_facts": timeline_facts,
+        "evidence_stats": {
+            "claim_count": len(claims),
+            "evidence_count": len(evidence),
+            "graph_evidence_count": graph_evidence_count,
+            "timeline_fact_count": len(timeline_facts),
+            "inline_citation_count": inline_citation_count,
+        },
+        "revision_directives": {
+            "reflection_source": task.reflection_source,
+            "revision_focus": task.revision_focus,
+            "next_step_suggestion": task.next_step_suggestion,
+            "revision_query_hints": list(task.revision_query_hints),
+        },
     }
 
 
@@ -941,6 +1322,7 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
             question=state.get("prompt", ""),
             report_type=state.get("report_type", "person"),
             primary_entities=state.get("primary_entities", []),
+            primary_target_contract=state.get("primary_target_contract"),
             noteboard=state.get("noteboard", []),
             stage1_receipts=state.get("stage1_receipts", []),
             claims=state.get("claim_ledger", []),
@@ -983,6 +1365,10 @@ def assemble_final_report(state: ReportState, llm3: OpenRouterLLM | None) -> str
             if (
                 _looks_like_benchmark_report(assembled)
                 and not _contains_internal_report_refs(assembled)
+                and not final_report_has_anchor_drift(
+                    assembled,
+                    list(state.get("primary_entities", [])),
+                )
                 and (len(assembled) >= 200 or len(drafts) <= 2)
             ):
                 return assembled
@@ -1011,6 +1397,7 @@ def build_report_memory(
     question: str,
     report_type: str,
     primary_entities: List[str],
+    primary_target_contract: PrimaryTargetContractModel | None,
     noteboard: List[str],
     stage1_receipts: List[ToolReceipt],
     claims: List[ClaimModel],
@@ -1018,6 +1405,11 @@ def build_report_memory(
     section_issues: List[str],
     section_drafts: List[SectionDraftModel],
     latest_observation: str,
+    consistency_issues: List[ConsistencyIssueModel] | None = None,
+    limit_notes: List[str] | None = None,
+    stage1_conflict_cases: List[Any] | None = None,
+    stage1_resolved_conflicts: List[Any] | None = None,
+    stage1_unresolved_conflicts: List[Any] | None = None,
 ) -> ReportMemoryModel:
     structured = _derive_structured_outputs(
         report_type=report_type,
@@ -1030,16 +1422,19 @@ def build_report_memory(
     )
     entities = _build_entities(report_type, primary_entities, claims, evidence)
     coverage = build_coverage_ledger(report_type, claims, evidence, section_drafts, section_issues, structured)
-    consistency_issues = run_consistency_validator(section_drafts, claims, evidence)
-    limits = build_limits(section_issues, coverage, consistency_issues, structured["not_found_reasons"])
-    open_questions = build_open_questions(coverage, consistency_issues)
+    resolved_consistency_issues = consistency_issues or run_consistency_validator(section_drafts, claims, evidence)
+    limits = dedupe_str_list(
+        build_limits(section_issues, coverage, resolved_consistency_issues, structured["not_found_reasons"])
+        + list(limit_notes or [])
+    )
+    open_questions = build_open_questions(coverage, resolved_consistency_issues)
     return ReportMemoryModel(
         question=question,
         entities=entities,
         claims=dedupe_claims([claim for claim in claims if claim.evidence_keys]),
         evidence=dedupe_evidence(evidence),
         coverage=coverage,
-        consistency_issues=consistency_issues,
+        consistency_issues=resolved_consistency_issues,
         open_questions=open_questions,
         limits=limits,
         latest_observation=latest_observation[:500],
@@ -1057,6 +1452,10 @@ def build_report_memory(
         coauthor_clusters=structured["coauthor_clusters"],
         profile_index=structured["profile_index"],
         doc_deep_dives=structured["doc_deep_dives"],
+        primary_target_contract=primary_target_contract or PrimaryTargetContractModel(),
+        stage1_conflict_cases=list(stage1_conflict_cases or []),
+        stage1_resolved_conflicts=list(stage1_resolved_conflicts or []),
+        stage1_unresolved_conflicts=list(stage1_unresolved_conflicts or []),
     )
 
 

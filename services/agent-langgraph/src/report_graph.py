@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from typing import Any, Dict, List
@@ -20,6 +21,7 @@ from report_helpers import (
     build_section_queries,
     contradiction_query_hints,
     coverage_is_complete,
+    detect_section_anchor_drift,
     dedupe_claims,
     dedupe_evidence,
     dedupe_str_list,
@@ -29,32 +31,38 @@ from report_helpers import (
     fallback_claims,
     graph_context_signals,
     graph_multi_entity_query,
+    is_conflict_or_methodology_section,
     latest_draft_per_section,
     needs_conflict_resolution,
     needs_timeline_normalization,
     pack_evidence,
     pick_primary_entities,
     run_consistency_validator,
+    section_allows_related_subjects,
     vector_multi_query,
 )
 from report_models import (
     ClaimModel,
     ConsistencyIssueModel,
     EvidenceRefModel,
+    PrimaryTargetContractModel,
     ReportResult,
     ReportState,
     SectionDraftModel,
     SectionReflectionModel,
     SectionTaskModel,
+    Stage2ModelConfig,
     make_initial_report_state,
 )
 from report_store import persist_report_snapshot
+from run_store import ensure_run_exists, load_primary_target_contract
 from run_events import emit_run_event
 from system_prompts import (
     REPORT_OUTLINE_SYSTEM_PROMPT,
     REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
     REPORT_SECTION_REFLECTION_SYSTEM_PROMPT,
 )
+from target_normalization import extract_person_targets
 from tool_worker_graph import ToolReceipt
 
 logger = get_logger(__name__)
@@ -87,6 +95,179 @@ def _stage2_worker_timeout() -> float:
     )
 
 
+def _env_text(name: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if isinstance(value, str) and value.strip() else ""
+
+
+def _resolve_stage2_model_config(
+    stage2_model_config: Stage2ModelConfig | None,
+) -> Stage2ModelConfig:
+    explicit = stage2_model_config or Stage2ModelConfig()
+    report_model = (
+        explicit.final_report_model
+        or _env_text("OPENROUTER_REPORT_MODEL")
+        or _env_text("OPENROUTER_PLANNER_MODEL")
+        or _env_text("OPENROUTER_MODEL")
+    )
+    worker_model = (
+        explicit.section_draft_model
+        or _env_text("OPENROUTER_REPORT_WORKER_MODEL")
+        or _env_text("OPENROUTER_WORKER_MODEL")
+        or report_model
+    )
+    return Stage2ModelConfig(
+        outline_model=explicit.outline_model or _env_text("OPENROUTER_REPORT_OUTLINE_MODEL") or report_model,
+        section_query_model=explicit.section_query_model or _env_text("OPENROUTER_REPORT_SECTION_QUERY_MODEL") or worker_model,
+        section_claim_model=explicit.section_claim_model or _env_text("OPENROUTER_REPORT_SECTION_CLAIM_MODEL") or worker_model,
+        section_draft_model=explicit.section_draft_model or _env_text("OPENROUTER_REPORT_SECTION_DRAFT_MODEL") or worker_model,
+        final_reflection_model=explicit.final_reflection_model or _env_text("OPENROUTER_REPORT_FINAL_REFLECTION_MODEL") or report_model,
+        final_report_model=explicit.final_report_model or _env_text("OPENROUTER_REPORT_FINAL_REPORT_MODEL") or report_model,
+    )
+
+
+def _looks_like_template_section(content: str) -> bool:
+    text = str(content or "").strip()
+    if not text:
+        return True
+    template_prefixes = (
+        "Section:",
+        "Objective:",
+        "Section group:",
+        "Graph chain:",
+        "Next step:",
+        "Revision focus:",
+    )
+    return any(text.startswith(prefix) for prefix in template_prefixes)
+
+
+def _section_inline_citation_count(content: str) -> int:
+    return len(re.findall(r"\[[A-Z0-9_]+\]", str(content or "")))
+
+
+def _subject_signature(value: str) -> str:
+    tokens = [token.casefold() for token in re.findall(r"[A-Za-z][A-Za-z'-]*", str(value or ""))]
+    return " ".join(tokens)
+
+
+def _subject_matches_primary(subject_name: str, primary_entities: List[str]) -> bool:
+    subject_signature = _subject_signature(subject_name)
+    if not subject_signature:
+        return False
+    for entity in primary_entities:
+        aliases = [str(entity or "").strip(), *extract_person_targets(str(entity or "").strip())]
+        for alias in aliases:
+            if subject_signature == _subject_signature(alias):
+                return True
+    return False
+
+
+def _claim_or_evidence_mentions_primary(
+    claim: ClaimModel,
+    evidence: List[EvidenceRefModel],
+    primary_entities: List[str],
+) -> bool:
+    blobs = [claim.text]
+    for item in evidence:
+        blobs.extend([item.snippet, item.title or "", item.source_url or ""])
+    for entity in primary_entities:
+        aliases = [str(entity or "").strip(), *extract_person_targets(str(entity or "").strip())]
+        for alias in aliases:
+            alias_text = str(alias or "").strip().casefold()
+            if alias_text and any(alias_text in str(blob or "").casefold() for blob in blobs):
+                return True
+    return False
+
+
+def verify_claims_for_task(
+    task: SectionTaskModel,
+    evidence: List[EvidenceRefModel],
+    claims: List[ClaimModel],
+    *,
+    primary_entities: List[str] | None = None,
+) -> tuple[List[ClaimModel], List[str]]:
+    valid_keys = {item.citation_key for item in evidence}
+    issues: List[str] = []
+    verified: List[ClaimModel] = []
+    primary_entities = list(primary_entities or task.entity_ids[:1])
+    allow_related_subjects = section_allows_related_subjects(task)
+    allow_unanchored_related = is_conflict_or_methodology_section(task)
+
+    for claim in claims:
+        matched = [key for key in claim.evidence_keys if key in valid_keys]
+        if not matched:
+            issues.append(f"{task.section_id}: dropped unsupported claim: {claim.claim_id}")
+            if claim.impact == "high":
+                issues.append(f"{task.section_id}: high-impact claim without evidence: {claim.claim_id}")
+            continue
+        matched_evidence = [item for item in evidence if item.citation_key in matched]
+        primary_evidence = next(
+            (
+                item
+                for item in matched_evidence
+                if item.source_url or item.document_id or item.object_ref or item.graph_ref
+            ),
+            None,
+        )
+        if primary_evidence is None:
+            issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
+            continue
+        has_run_evidence_link = bool(
+            primary_evidence.evidence_object_key
+            or (isinstance(primary_evidence.object_ref, dict) and (primary_evidence.object_ref.get("objectKey") or primary_evidence.object_ref.get("object_key")))
+            or primary_evidence.document_id
+        )
+        if not has_run_evidence_link:
+            issues.append(f"{task.section_id}: dropped claim without run-linked evidence object: {claim.claim_id}")
+            continue
+
+        subject_name = str(claim.subject_name or claim.subject_entity_id or "").strip() or None
+        about_primary_subject = claim.about_primary_subject
+        if about_primary_subject is None:
+            if subject_name and primary_entities:
+                about_primary_subject = _subject_matches_primary(subject_name, primary_entities)
+            elif subject_name:
+                about_primary_subject = False
+            else:
+                about_primary_subject = True
+
+        if subject_name and primary_entities and _subject_matches_primary(subject_name, primary_entities):
+            about_primary_subject = True
+
+        if not subject_name and about_primary_subject and primary_entities:
+            subject_name = primary_entities[0]
+
+        if subject_name and not about_primary_subject:
+            anchored_to_primary = _claim_or_evidence_mentions_primary(
+                claim,
+                matched_evidence,
+                primary_entities,
+            )
+            if not allow_related_subjects:
+                issues.append(f"{task.section_id}: dropped off-target claim: {claim.claim_id}")
+                continue
+            if not allow_unanchored_related and not anchored_to_primary:
+                issues.append(f"{task.section_id}: dropped unanchored related-subject claim: {claim.claim_id}")
+                continue
+
+        normalized = claim.model_copy(
+            update={
+                "evidence_keys": matched,
+                "subject_entity_id": claim.subject_entity_id or subject_name or (primary_entities[0] if about_primary_subject and primary_entities else None),
+                "subject_name": subject_name,
+                "about_primary_subject": about_primary_subject,
+                "object": claim.object or claim.text,
+                "source_url": primary_evidence.source_url,
+                "source_type": primary_evidence.source_type,
+                "retrieved_at": primary_evidence.retrieved_at,
+                "quote_span": primary_evidence.snippet[:280],
+            }
+        )
+        verified.append(normalized)
+
+    return (verified, issues)
+
+
 # Keep graph assembly in one place so node ordering and route transitions are easy to audit.
 def build_report_graph(
     mcp_client: McpClientProtocol,
@@ -94,8 +275,10 @@ def build_report_graph(
     *,
     section_llm: OpenRouterLLM | None = None,
     final_llm: OpenRouterLLM | None = None,
+    role_llms: Dict[str, OpenRouterLLM] | None = None,
 ) -> StateGraph:
     graph = StateGraph(ReportState)
+    role_llms = dict(role_llms or {})
     if section_llm is None and final_llm is None:
         section_llm = llm3
         final_llm = llm3
@@ -103,6 +286,12 @@ def build_report_graph(
         section_llm = final_llm
     elif final_llm is None:
         final_llm = section_llm
+    outline_llm = role_llms.get("outline") or final_llm
+    section_query_llm = role_llms.get("section_query") or section_llm
+    section_claim_llm = role_llms.get("section_claim") or section_llm
+    section_draft_llm = role_llms.get("section_draft") or section_llm
+    final_reflection_llm = role_llms.get("final_reflection") or final_llm
+    final_report_llm = role_llms.get("final_report") or final_llm
     # Run-local caches prevent repeated DB round-trips across sections/refinement rounds.
     entity_signal_cache: Dict[str, tuple[List[str], List[str], List[str]]] = {}
     vector_query_cache: Dict[str, List[Dict[str, Any]]] = {}
@@ -121,19 +310,68 @@ def build_report_graph(
             {"component": "report_subgraph", "stage": stage, **payload},
         )
 
+    def _stage1_conflict_issue_models(conflicts: List[Any]) -> List[ConsistencyIssueModel]:
+        return [
+            ConsistencyIssueModel(
+                issue_id=f"stage1_conflict_{index}",
+                severity="high" if bool(getattr(item, "blocking", False)) else "medium",
+                description=str(
+                    getattr(item, "rationale", "")
+                    or f"Stage 1 conflict on {getattr(item, 'relation_type', '') or getattr(item, 'field_name', 'field')}."
+                ),
+                conflicting_sections=["conflict_resolution"],
+                targeted_queries=[
+                    str(getattr(item, "relation_type", "") or getattr(item, "field_name", "")).replace("_", " ").strip()
+                ],
+            )
+            for index, item in enumerate(conflicts[:6], start=1)
+        ]
+
+    def _stage1_conflict_query_hints(conflicts: List[Any]) -> List[str]:
+        return dedupe_str_list(
+            [
+                str(getattr(item, "relation_type", "") or getattr(item, "field_name", "")).replace("_", " ").strip()
+                for item in conflicts
+                if str(getattr(item, "relation_type", "") or getattr(item, "field_name", "")).strip()
+            ]
+        )
+
+    def _stage1_conflict_limit_notes(conflicts: List[Any]) -> List[str]:
+        if not conflicts:
+            return []
+        return [f"Stage 1 left {len(conflicts)} graph conflict(s) unresolved."]
+
+    def _merge_consistency_issues(*groups: List[ConsistencyIssueModel]) -> List[ConsistencyIssueModel]:
+        deduped: Dict[str, ConsistencyIssueModel] = {}
+        for group in groups:
+            for item in group:
+                issue_id = str(getattr(item, "issue_id", "") or "").strip()
+                description = str(getattr(item, "description", "") or "").strip()
+                key = issue_id or description.casefold()
+                if key and key not in deduped:
+                    deduped[key] = item
+        return list(deduped.values())
+
     def report_init_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "report_init_node", "started")
         report_type = decide_report_type(state.get("prompt", ""), state.get("noteboard", []))
+        primary_target_contract = state.get("primary_target_contract") or PrimaryTargetContractModel()
+        stage1_conflict_cases = list(state.get("stage1_conflict_cases", []))
+        stage1_resolved_conflicts = list(state.get("stage1_resolved_conflicts", []))
+        stage1_unresolved_conflicts = list(state.get("stage1_unresolved_conflicts", []))
         primary_entities = pick_primary_entities(
             mcp_client=mcp_client,
             run_id=state["run_id"],
             prompt=state.get("prompt", ""),
             noteboard=state.get("noteboard", []),
             receipts=state.get("stage1_receipts", []),
+            primary_target_contract=primary_target_contract,
         )
+        stage1_conflict_issues = _stage1_conflict_issue_models(stage1_unresolved_conflicts)
         output = {
             "report_type": report_type,
             "primary_entities": primary_entities,
+            "primary_target_contract": primary_target_contract,
             "section_drafts": [],
             "claim_ledger": [],
             "evidence_refs": [],
@@ -147,10 +385,23 @@ def build_report_graph(
             "section_claims_buffer": [],
             "section_issues_buffer": [],
             "report_memory": state.get("report_memory").model_copy(
-                update={"question": state.get("prompt", ""), "entities": [], "claims": [], "evidence": [], "open_questions": [], "limits": [], "consistency_issues": [], "step_count": 0}
+                update={
+                    "question": state.get("prompt", ""),
+                    "entities": [],
+                    "claims": [],
+                    "evidence": [],
+                    "open_questions": [],
+                    "limits": _stage1_conflict_limit_notes(stage1_unresolved_conflicts),
+                    "consistency_issues": stage1_conflict_issues,
+                    "step_count": 0,
+                    "primary_target_contract": primary_target_contract,
+                    "stage1_conflict_cases": stage1_conflict_cases,
+                    "stage1_resolved_conflicts": stage1_resolved_conflicts,
+                    "stage1_unresolved_conflicts": stage1_unresolved_conflicts,
+                }
             ),
-            "consistency_issues": [],
-            "contradiction_query_hints": [],
+            "consistency_issues": stage1_conflict_issues,
+            "contradiction_query_hints": _stage1_conflict_query_hints(stage1_conflict_cases),
         }
         emit_stage(state, "report_init_node", "completed", report_type=report_type, primary_entity_count=len(primary_entities))
         return output
@@ -159,7 +410,7 @@ def build_report_graph(
         emit_stage(state, "build_outline_node", "started")
         fallback_outline = default_outline(state.get("report_type", "person"), state.get("primary_entities", []))
         fallback_outline = _normalize_outline(fallback_outline, max_outline_sections)
-        if final_llm is None:
+        if outline_llm is None:
             emit_stage(state, "build_outline_node", "completed", outline_count=len(fallback_outline), reason="llm_unavailable")
             return {"outline": fallback_outline}
 
@@ -167,6 +418,7 @@ def build_report_graph(
             "prompt": state.get("prompt", ""),
             "report_type": state.get("report_type", "person"),
             "primary_entities": state.get("primary_entities", []),
+            "primary_target_contract": state.get("primary_target_contract").model_dump() if state.get("primary_target_contract") else {},
             "noteboard": state.get("noteboard", [])[-12:],
             "output_schema": {
                 "outline": [
@@ -185,7 +437,7 @@ def build_report_graph(
         }
         try:
             parsed = invoke_complete_json(
-                final_llm,
+                outline_llm,
                 REPORT_OUTLINE_SYSTEM_PROMPT,
                 payload,
                 temperature=0.2,
@@ -231,7 +483,7 @@ def build_report_graph(
         evidence: List[EvidenceRefModel],
     ) -> List[ClaimModel]:
         emit_stage(state, "extract_claims_node", "started", section_id=task.section_id)
-        if section_llm is None or not evidence:
+        if section_claim_llm is None or not evidence:
             claims = fallback_claims(task, evidence)
             emit_stage(
                 state,
@@ -239,7 +491,7 @@ def build_report_graph(
                 "completed",
                 section_id=task.section_id,
                 claim_count=len(claims),
-                reason=("llm_unavailable" if section_llm is None else "no_evidence"),
+                reason=("llm_unavailable" if section_claim_llm is None else "no_evidence"),
             )
             return claims
 
@@ -251,6 +503,8 @@ def build_report_graph(
                     {
                         "claim_id": "string",
                         "text": "string",
+                        "subject_name": "string",
+                        "about_primary_subject": "boolean",
                         "confidence": "number",
                         "impact": "low|medium|high",
                         "evidence_keys": ["string"],
@@ -261,7 +515,7 @@ def build_report_graph(
         }
         try:
             parsed = invoke_complete_json(
-                section_llm,
+                section_claim_llm,
                 REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
                 payload,
                 temperature=0.1,
@@ -296,49 +550,12 @@ def build_report_graph(
         claims: List[ClaimModel],
     ) -> tuple[List[ClaimModel], List[str]]:
         emit_stage(state, "verify_claims_node", "started", section_id=task.section_id)
-        valid_keys = {item.citation_key for item in evidence}
-        issues: List[str] = []
-        verified: List[ClaimModel] = []
-
-        for claim in claims:
-            matched = [key for key in claim.evidence_keys if key in valid_keys]
-            if not matched:
-                issues.append(f"{task.section_id}: dropped unsupported claim: {claim.claim_id}")
-                if claim.impact == "high":
-                    issues.append(f"{task.section_id}: high-impact claim without evidence: {claim.claim_id}")
-                continue
-            matched_evidence = [item for item in evidence if item.citation_key in matched]
-            primary_evidence = next(
-                (
-                    item
-                    for item in matched_evidence
-                    if item.source_url or item.document_id or item.object_ref or item.graph_ref
-                ),
-                None,
-            )
-            if primary_evidence is None:
-                issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
-                continue
-            has_run_evidence_link = bool(
-                primary_evidence.evidence_object_key
-                or (isinstance(primary_evidence.object_ref, dict) and (primary_evidence.object_ref.get("objectKey") or primary_evidence.object_ref.get("object_key")))
-                or primary_evidence.document_id
-            )
-            if not has_run_evidence_link:
-                issues.append(f"{task.section_id}: dropped claim without run-linked evidence object: {claim.claim_id}")
-                continue
-            normalized = claim.model_copy(
-                update={
-                    "evidence_keys": matched,
-                    "subject_entity_id": claim.subject_entity_id or (task.entity_ids[0] if task.entity_ids else None),
-                    "object": claim.object or claim.text,
-                    "source_url": primary_evidence.source_url,
-                    "source_type": primary_evidence.source_type,
-                    "retrieved_at": primary_evidence.retrieved_at,
-                    "quote_span": primary_evidence.snippet[:280],
-                }
-            )
-            verified.append(normalized)
+        verified, issues = verify_claims_for_task(
+            task,
+            evidence,
+            claims,
+            primary_entities=list(state.get("primary_entities", [])),
+        )
 
         emit_stage(
             state,
@@ -372,7 +589,7 @@ def build_report_graph(
         )
 
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
-        queries = dedupe_str_list(build_section_queries(hydrated_task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
+        queries = dedupe_str_list(build_section_queries(hydrated_task, section_query_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
         graph_hits = graph_multi_entity_query(mcp_client, state["run_id"], hydrated_task.entity_ids)
         for query in queries:
@@ -400,7 +617,7 @@ def build_report_graph(
         section_draft = SectionDraftModel(
             section_id=hydrated_task.section_id,
             title=hydrated_task.title,
-            content=draft_section_content(state["run_id"], hydrated_task, verified_claims, evidence, section_llm),
+            content=draft_section_content(state["run_id"], hydrated_task, verified_claims, evidence, section_draft_llm),
             citation_keys=[item.citation_key for item in evidence],
         )
         emit_stage(
@@ -449,7 +666,13 @@ def build_report_graph(
                             "query_hints": dedupe_str_list(
                                 list(base_task.query_hints) + list(reflection.query_hints) + state.get("query_hints", [])
                             ),
+                            "revision_query_hints": dedupe_str_list(
+                                list(getattr(base_task, "revision_query_hints", []))
+                                + list(reflection.query_hints)
+                                + state.get("query_hints", [])
+                            ),
                             "current_content": current_content,
+                            "reflection_source": reflection.reflection_source or "final_reflection_node",
                             "revision_focus": reflection.critique,
                             "next_step_suggestion": reflection.next_step_suggestion,
                         }
@@ -461,7 +684,10 @@ def build_report_graph(
         if state.get("refine_round", 0) > 0:
             section_tasks = [
                 task.model_copy(
-                    update={"query_hints": dedupe_str_list(list(task.query_hints) + state.get("query_hints", []))}
+                    update={
+                        "query_hints": dedupe_str_list(list(task.query_hints) + state.get("query_hints", [])),
+                        "revision_query_hints": dedupe_str_list(list(task.revision_query_hints) + state.get("query_hints", [])),
+                    }
                 )
                 for task in section_tasks
             ]
@@ -579,6 +805,7 @@ def build_report_graph(
                 question=state.get("prompt", ""),
                 report_type=state.get("report_type", "person"),
                 primary_entities=state.get("primary_entities", []),
+                primary_target_contract=state.get("primary_target_contract"),
                 noteboard=state.get("noteboard", []),
                 stage1_receipts=state.get("stage1_receipts", []),
                 claims=list(state.get("claim_ledger", [])) + new_claims,
@@ -586,6 +813,11 @@ def build_report_graph(
                 section_issues=list(state.get("section_issues", [])) + new_issues,
                 section_drafts=list(state.get("section_drafts", [])) + new_drafts,
                 latest_observation=latest_observation,
+                consistency_issues=list(state.get("consistency_issues", [])),
+                limit_notes=_stage1_conflict_limit_notes(list(state.get("stage1_unresolved_conflicts", []))),
+                stage1_conflict_cases=list(state.get("stage1_conflict_cases", [])),
+                stage1_resolved_conflicts=list(state.get("stage1_resolved_conflicts", [])),
+                stage1_unresolved_conflicts=list(state.get("stage1_unresolved_conflicts", [])),
             ),
         }
         emit_stage(
@@ -635,7 +867,7 @@ def build_report_graph(
             return dict(state)
 
         emit_stage(state, "vector_retrieve_node", "started", section_id=task.section_id)
-        queries = dedupe_str_list(build_section_queries(task, section_llm, run_id=state["run_id"]))[:max_vector_queries]
+        queries = dedupe_str_list(build_section_queries(task, section_query_llm, run_id=state["run_id"]))[:max_vector_queries]
         hits: List[Dict[str, Any]] = []
         graph_hits = graph_multi_entity_query(mcp_client, state["run_id"], task.entity_ids)
         for query in queries:
@@ -675,7 +907,7 @@ def build_report_graph(
 
         emit_stage(state, "extract_claims_node", "started", section_id=task.section_id)
         evidence = state.get("section_evidence_buffer", [])
-        if section_llm is None or not evidence:
+        if section_claim_llm is None or not evidence:
             claims = fallback_claims(task, evidence)
             emit_stage(
                 state,
@@ -683,7 +915,7 @@ def build_report_graph(
                 "completed",
                 section_id=task.section_id,
                 claim_count=len(claims),
-                reason=("llm_unavailable" if section_llm is None else "no_evidence"),
+                reason=("llm_unavailable" if section_claim_llm is None else "no_evidence"),
             )
             return {"section_claims_buffer": claims}
 
@@ -695,6 +927,8 @@ def build_report_graph(
                     {
                         "claim_id": "string",
                         "text": "string",
+                        "subject_name": "string",
+                        "about_primary_subject": "boolean",
                         "confidence": "number",
                         "impact": "low|medium|high",
                         "evidence_keys": ["string"],
@@ -705,7 +939,7 @@ def build_report_graph(
         }
         try:
             parsed = invoke_complete_json(
-                section_llm,
+                section_claim_llm,
                 REPORT_SECTION_CLAIMS_SYSTEM_PROMPT,
                 payload,
                 temperature=0.1,
@@ -734,49 +968,12 @@ def build_report_graph(
         emit_stage(state, "verify_claims_node", "started", section_id=task.section_id)
         evidence = state.get("section_evidence_buffer", [])
         claims = state.get("section_claims_buffer", [])
-        valid_keys = {item.citation_key for item in evidence}
-        issues: List[str] = []
-        verified: List[ClaimModel] = []
-
-        for claim in claims:
-            matched = [key for key in claim.evidence_keys if key in valid_keys]
-            if not matched:
-                issues.append(f"{task.section_id}: dropped unsupported claim: {claim.claim_id}")
-                if claim.impact == "high":
-                    issues.append(f"{task.section_id}: high-impact claim without evidence: {claim.claim_id}")
-                continue
-            matched_evidence = [item for item in evidence if item.citation_key in matched]
-            primary_evidence = next(
-                (
-                    item
-                    for item in matched_evidence
-                    if item.source_url or item.document_id or item.object_ref or item.graph_ref
-                ),
-                None,
-            )
-            if primary_evidence is None:
-                issues.append(f"{task.section_id}: dropped claim without stable evidence reference: {claim.claim_id}")
-                continue
-            has_run_evidence_link = bool(
-                primary_evidence.evidence_object_key
-                or (isinstance(primary_evidence.object_ref, dict) and (primary_evidence.object_ref.get("objectKey") or primary_evidence.object_ref.get("object_key")))
-                or primary_evidence.document_id
-            )
-            if not has_run_evidence_link:
-                issues.append(f"{task.section_id}: dropped claim without run-linked evidence object: {claim.claim_id}")
-                continue
-            normalized = claim.model_copy(
-                update={
-                    "evidence_keys": matched,
-                    "subject_entity_id": claim.subject_entity_id or (task.entity_ids[0] if task.entity_ids else None),
-                    "object": claim.object or claim.text,
-                    "source_url": primary_evidence.source_url,
-                    "source_type": primary_evidence.source_type,
-                    "retrieved_at": primary_evidence.retrieved_at,
-                    "quote_span": primary_evidence.snippet[:280],
-                }
-            )
-            verified.append(normalized)
+        verified, issues = verify_claims_for_task(
+            task,
+            evidence,
+            claims,
+            primary_entities=list(state.get("primary_entities", [])),
+        )
 
         emit_stage(
             state,
@@ -799,7 +996,7 @@ def build_report_graph(
         section_draft = SectionDraftModel(
             section_id=task.section_id,
             title=task.title,
-            content=draft_section_content(state["run_id"], task, claims, evidence, section_llm),
+            content=draft_section_content(state["run_id"], task, claims, evidence, section_draft_llm),
             citation_keys=[item.citation_key for item in evidence],
         )
         pending = list(state.get("pending_section_tasks", []))
@@ -819,6 +1016,7 @@ def build_report_graph(
                 question=state.get("prompt", ""),
                 report_type=state.get("report_type", "person"),
                 primary_entities=state.get("primary_entities", []),
+                primary_target_contract=state.get("primary_target_contract"),
                 noteboard=state.get("noteboard", []),
                 stage1_receipts=state.get("stage1_receipts", []),
                 claims=list(state.get("claim_ledger", [])) + claims,
@@ -826,6 +1024,11 @@ def build_report_graph(
                 section_issues=list(state.get("section_issues", [])) + state.get("section_issues_buffer", []),
                 section_drafts=list(state.get("section_drafts", [])) + [section_draft],
                 latest_observation=(evidence[0].snippet if evidence else section_draft.content[:240]),
+                consistency_issues=list(state.get("consistency_issues", [])),
+                limit_notes=_stage1_conflict_limit_notes(list(state.get("stage1_unresolved_conflicts", []))),
+                stage1_conflict_cases=list(state.get("stage1_conflict_cases", [])),
+                stage1_resolved_conflicts=list(state.get("stage1_resolved_conflicts", [])),
+                stage1_unresolved_conflicts=list(state.get("stage1_unresolved_conflicts", [])),
             ),
         }
         emit_stage(
@@ -848,11 +1051,16 @@ def build_report_graph(
         merged_claims = dedupe_claims(state.get("claim_ledger", []))
         merged_evidence = dedupe_evidence(state.get("evidence_refs", []))
         merged_issues = dedupe_str_list(state.get("section_issues", []))
-        consistency_issues = run_consistency_validator(merged_drafts, merged_claims, merged_evidence)
+        stage1_conflict_issues = _stage1_conflict_issue_models(list(state.get("stage1_unresolved_conflicts", [])))
+        consistency_issues = _merge_consistency_issues(
+            stage1_conflict_issues,
+            run_consistency_validator(merged_drafts, merged_claims, merged_evidence),
+        )
         report_memory = build_report_memory(
             question=state.get("prompt", ""),
             report_type=state.get("report_type", "person"),
             primary_entities=state.get("primary_entities", []),
+            primary_target_contract=state.get("primary_target_contract"),
             noteboard=state.get("noteboard", []),
             stage1_receipts=state.get("stage1_receipts", []),
             claims=merged_claims,
@@ -860,6 +1068,11 @@ def build_report_graph(
             section_issues=merged_issues,
             section_drafts=merged_drafts,
             latest_observation=state.get("report_memory").latest_observation if state.get("report_memory") else "",
+            consistency_issues=consistency_issues,
+            limit_notes=_stage1_conflict_limit_notes(list(state.get("stage1_unresolved_conflicts", []))),
+            stage1_conflict_cases=list(state.get("stage1_conflict_cases", [])),
+            stage1_resolved_conflicts=list(state.get("stage1_resolved_conflicts", [])),
+            stage1_unresolved_conflicts=list(state.get("stage1_unresolved_conflicts", [])),
         )
         next_state = {
             "section_drafts": merged_drafts,
@@ -867,7 +1080,10 @@ def build_report_graph(
             "evidence_refs": merged_evidence,
             "section_issues": merged_issues,
             "consistency_issues": consistency_issues,
-            "contradiction_query_hints": contradiction_query_hints(consistency_issues),
+            "contradiction_query_hints": dedupe_str_list(
+                contradiction_query_hints(consistency_issues)
+                + _stage1_conflict_query_hints(list(state.get("stage1_conflict_cases", [])))
+            ),
             "report_memory": report_memory.model_copy(update={"consistency_issues": consistency_issues}),
         }
         if persist_draft_snapshots:
@@ -907,10 +1123,12 @@ def build_report_graph(
 
         reflections: List[SectionReflectionModel] = []
         quality_ok_from_llm = False
+        llm_reflections_usable = False
 
-        if final_llm is not None:
+        if final_reflection_llm is not None:
             payload = {
                 "report_type": state.get("report_type", "person"),
+                "primary_target_contract": state.get("primary_target_contract").model_dump() if state.get("primary_target_contract") else {},
                 "outline": [item.model_dump() for item in outline],
                 "section_drafts": [item.model_dump() for item in drafts],
                 "section_issues": state.get("section_issues", []),
@@ -931,7 +1149,7 @@ def build_report_graph(
             }
             try:
                 parsed = invoke_complete_json(
-                    final_llm,
+                    final_reflection_llm,
                     REPORT_SECTION_REFLECTION_SYSTEM_PROMPT,
                     payload,
                     temperature=0.1,
@@ -939,10 +1157,18 @@ def build_report_graph(
                     run_id=state["run_id"],
                     operation="stage2.final_reflection",
                 )
-                quality_ok_from_llm = bool(parsed.get("quality_ok", False))
                 raw_sections = parsed.get("sections")
                 if isinstance(raw_sections, list):
-                    reflections = [SectionReflectionModel.model_validate(item) for item in raw_sections]
+                    parsed_reflections = [SectionReflectionModel.model_validate(item) for item in raw_sections]
+                    if parsed_reflections:
+                        reflections = parsed_reflections
+                        quality_ok_from_llm = bool(parsed.get("quality_ok", False))
+                        llm_reflections_usable = True
+                    else:
+                        logger.warning(
+                            "Stage 2 final reflection returned no usable sections; falling back to heuristics",
+                            extra={"run_id": state["run_id"]},
+                        )
             except Exception:
                 logger.exception("Stage 2 final reflection failed")
 
@@ -954,6 +1180,7 @@ def build_report_graph(
                 status="missing",
                 critique="Required section is missing from the current report draft.",
                 current_content=(draft.content if draft else ""),
+                reflection_source="final_reflection_node",
                 next_step_suggestion="Retrieve evidence aligned with the section objective and draft the missing section with concrete citations.",
                 query_hints=["overview", "timeline", "official profile"],
             )
@@ -968,13 +1195,14 @@ def build_report_graph(
                     reflection_by_section[task.section_id] = SectionReflectionModel(
                         section_id=task.section_id,
                         status="needs_revision",
+                        reflection_source="final_reflection_node",
                         critique="Section is too thin or lacks enough explicit cited detail for the objective.",
                         current_content=draft.content,
                         next_step_suggestion="Expand this section with more evidence-backed specifics, chronology, and direct identifiers tied to the section objective.",
                         query_hints=list(task.query_hints)[:3],
                     )
                 else:
-                    reflection_by_section.setdefault(task.section_id, SectionReflectionModel(section_id=task.section_id, status="ok"))
+                    reflection_by_section.setdefault(task.section_id, SectionReflectionModel(section_id=task.section_id, status="ok", reflection_source="final_reflection_node"))
 
         for task in outline:
             draft = draft_lookup.get(task.section_id)
@@ -984,9 +1212,36 @@ def build_report_graph(
                     section_id=task.section_id,
                     status="ok" if draft and draft.content.strip() else "missing",
                     current_content=(draft.content if draft else ""),
+                    reflection_source="final_reflection_node",
                 )
             elif not reflection.current_content and draft is not None:
                 reflection_by_section[task.section_id] = reflection.model_copy(update={"current_content": draft.content})
+
+        primary_entities = list(state.get("primary_entities", []))
+        claims_by_section: Dict[str, List[ClaimModel]] = {}
+        for claim in state.get("claim_ledger", []):
+            claims_by_section.setdefault(claim.section_id, []).append(claim)
+        for task in outline:
+            draft = draft_lookup.get(task.section_id)
+            if draft is None:
+                continue
+            drift_subject = detect_section_anchor_drift(
+                task,
+                draft.content,
+                claims_by_section.get(task.section_id, []),
+                primary_entities,
+            )
+            if not drift_subject:
+                continue
+            reflection_by_section[task.section_id] = SectionReflectionModel(
+                section_id=task.section_id,
+                status="needs_revision",
+                reflection_source="final_reflection_node",
+                critique=f"Section drifted away from the declared target and is dominated by {drift_subject}.",
+                current_content=draft.content,
+                next_step_suggestion=f"Rewrite this section so it stays centered on {primary_entities[0] if primary_entities else 'the primary subject'} and treats {drift_subject} only as anchored context when directly relevant.",
+                query_hints=dedupe_str_list(list(task.query_hints) + [primary_entities[0]] if primary_entities else list(task.query_hints))[:4],
+            )
 
         normalized_reflections = [
             reflection_by_section.get(task.section_id)
@@ -994,7 +1249,7 @@ def build_report_graph(
             if reflection_by_section.get(task.section_id) is not None
         ]
         has_targets = any(item.status != "ok" for item in normalized_reflections if item is not None)
-        quality_ok = (quality_ok_from_llm if final_llm is not None else True) and not has_targets
+        quality_ok = (quality_ok_from_llm if llm_reflections_usable else True) and not has_targets
         emit_stage(
             state,
             "final_reflection_node",
@@ -1037,6 +1292,19 @@ def build_report_graph(
                 section_drafts=drafts,
             )
         )
+
+        evidence_by_section: Dict[str, List[EvidenceRefModel]] = {}
+        for item in evidence_refs:
+            evidence_by_section.setdefault(item.section_id, []).append(item)
+        for draft in drafts:
+            content = draft.content.strip()
+            if not content:
+                continue
+            if _looks_like_template_section(content):
+                section_issues.append(f"{draft.section_id}: template-style fallback content was persisted instead of analyst prose.")
+            section_citation_count = _section_inline_citation_count(content)
+            if section_citation_count == 0 and evidence_by_section.get(draft.section_id):
+                section_issues.append(f"{draft.section_id}: evidence-backed section is missing inline citation markers.")
 
         for claim in claims:
             if claim.impact == "high" and not claim.evidence_keys:
@@ -1114,6 +1382,8 @@ def build_report_graph(
             and not any("Citation linkage quality gate:" in item for item in section_issues)
             and not any("Retrieval diversity gate:" in item for item in section_issues)
             and not any("section-level evidence gate failed" in item for item in section_issues)
+            and not any("template-style fallback content" in item for item in section_issues)
+            and not any("missing inline citation markers" in item for item in section_issues)
             and not consistency_issues
             and coverage_is_complete(coverage, state.get("report_type", "person"))
         )
@@ -1121,7 +1391,17 @@ def build_report_graph(
             "quality_ok": quality_ok,
             "missing_section_ids": sorted(set(missing + missing_targets)),
             "section_issues": dedupe_str_list(section_issues),
-            "report_memory": (report_memory.model_copy(update={"coverage": coverage, "limits": dedupe_str_list(section_issues), "consistency_issues": consistency_issues}) if report_memory is not None else report_memory),
+            "report_memory": (
+                report_memory.model_copy(
+                    update={
+                        "coverage": coverage,
+                        "limits": dedupe_str_list(list(report_memory.limits) + section_issues),
+                        "consistency_issues": consistency_issues,
+                    }
+                )
+                if report_memory is not None
+                else report_memory
+            ),
         }
         emit_stage(
             state,
@@ -1213,13 +1493,14 @@ def build_report_graph(
 
     def finalize_report_node(state: ReportState) -> Dict[str, Any]:
         emit_stage(state, "finalize_report_node", "started")
-        final_report = assemble_final_report(state, final_llm)
+        final_report = assemble_final_report(state, final_report_llm)
         appendix = assemble_evidence_appendix(state.get("evidence_refs", []))
+        snapshot_status = "ready" if bool(state.get("quality_ok", False)) else "failed"
         try:
             persist_report_snapshot(
                 run_id=state["run_id"],
                 report_type=state.get("report_type", "person"),
-                status="ready",
+                status=snapshot_status,
                 refine_round=int(state.get("refine_round", 0)),
                 quality_ok=bool(state.get("quality_ok", False)),
                 final_report=final_report,
@@ -1233,12 +1514,13 @@ def build_report_graph(
             raise RuntimeError(f"Stage 2 final persistence failed: {exc}") from exc
         emit_run_event(
             state["run_id"],
-            "REPORT_READY",
+            "REPORT_READY" if snapshot_status == "ready" else "REPORT_FAILED",
             {
                 "component": "report_subgraph",
                 "report_type": state.get("report_type", "person"),
                 "quality_ok": bool(state.get("quality_ok", False)),
                 "refine_round": int(state.get("refine_round", 0)),
+                "status": snapshot_status,
             },
         )
         output = {
@@ -1320,31 +1602,58 @@ def run_report_subgraph(
     prompt: str,
     noteboard: List[str],
     stage1_receipts: List[ToolReceipt],
+    stage1_conflict_cases: List[Any] | None = None,
+    stage1_resolved_conflicts: List[Any] | None = None,
+    stage1_unresolved_conflicts: List[Any] | None = None,
     max_refine_rounds: int = 1,
+    primary_target_contract: PrimaryTargetContractModel | None = None,
+    stage2_model_config: Stage2ModelConfig | None = None,
 ) -> ReportResult:
     load_env()
+    ensure_run_exists(run_id, prompt)
     emit_run_event(run_id, "STAGE2_STARTED", {"component": "report_subgraph"})
 
     final_llm: OpenRouterLLM | None = None
     section_llm: OpenRouterLLM | None = None
+    role_llms: Dict[str, OpenRouterLLM] = {}
+    resolved_primary_target_contract = primary_target_contract or load_primary_target_contract(run_id)
+    resolved_stage2_model_config = _resolve_stage2_model_config(stage2_model_config)
     if os.getenv("OPENROUTER_API_KEY"):
-        report_model = (
-            os.getenv("OPENROUTER_REPORT_MODEL")
-            or os.getenv("OPENROUTER_PLANNER_MODEL")
-            or os.getenv("OPENROUTER_MODEL")
-        )
-        report_worker_model = (
-            os.getenv("OPENROUTER_REPORT_WORKER_MODEL")
-            or os.getenv("OPENROUTER_WORKER_MODEL")
-            or report_model
-        )
-        final_llm = OpenRouterLLM(model=report_model)
-        section_llm = OpenRouterLLM(model=report_worker_model)
+        llm_cache: Dict[str, OpenRouterLLM] = {}
+
+        def _llm_for_model(model_name: str) -> OpenRouterLLM | None:
+            cleaned = str(model_name or "").strip()
+            if not cleaned:
+                return None
+            cached = llm_cache.get(cleaned)
+            if cached is None:
+                cached = OpenRouterLLM(model=cleaned)
+                llm_cache[cleaned] = cached
+            return cached
+
+        final_llm = _llm_for_model(resolved_stage2_model_config.final_report_model)
+        section_llm = _llm_for_model(resolved_stage2_model_config.section_draft_model)
+        for role, model_name in {
+            "outline": resolved_stage2_model_config.outline_model,
+            "section_query": resolved_stage2_model_config.section_query_model,
+            "section_claim": resolved_stage2_model_config.section_claim_model,
+            "section_draft": resolved_stage2_model_config.section_draft_model,
+            "final_reflection": resolved_stage2_model_config.final_reflection_model,
+            "final_report": resolved_stage2_model_config.final_report_model,
+        }.items():
+            llm = _llm_for_model(model_name)
+            if llm is not None:
+                role_llms[role] = llm
 
     mcp_client = RoutedMcpClient()
     mcp_client.start()
     try:
-        graph = build_report_graph(mcp_client, section_llm=section_llm, final_llm=final_llm)
+        graph = build_report_graph(
+            mcp_client,
+            section_llm=section_llm,
+            final_llm=final_llm,
+            role_llms=role_llms,
+        )
         checkpointer: Any | None = None
         try:
             from langgraph.checkpoint.memory import MemorySaver  # type: ignore
@@ -1359,7 +1668,11 @@ def run_report_subgraph(
             prompt=prompt,
             noteboard=noteboard,
             stage1_receipts=stage1_receipts,
+            stage1_conflict_cases=stage1_conflict_cases,
+            stage1_resolved_conflicts=stage1_resolved_conflicts,
+            stage1_unresolved_conflicts=stage1_unresolved_conflicts,
             max_refine_rounds=max_refine_rounds,
+            primary_target_contract=resolved_primary_target_contract,
         )
         compiled = graph.compile(checkpointer=checkpointer) if checkpointer is not None else graph.compile()
         invoke_cfg = {"configurable": {"thread_id": run_id}} if checkpointer is not None else None
@@ -1376,6 +1689,7 @@ def run_report_subgraph(
             quality_ok=bool(final_state.get("quality_ok", False)),
             refine_round=int(final_state.get("refine_round", 0)),
             report_memory=final_report_memory,
+            primary_target_contract=final_state.get("primary_target_contract") or resolved_primary_target_contract,
         )
         emit_run_event(
             run_id,

@@ -59,23 +59,6 @@ function buildRunTaggedPredicate(alias: string, options?: { allowExternalContext
   )`;
 }
 
-function applyScopedRunId<T extends { properties: Record<string, unknown> }>(
-  items: T[],
-  runId: string,
-  scope: string
-): T[] {
-  if (scope !== "run") return items;
-  return items.map((item) => ({
-    ...item,
-    properties: item.properties.run_id
-      ? item.properties
-      : {
-          ...item.properties,
-          run_id: runId,
-        },
-  }));
-}
-
 function buildStage2Markdown(finalReport?: string | null, evidenceAppendix?: string | null): string | null {
   const parts = [finalReport?.trim(), evidenceAppendix?.trim()].filter(
     (value): value is string => Boolean(value)
@@ -293,6 +276,10 @@ app.get("/runs/:runId", async (req, reply) => {
             COALESCE(rr.run_id::text, rep.report_id::text) AS report_id,
             COALESCE(rr.status, rep.status) AS report_status,
             COALESCE(rr.updated_at, rep.created_at) AS report_created_at,
+            COALESCE(cs.total_count, 0) AS conflict_count,
+            COALESCE(cs.resolved_count, 0) AS resolved_conflict_count,
+            COALESCE(cs.unresolved_count, 0) AS unresolved_conflict_count,
+            COALESCE(cs.blocking_unresolved_count, 0) AS blocking_unresolved_conflict_count,
             rep.markdown_bucket, rep.markdown_object_key, rep.markdown_version_id,
             rep.json_bucket, rep.json_object_key, rep.json_version_id
      FROM runs r
@@ -309,6 +296,15 @@ app.get("/runs/:runId", async (req, reply) => {
        ORDER BY created_at DESC
        LIMIT 1
      ) rep ON true
+     LEFT JOIN LATERAL (
+       SELECT
+         COUNT(*)::int AS total_count,
+         COUNT(*) FILTER (WHERE status IN ('resolved', 'applied'))::int AS resolved_count,
+         COUNT(*) FILTER (WHERE status NOT IN ('resolved', 'applied'))::int AS unresolved_count,
+         COUNT(*) FILTER (WHERE status NOT IN ('resolved', 'applied') AND blocking = TRUE)::int AS blocking_unresolved_count
+       FROM graph_conflict_cases
+       WHERE run_id = r.run_id
+     ) cs ON true
      WHERE r.run_id = $1`,
     [runId]
   );
@@ -328,6 +324,12 @@ app.get("/runs/:runId", async (req, reply) => {
       constraints: row.constraints,
       notes: row.notes
     },
+    conflictSummary: {
+      total: row.conflict_count ?? 0,
+      resolved: row.resolved_conflict_count ?? 0,
+      unresolved: row.unresolved_conflict_count ?? 0,
+      blockingUnresolved: row.blocking_unresolved_conflict_count ?? 0
+    },
     latestReport: row.report_id
       ? {
           reportId: row.report_id,
@@ -345,6 +347,91 @@ app.get("/runs/:runId", async (req, reply) => {
           }
         }
       : null
+  };
+});
+
+app.get("/runs/:runId/conflicts", async (req, reply) => {
+  const { runId } = req.params as { runId: string };
+  const runExists = await pool.query(`SELECT 1 FROM runs WHERE run_id = $1`, [runId]);
+  if (!runExists.rows.length) return reply.code(404).send({ error: "run not found" });
+
+  const [casesRes, evidenceRes] = await Promise.all([
+    pool.query(
+      `SELECT
+         case_id, target_type, target_id, field_name, relation_type, scope, status, blocking,
+         chosen_value, deterministic_winner, confidence, rationale, candidate_values,
+         source_tools, source_domains, graph_entity_ids, graph_relation_ids, notes,
+         created_at, updated_at
+       FROM graph_conflict_cases
+       WHERE run_id = $1
+       ORDER BY blocking DESC, confidence DESC, updated_at DESC, case_id ASC`,
+      [runId]
+    ),
+    pool.query(
+      `SELECT
+         evidence_id, case_id, candidate_value, polarity, document_id, chunk_id, object_ref,
+         source_url, source_domain, snippet, source_tool, retrieved_at, score, created_at
+       FROM graph_conflict_evidence
+       WHERE run_id = $1
+       ORDER BY case_id ASC, created_at ASC, evidence_id ASC`,
+      [runId]
+    )
+  ]);
+
+  const evidenceByCase = new Map<string, unknown[]>();
+  for (const row of evidenceRes.rows) {
+    const caseId = String(row.case_id ?? "");
+    const bucket = evidenceByCase.get(caseId) ?? [];
+    bucket.push({
+      evidenceId: row.evidence_id,
+      caseId,
+      candidateValue: row.candidate_value,
+      polarity: row.polarity,
+      documentId: row.document_id,
+      chunkId: row.chunk_id,
+      objectRef: row.object_ref ?? {},
+      sourceUrl: row.source_url,
+      sourceDomain: row.source_domain,
+      snippet: row.snippet,
+      sourceTool: row.source_tool,
+      retrievedAt: row.retrieved_at,
+      score: row.score,
+      createdAt: row.created_at
+    });
+    evidenceByCase.set(caseId, bucket);
+  }
+
+  return {
+    runId,
+    summary: {
+      total: casesRes.rows.length,
+      resolved: casesRes.rows.filter((row) => ["resolved", "applied"].includes(String(row.status ?? ""))).length,
+      unresolved: casesRes.rows.filter((row) => !["resolved", "applied"].includes(String(row.status ?? ""))).length,
+      blockingUnresolved: casesRes.rows.filter((row) => !["resolved", "applied"].includes(String(row.status ?? "")) && row.blocking === true).length
+    },
+    conflicts: casesRes.rows.map((row) => ({
+      caseId: row.case_id,
+      targetType: row.target_type,
+      targetId: row.target_id,
+      fieldName: row.field_name,
+      relationType: row.relation_type,
+      scope: row.scope,
+      status: row.status,
+      blocking: row.blocking,
+      chosenValue: row.chosen_value,
+      deterministicWinner: row.deterministic_winner,
+      confidence: row.confidence,
+      rationale: row.rationale,
+      candidateValues: row.candidate_values ?? [],
+      sourceTools: row.source_tools ?? [],
+      sourceDomains: row.source_domains ?? [],
+      graphEntityIds: row.graph_entity_ids ?? [],
+      graphRelationIds: row.graph_relation_ids ?? [],
+      notes: row.notes ?? [],
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      evidence: evidenceByCase.get(String(row.case_id ?? "")) ?? []
+    }))
   };
 });
 
@@ -688,14 +775,11 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       edgeOffset
     });
 
-    const scopedNodes = applyScopedRunId(projection.nodes, runId, scope);
-    const scopedEdges = applyScopedRunId(projection.edges, runId, scope);
-
     return {
       runId,
       scope,
-      nodes: scopedNodes,
-      edges: scopedEdges,
+      nodes: projection.nodes,
+      edges: projection.edges,
       page: {
         nodes: { limit: nodeLimit, offset: nodeOffset, total: projection.totalNodes },
         edges: { limit: edgeLimit, offset: edgeOffset, total: projection.totalEdges }

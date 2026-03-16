@@ -4,12 +4,14 @@ import json
 import os
 import queue
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from env import load_env
 from run_events import emit_run_event
+from run_monitor import notify_progress, progress_keepalive_seconds
 
 
 def get_openrouter_timeout(env_var: str, default: float) -> float:
@@ -144,7 +146,11 @@ class OpenRouterLLM:
         }
 
         try:
-            data = self._post_json_with_wall_clock_timeout(payload, timeout)
+            data = self._post_json_with_wall_clock_timeout(
+                payload,
+                timeout,
+                progress_stage=f"LLM_CALL_WAIT:{operation or 'complete_json'}",
+            )
             content: Any = (
                 data.get("choices", [{}])[0]
                 .get("message", {})
@@ -196,7 +202,13 @@ class OpenRouterLLM:
                 )
             raise
 
-    def _post_json_with_wall_clock_timeout(self, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    def _post_json_with_wall_clock_timeout(
+        self,
+        payload: Dict[str, Any],
+        timeout: float,
+        *,
+        progress_stage: str | None = None,
+    ) -> Dict[str, Any]:
         result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
         connect_timeout = min(10.0, timeout)
 
@@ -211,20 +223,39 @@ class OpenRouterLLM:
                     json=payload,
                     timeout=(connect_timeout, timeout),
                 )
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    response_text = ""
+                    try:
+                        response_text = str(getattr(response, "text", "") or "").strip()
+                    except Exception:
+                        response_text = ""
+                    if response_text:
+                        detail = response_text[:800]
+                        exc.args = (*exc.args, f"response={detail}")
+                    raise
                 result_queue.put((True, response.json()))
             except Exception as exc:
                 result_queue.put((False, exc))
 
         thread = threading.Thread(target=_request, name="openrouter-request", daemon=True)
         thread.start()
+        deadline = time.monotonic() + timeout
+        keepalive_seconds = progress_keepalive_seconds()
 
-        try:
-            ok, value = result_queue.get(timeout=timeout)
-        except queue.Empty as exc:
-            raise requests.exceptions.Timeout(
-                f"OpenRouter wall-clock timeout after {timeout} seconds"
-            ) from exc
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.exceptions.Timeout(
+                    f"OpenRouter wall-clock timeout after {timeout} seconds"
+                )
+            try:
+                ok, value = result_queue.get(timeout=min(keepalive_seconds, remaining))
+                break
+            except queue.Empty:
+                if progress_stage:
+                    notify_progress(progress_stage)
 
         if ok:
             return value if isinstance(value, dict) else {}

@@ -22,6 +22,8 @@ type EvidenceObjectRef = {
   versionId?: string;
   etag?: string;
   documentId?: string;
+  chunkId?: string;
+  sourceUrl?: string;
 };
 
 type EvidenceInput = {
@@ -108,6 +110,8 @@ type GraphEntityRecord = {
   updated_at: string;
   evidence_document_id?: string;
   evidence_document_ids?: string[];
+  evidence_chunk_id?: string;
+  evidence_chunk_ids?: string[];
   evidence_bucket?: string;
   evidence_object_key?: string;
   evidence_object_keys?: string[];
@@ -143,11 +147,15 @@ type GraphRelationRecord = {
   updated_at: string;
   evidence_document_id?: string;
   evidence_document_ids?: string[];
+  evidence_chunk_id?: string;
+  evidence_chunk_ids?: string[];
   evidence_bucket?: string;
   evidence_object_key?: string;
   evidence_object_keys?: string[];
   evidence_version_id?: string;
   evidence_etag?: string;
+  source_url?: string;
+  source_urls?: string[];
   ingested_at: string;
   embedding_text: string;
   embedding: number[];
@@ -824,10 +832,15 @@ function deriveFilterTerms(entityType: string, canonicalName: string, altNames: 
 function buildEvidenceProps(input?: EvidenceInput | EvidenceObjectRef): Record<string, string | string[]> {
   const ref = "objectRef" in (input ?? {}) ? (input as EvidenceInput).objectRef : (input as EvidenceObjectRef | undefined);
   const evidenceDocumentId = "documentId" in (input ?? {}) ? (input as EvidenceInput).documentId : ref?.documentId;
+  const evidenceChunkId = "chunkId" in (input ?? {}) ? (input as EvidenceInput).chunkId : ref?.chunkId;
   const props: Record<string, string | string[]> = {};
   if (evidenceDocumentId) {
     props.evidence_document_id = evidenceDocumentId;
     props.evidence_document_ids = [evidenceDocumentId];
+  }
+  if (evidenceChunkId) {
+    props.evidence_chunk_id = evidenceChunkId;
+    props.evidence_chunk_ids = [evidenceChunkId];
   }
   if (ref?.bucket) props.evidence_bucket = ref.bucket;
   if (ref?.objectKey) props.evidence_object_key = ref.objectKey;
@@ -931,6 +944,7 @@ function normalizeGraphRelation(runId: string, input: GraphRelationInput): Graph
   const evidenceProps = buildEvidenceProps(input.evidenceRef);
   const createdAt = utcNow();
   const evidenceObjectKey = typeof evidenceProps.evidence_object_key === "string" ? evidenceProps.evidence_object_key : undefined;
+  const sourceUrl = input.evidenceRef?.sourceUrl?.trim() || undefined;
   const canonicalId = stableId(
     "relc",
     String(input.src_canonical_id ?? input.src_id),
@@ -969,6 +983,8 @@ function normalizeGraphRelation(runId: string, input: GraphRelationInput): Graph
     updated_at: createdAt,
     ingested_at: createdAt,
     evidence_object_keys: evidenceObjectKey ? [evidenceObjectKey] : undefined,
+    source_url: sourceUrl,
+    source_urls: sourceUrl ? [sourceUrl] : undefined,
     embedding_text: "",
     embedding: [],
     ...evidenceProps,
@@ -1099,6 +1115,20 @@ function extractEvidenceDocumentIds(value: Record<string, unknown> | GraphEntity
   return uniqueStrings([
     value.evidence_document_id,
     ...(((value.evidence_document_ids as string[] | undefined) ?? [])),
+  ]);
+}
+
+function extractEvidenceChunkIds(value: Record<string, unknown> | GraphEntityRecord | GraphRelationRecord): string[] {
+  return uniqueStrings([
+    value.evidence_chunk_id,
+    ...(((value.evidence_chunk_ids as string[] | undefined) ?? [])),
+  ]);
+}
+
+function extractSourceUrls(value: Record<string, unknown> | GraphEntityRecord | GraphRelationRecord): string[] {
+  return uniqueStrings([
+    value.source_url,
+    ...(((value.source_urls as string[] | undefined) ?? [])),
   ]);
 }
 
@@ -1251,6 +1281,8 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
   );
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
+  const evidenceChunkIds = extractEvidenceChunkIds(existing).concat(extractEvidenceChunkIds(incoming));
+  const mergedEvidenceChunkIds = uniqueStrings(evidenceChunkIds);
   const mergedEvidenceObjectKeys = uniqueStrings([
     ...((existing.evidence_object_keys as string[] | undefined) ?? []),
     ...((incoming.evidence_object_keys as string[] | undefined) ?? []),
@@ -1292,6 +1324,8 @@ function mergeEntityRecords(existing: Record<string, unknown> | null, incoming: 
     ingested_at: String(existing.ingested_at ?? incoming.ingested_at ?? incoming.updated_at),
     evidence_document_id: mergedEvidenceDocumentIds[0] || undefined,
     evidence_document_ids: mergedEvidenceDocumentIds.length ? mergedEvidenceDocumentIds : undefined,
+    evidence_chunk_id: mergedEvidenceChunkIds[0] || undefined,
+    evidence_chunk_ids: mergedEvidenceChunkIds.length ? mergedEvidenceChunkIds : undefined,
     evidence_bucket: String(incoming.evidence_bucket ?? existing.evidence_bucket ?? "") || undefined,
     evidence_object_key: String(incoming.evidence_object_key ?? existing.evidence_object_key ?? "") || undefined,
     evidence_object_keys: mergedEvidenceObjectKeys.length ? mergedEvidenceObjectKeys : undefined,
@@ -1316,11 +1350,19 @@ function mergeRelationRecords(existing: Record<string, unknown> | null, incoming
   const relType = canonicalizeRelationType(chooseCanonicalName([existing.rel_type, incoming.rel_type]));
   const evidenceDocumentIds = extractEvidenceDocumentIds(existing).concat(extractEvidenceDocumentIds(incoming));
   const mergedEvidenceDocumentIds = uniqueStrings(evidenceDocumentIds);
+  const evidenceChunkIds = extractEvidenceChunkIds(existing).concat(extractEvidenceChunkIds(incoming));
+  const mergedEvidenceChunkIds = uniqueStrings(evidenceChunkIds);
   const mergedEvidenceObjectKeys = uniqueStrings([
     ...((existing.evidence_object_keys as string[] | undefined) ?? []),
     ...((incoming.evidence_object_keys as string[] | undefined) ?? []),
     String(existing.evidence_object_key ?? ""),
     String(incoming.evidence_object_key ?? ""),
+  ]);
+  const mergedSourceUrls = uniqueStrings([
+    ...((existing.source_urls as string[] | undefined) ?? []),
+    ...((incoming.source_urls as string[] | undefined) ?? []),
+    String(existing.source_url ?? ""),
+    String(incoming.source_url ?? ""),
   ]);
   return {
     edge_id: String(existing.edge_id ?? incoming.edge_id),
@@ -1343,11 +1385,15 @@ function mergeRelationRecords(existing: Record<string, unknown> | null, incoming
     ingested_at: String(existing.ingested_at ?? incoming.ingested_at ?? incoming.updated_at),
     evidence_document_id: mergedEvidenceDocumentIds[0] || undefined,
     evidence_document_ids: mergedEvidenceDocumentIds.length ? mergedEvidenceDocumentIds : undefined,
+    evidence_chunk_id: mergedEvidenceChunkIds[0] || undefined,
+    evidence_chunk_ids: mergedEvidenceChunkIds.length ? mergedEvidenceChunkIds : undefined,
     evidence_bucket: String(incoming.evidence_bucket ?? existing.evidence_bucket ?? "") || undefined,
     evidence_object_key: String(incoming.evidence_object_key ?? existing.evidence_object_key ?? "") || undefined,
     evidence_object_keys: mergedEvidenceObjectKeys.length ? mergedEvidenceObjectKeys : undefined,
     evidence_version_id: String(incoming.evidence_version_id ?? existing.evidence_version_id ?? "") || undefined,
     evidence_etag: String(incoming.evidence_etag ?? existing.evidence_etag ?? "") || undefined,
+    source_url: String(incoming.source_url ?? existing.source_url ?? "") || undefined,
+    source_urls: mergedSourceUrls.length ? mergedSourceUrls : undefined,
     embedding_text: incoming.embedding_text,
     embedding: averageEmbeddings([toNumericArray(existing.embedding), incoming.embedding]),
   };
@@ -1689,6 +1735,52 @@ function validateGraphBatch(entities: GraphEntityRecord[], relations: GraphRelat
   };
 }
 
+function evidenceRefFromGraphRecord(record: GraphEntityRecord | GraphRelationRecord): Record<string, unknown> | null {
+  const objectRef = {
+    bucket: record.evidence_bucket ?? null,
+    objectKey: record.evidence_object_key ?? null,
+    versionId: record.evidence_version_id ?? null,
+    etag: record.evidence_etag ?? null,
+    documentId: record.evidence_document_id ?? null,
+    chunkId: record.evidence_chunk_id ?? null,
+  };
+  const sourceUrls = extractSourceUrls(record);
+  const ref = {
+    documentId: record.evidence_document_id ?? null,
+    chunkId: record.evidence_chunk_id ?? null,
+    objectRef,
+    sourceUrl: sourceUrls[0] ?? null,
+  };
+  return ref.documentId || ref.chunkId || objectRef.bucket || objectRef.objectKey || ref.sourceUrl ? ref : null;
+}
+
+function evidenceRefsFromGraphBatch(
+  entities: GraphEntityRecord[],
+  relations: GraphRelationRecord[]
+): Record<string, unknown>[] {
+  const refs: Record<string, unknown>[] = [];
+  for (const record of [...entities, ...relations]) {
+    const ref = evidenceRefFromGraphRecord(record);
+    if (ref) refs.push(ref);
+  }
+  const seen = new Set<string>();
+  const output: Record<string, unknown>[] = [];
+  for (const ref of refs) {
+    const objectRef = (ref.objectRef ?? {}) as Record<string, unknown>;
+    const key = [
+      String(ref.documentId ?? ""),
+      String(ref.chunkId ?? ""),
+      String(objectRef.bucket ?? ""),
+      String(objectRef.objectKey ?? ""),
+      String(ref.sourceUrl ?? ""),
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(ref);
+  }
+  return output;
+}
+
 export function registerIngestGraphEntity(server: McpServer) {
   server.registerTool(
     "ingest_graph_entity",
@@ -1730,6 +1822,9 @@ export function registerIngestGraphEntity(server: McpServer) {
           key: primary?.node_id ?? entityId ?? "",
           relationCount: normalizedRelations.length,
           graphSchema: "sample_v1",
+          entityIds: storedEntities.map((entity) => entity.node_id),
+          relationIds: normalizedRelations.map((relation) => relation.edge_id),
+          evidenceRefs: evidenceRefsFromGraphBatch(storedEntities, normalizedRelations),
           contractMetrics,
         };
 
@@ -1783,6 +1878,9 @@ export function registerIngestGraphEntities(server: McpServer) {
           count: storedEntities.length,
           relationCount: parsed.relations.length,
           graphSchema: "sample_v1",
+          entityIds: storedEntities.map((entity) => entity.node_id),
+          relationIds: parsed.relations.map((relation) => relation.edge_id),
+          evidenceRefs: evidenceRefsFromGraphBatch(storedEntities, parsed.relations),
           entities: storedEntities.map((entity) => ({
             nodeId: entity.node_id,
             type: entity.type,
@@ -1842,6 +1940,8 @@ export function registerIngestGraphRelations(server: McpServer) {
         const output = {
           count: storedRelations.length,
           graphSchema: "sample_v1",
+          relationIds: storedRelations.map((relation) => relation.edge_id),
+          evidenceRefs: evidenceRefsFromGraphBatch([], storedRelations),
           contractMetrics,
           warnings: [],
         };

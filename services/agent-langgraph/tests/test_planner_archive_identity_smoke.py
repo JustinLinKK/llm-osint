@@ -102,6 +102,7 @@ def _load_planner_graph_module(monkeypatch):
 
     openrouter_module = types.ModuleType("openrouter_llm")
     openrouter_module.OpenRouterLLM = object
+    openrouter_module.invoke_complete_json = lambda *args, **kwargs: {}
     monkeypatch.setitem(sys.modules, "openrouter_llm", openrouter_module)
 
     logger_module = types.ModuleType("logger")
@@ -115,8 +116,18 @@ def _load_planner_graph_module(monkeypatch):
             for key, value in kwargs.items():
                 setattr(self, key, value)
 
+        @classmethod
+        def model_validate(cls, payload: Dict[str, Any] | None) -> "_BaseModel":
+            return cls(**(payload or {}))
+
         def model_dump(self) -> Dict[str, Any]:
             return dict(self.__dict__)
+
+        def model_copy(self, *, update: Dict[str, Any] | None = None, deep: bool = False) -> "_BaseModel":
+            data = dict(self.__dict__)
+            if update:
+                data.update(update)
+            return self.__class__(**data)
 
     def _field(*args: Any, default_factory=None, **kwargs: Any) -> Any:
         if default_factory is not None:
@@ -126,6 +137,68 @@ def _load_planner_graph_module(monkeypatch):
     pydantic_module.BaseModel = _BaseModel
     pydantic_module.Field = _field
     monkeypatch.setitem(sys.modules, "pydantic", pydantic_module)
+
+    report_models_module = types.ModuleType("report_models")
+
+    class _PrimaryTargetContractModel(_BaseModel):
+        def __init__(
+            self,
+            target_type: str = "person",
+            prompt_targets: List[str] | None = None,
+            canonical_name: str = "",
+            approved_aliases: List[str] | None = None,
+            approved_handles: List[str] | None = None,
+            approved_domains: List[str] | None = None,
+            root_entity_id: str = "",
+            anchor_receipt_ids: List[str] | None = None,
+            locked_iteration: int = 0,
+            lock_reason: str = "",
+        ) -> None:
+            super().__init__(
+                target_type=target_type,
+                prompt_targets=list(prompt_targets or []),
+                canonical_name=canonical_name,
+                approved_aliases=list(approved_aliases or []),
+                approved_handles=list(approved_handles or []),
+                approved_domains=list(approved_domains or []),
+                root_entity_id=root_entity_id,
+                anchor_receipt_ids=list(anchor_receipt_ids or []),
+                locked_iteration=locked_iteration,
+                lock_reason=lock_reason,
+            )
+
+    class _PrimaryGraphTemplateModel(_BaseModel):
+        def __init__(
+            self,
+            root_entity_id: str = "",
+            root_entity_type: str = "Person",
+            root_canonical_name: str = "",
+            root_aliases: List[str] | None = None,
+            approved_handles: List[str] | None = None,
+            approved_domains: List[str] | None = None,
+            first_hop_entity_categories: List[str] | None = None,
+            first_hop_relation_categories: List[str] | None = None,
+            template_mode: str = "metadata_only",
+        ) -> None:
+            super().__init__(
+                root_entity_id=root_entity_id,
+                root_entity_type=root_entity_type,
+                root_canonical_name=root_canonical_name,
+                root_aliases=list(root_aliases or []),
+                approved_handles=list(approved_handles or []),
+                approved_domains=list(approved_domains or []),
+                first_hop_entity_categories=list(first_hop_entity_categories or []),
+                first_hop_relation_categories=list(first_hop_relation_categories or []),
+                template_mode=template_mode,
+            )
+
+    report_models_module.PrimaryTargetContractModel = _PrimaryTargetContractModel
+    report_models_module.PrimaryGraphTemplateModel = _PrimaryGraphTemplateModel
+    monkeypatch.setitem(sys.modules, "report_models", report_models_module)
+
+    run_store_module = types.ModuleType("run_store")
+    run_store_module.persist_primary_target_contract = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "run_store", run_store_module)
 
     env_module = types.ModuleType("env")
     env_module.load_env = lambda: None
@@ -157,8 +230,8 @@ def _load_planner_graph_module(monkeypatch):
 def test_planner_smoke_runs_archive_identity_chain(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 
-    def fake_run_tool_worker(_mcp_client, run_id: str, tool_name: str, arguments: Dict[str, Any]) -> ToolWorkerResultStub:
-        if tool_name in {"person_search", "tavily_person_search"}:
+    def fake_run_tool_worker(_mcp_client, run_id: str, tool_name: str, arguments: Dict[str, Any], **_kwargs: Any) -> ToolWorkerResultStub:
+        if tool_name in {"person_search", "tavily_person_search", "tavily_research"}:
             result = {
                 "name": "Ada Lovelace",
                 "count": 1,
@@ -169,6 +242,7 @@ def test_planner_smoke_runs_archive_identity_chain(monkeypatch) -> None:
                 tool_name=tool_name,
                 ok=True,
                 summary="Searched public web sources for Ada Lovelace.",
+                arguments=arguments,
                 key_facts=[{"name": "Ada Lovelace"}, {"profileUrls": ["https://example.edu/ada"]}],
                 next_hints=["https://example.edu/ada"],
             )
@@ -286,7 +360,7 @@ def test_planner_smoke_runs_archive_identity_chain(monkeypatch) -> None:
     final_state = graph.compile().invoke(state)
 
     tool_names = [receipt.tool_name for receipt in final_state["tool_receipts"]]
-    assert "tavily_person_search" in tool_names
+    assert "tavily_research" in tool_names
     assert "wayback_fetch_url" in tool_names
     assert "historical_bio_diff" in tool_names
     assert "ingest_graph_entities" in tool_names
@@ -433,12 +507,14 @@ def test_extract_usernames_supports_dotted_handles_and_profile_urls(monkeypatch)
     usernames = planner_graph._extract_usernames(
         "Mentions: @xinyu.pi and @xinyu-pi. Profiles: "
         "https://github.com/xinyu.pi https://gitlab.com/xinyu-pi "
-        "https://www.reddit.com/user/xinyu_pi/"
+        "https://www.reddit.com/user/xinyu_pi/ "
+        "https://www.linkedin.com/in/justinlinkk/"
     )
 
     assert "xinyu.pi" in usernames
     assert "xinyu-pi" in usernames
     assert "xinyu_pi" in usernames
+    assert "justinlinkk" in usernames
 
 
 def test_related_person_candidate_filter_rejects_none_publications(monkeypatch) -> None:
@@ -461,12 +537,57 @@ def test_related_person_candidate_filter_rejects_noisy_suggest_phrase(monkeypatc
     )
 
 
+def test_related_person_candidate_filter_rejects_location_and_descriptor_phrases(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert not planner_graph._is_related_person_candidate(
+        "United States",
+        source_key="relatedPeople",
+        source_tool="google_serp_person_search",
+    )
+    assert not planner_graph._is_related_person_candidate(
+        "La Jolla Shores",
+        source_key="relatedPeople",
+        source_tool="google_serp_person_search",
+    )
+    assert not planner_graph._is_related_person_candidate(
+        "Green Scholarship",
+        source_key="relatedPeople",
+        source_tool="google_serp_person_search",
+    )
+    assert not planner_graph._is_related_person_candidate(
+        "Frederick Pi Stealth Startup",
+        source_key="relatedPeople",
+        source_tool="google_serp_person_search",
+    )
+
+
 def test_google_scholar_profile_query_is_site_constrained(monkeypatch) -> None:
     planner_graph = _load_planner_graph_module(monkeypatch)
 
     assert planner_graph._google_scholar_profile_query("Ada Lovelace") == (
         'site:scholar.google.com/citations "Ada Lovelace"'
     )
+
+
+def test_extract_google_serp_person_target_rejects_non_person_targets(monkeypatch) -> None:
+    planner_graph = _load_planner_graph_module(monkeypatch)
+
+    assert planner_graph._extract_google_serp_person_target(
+        {"target_name": 'site:scholar.google.com/citations "Ada Lovelace"'}
+    ) == "Ada Lovelace"
+    assert planner_graph._extract_google_serp_person_target(
+        {"target_name": 'site:scholar.google.com/citations "United States"'}
+    ) is None
+    assert planner_graph._extract_google_serp_person_target(
+        {"target_name": 'site:scholar.google.com/citations "La Jolla Shores"'}
+    ) is None
+    assert planner_graph._extract_google_serp_person_target(
+        {"target_name": 'site:scholar.google.com/citations "Green Scholarship"'}
+    ) is None
+    assert planner_graph._extract_google_serp_person_target(
+        {"target_name": 'site:scholar.google.com/citations "Frederick Pi Stealth Startup"'}
+    ) is None
 
 
 def test_normalize_related_org_name_rejects_tool_provider_labels(monkeypatch) -> None:

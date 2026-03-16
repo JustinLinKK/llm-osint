@@ -113,6 +113,36 @@ def test_tavily_person_search_uses_advanced_defaults_and_normalizes_scores(monke
     assert result["summary"]["chunks_per_source"] == 3
 
 
+def test_tavily_search_family_caps_results_to_five(monkeypatch, tmp_path) -> None:
+    captured: list[dict] = []
+
+    def _fake_request(api_url: str, payload: dict | None, *, timeout_seconds: int, method: str = "POST") -> dict:
+        captured.append(payload or {})
+        return {"query": payload.get("query") if isinstance(payload, dict) else "", "results": []}
+
+    monkeypatch.setattr(unified_research_mcp, "_tavily_json_request", _fake_request)
+
+    web_result = unified_research_mcp._tool_web_search(
+        {
+            "query": "Ada Lovelace",
+            "max_results": 99,
+            "output_dir": str(tmp_path / "web"),
+        }
+    )
+    person_result = unified_research_mcp._tool_tavily_person_search(
+        {
+            "target_name": "Ada Lovelace",
+            "max_results": 99,
+            "output_dir": str(tmp_path / "person"),
+        }
+    )
+
+    assert captured[0]["max_results"] == 5
+    assert captured[1]["max_results"] == 5
+    assert web_result["payload"]["max_results"] == 5
+    assert person_result["payload"]["max_results"] == 5
+
+
 def test_extract_webpage_defaults_to_text_advanced_and_five_chunks(monkeypatch, tmp_path) -> None:
     captured: dict = {}
 
@@ -133,3 +163,33 @@ def test_extract_webpage_defaults_to_text_advanced_and_five_chunks(monkeypatch, 
     assert captured["payload"]["extract_depth"] == "advanced"
     assert captured["payload"]["format"] == "text"
     assert captured["payload"]["chunks_per_source"] == 5
+
+
+def test_crawl_and_map_cap_limit_to_five(monkeypatch, tmp_path) -> None:
+    captured: list[dict] = []
+
+    def _fake_request(api_url: str, payload: dict | None, *, timeout_seconds: int, method: str = "POST") -> dict:
+        captured.append(payload or {})
+        return {"results": []}
+
+    monkeypatch.setattr(unified_research_mcp, "_tavily_json_request", _fake_request)
+
+    crawl_result = unified_research_mcp._tool_crawl_webpage(
+        {
+            "url": "https://docs.tavily.com",
+            "limit": 50,
+            "output_dir": str(tmp_path / "crawl"),
+        }
+    )
+    map_result = unified_research_mcp._tool_map_webpage(
+        {
+            "url": "https://docs.tavily.com",
+            "limit": 50,
+            "output_dir": str(tmp_path / "map"),
+        }
+    )
+
+    assert captured[0]["limit"] == 5
+    assert captured[1]["limit"] == 5
+    assert crawl_result["summary"]["limit"] == 5
+    assert map_result["summary"]["limit"] == 5

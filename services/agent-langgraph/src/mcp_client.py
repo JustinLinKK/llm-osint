@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +14,7 @@ from typing import Any, Dict, Optional, Protocol
 import requests
 
 from logger import get_logger
-from run_monitor import notify_progress
+from run_monitor import notify_progress, progress_keepalive_seconds
 
 logger = get_logger(__name__)
 
@@ -153,6 +155,16 @@ def _parse_mcp_content(result: Dict[str, Any]) -> Dict[str, Any]:
     return {"content": content_items}
 
 
+def _mcp_progress_stage(payload: Dict[str, Any]) -> str:
+    method = str(payload.get("method") or "request").strip() or "request"
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    if method == "tools/call":
+        tool_name = str(params.get("name") or "").strip()
+        if tool_name:
+            return f"MCP_TOOL_WAIT:{tool_name}"
+    return f"MCP_HTTP_WAIT:{method}"
+
+
 class StreamableHttpMcpClient:
     def __init__(self, server_url: Optional[str] = None) -> None:
         self._server_url = server_url or os.getenv("MCP_SERVER_URL", "http://mcp-server:3001/mcp")
@@ -278,14 +290,53 @@ class StreamableHttpMcpClient:
     ) -> Optional[requests.Response]:
         headers = self._headers(include_session=include_session, include_protocol=include_protocol)
         timeout = timeout_seconds if timeout_seconds is not None else self._request_timeout_seconds
-        try:
-            response = requests.post(self._server_url, headers=headers, json=payload, timeout=timeout)
-        except requests.RequestException as exc:
+        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+        progress_stage = _mcp_progress_stage(payload)
+
+        def _request() -> None:
+            try:
+                response = requests.post(self._server_url, headers=headers, json=payload, timeout=timeout)
+                result_queue.put((True, response))
+            except Exception as exc:
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=_request, name="mcp-http-post", daemon=True)
+        thread.start()
+        deadline = time.monotonic() + timeout
+        keepalive_seconds = progress_keepalive_seconds()
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.error(
+                    "MCP HTTP request timed out",
+                    extra={
+                        "tool": "mcp_client",
+                        "url": self._server_url,
+                        "method": payload.get("method"),
+                        "timeout_seconds": timeout,
+                    },
+                )
+                return None
+            try:
+                ok, value = result_queue.get(timeout=min(keepalive_seconds, remaining))
+                break
+            except queue.Empty:
+                notify_progress(progress_stage)
+
+        if not ok:
+            exc = value
             logger.error(
                 "MCP HTTP request failed",
-                extra={"tool": "mcp_client", "url": self._server_url, "error": str(exc)},
+                extra={
+                    "tool": "mcp_client",
+                    "url": self._server_url,
+                    "method": payload.get("method"),
+                    "error": str(exc),
+                },
             )
             return None
+        response = value
         if response.status_code == 202:
             return None
         return response
@@ -380,6 +431,9 @@ class RoutedMcpClient:
         }
         self._tool_server_map = _load_tool_server_map()
         self._started_servers: set[str] = set()
+        self._startup_locks: Dict[str, threading.Lock] = {
+            server_name: threading.Lock() for server_name in self._clients
+        }
 
     def start(self) -> None:
         # Keep startup lightweight; connect lazily per route.
@@ -402,9 +456,12 @@ class RoutedMcpClient:
                 raw={},
             )
         if server_name not in self._started_servers:
-            client.start()
-            self._started_servers.add(server_name)
-            logger.info("MCP route started", extra={"tool": name, "server": server_name})
+            startup_lock = self._startup_locks.setdefault(server_name, threading.Lock())
+            with startup_lock:
+                if server_name not in self._started_servers:
+                    client.start()
+                    self._started_servers.add(server_name)
+                    logger.info("MCP route started", extra={"tool": name, "server": server_name})
 
         logger.info("MCP tool routed", extra={"tool": name, "server": server_name})
         return client.call_tool(name, arguments)

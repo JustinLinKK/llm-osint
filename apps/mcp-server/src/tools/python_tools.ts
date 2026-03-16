@@ -772,6 +772,9 @@ function inferResearchArtifacts(toolName: string, output: unknown): ResearchArti
     for (const htmlPath of asStringArray(payload.html_files)) {
       addResearchArtifact(artifacts, { sourcePath: htmlPath, sourceType: "html", contentType: "text/html" });
     }
+    for (const jsonPath of asStringArray(payload.json_files)) {
+      addResearchArtifact(artifacts, { sourcePath: jsonPath, sourceType: "json", contentType: "application/json" });
+    }
   }
 
   if (
@@ -1357,7 +1360,36 @@ function compactResearchOutput(toolName: string, output: unknown, stored: Stored
     const compact: Record<string, unknown> = {
       reset_session: output.reset_session === true,
       session_reset: output.session_reset === true,
+      profile: typeof output.profile === "string" ? output.profile : "",
+      username: typeof output.username === "string" ? output.username : "",
+      linkedin_username: typeof output.linkedin_username === "string" ? output.linkedin_username : "",
+      username_candidates: asStringArray(output.username_candidates).slice(0, 10),
+      file_count: typeof output.file_count === "number" ? output.file_count : 0,
+      output_dir: typeof output.output_dir === "string" ? output.output_dir : "",
+      html_files: asStringArray(output.html_files).slice(0, 5),
+      json_files: asStringArray(output.json_files).slice(0, 5),
+      cross_platform_profiles: asObjectArray(output.cross_platform_profiles).slice(0, 10).map((item) => ({
+        platform: typeof item.platform === "string" ? item.platform : "",
+        username: typeof item.username === "string" ? item.username : "",
+        url: typeof item.url === "string" ? item.url : "",
+      })),
+      email_domains: asStringArray(output.email_domains).slice(0, 10),
       evidence: minimalEvidenceRef(stored),
+    };
+    const contactInfo = isObjectRecord(output.contact_info) ? output.contact_info : {};
+    compact.contact_info = {
+      overlay_url: typeof contactInfo.overlay_url === "string" ? contactInfo.overlay_url : "",
+      emails: asStringArray(contactInfo.emails).slice(0, 10),
+      phones: asStringArray(contactInfo.phones).slice(0, 10),
+      websites: asStringArray(contactInfo.websites).slice(0, 10),
+      profiles: asStringArray(contactInfo.profiles).slice(0, 10),
+      addresses: asStringArray(contactInfo.addresses).slice(0, 5),
+      birthdays: asStringArray(contactInfo.birthdays).slice(0, 5),
+      sections: asObjectArray(contactInfo.sections).slice(0, 10).map((section) => ({
+        label: trimText(section.label, 80),
+        values: asStringArray(section.values).slice(0, 5),
+        links: asStringArray(section.links).slice(0, 5),
+      })),
     };
     return compact;
   }

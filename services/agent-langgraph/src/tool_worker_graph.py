@@ -17,6 +17,7 @@ from mcp_client import McpClientProtocol
 from openrouter_llm import OpenRouterLLM, get_openrouter_timeout, invoke_complete_json
 from receipt_store import insert_artifact, insert_artifact_summary, insert_run_note, insert_tool_receipt
 from run_events import emit_run_event
+from run_monitor import wait_with_progress
 from system_prompts import (
     ACADEMIC_IDENTITY_TOOL_SUMMARY_SYSTEM_PROMPT,
     ARCHIVE_DIFF_TOOL_SUMMARY_SYSTEM_PROMPT,
@@ -241,6 +242,8 @@ class ToolWorkerState(TypedDict):
     run_id: str
     tool_name: str
     arguments: Dict[str, Any]
+    primary_target_contract: Dict[str, Any]
+    primary_graph_template: Dict[str, Any]
     ok: bool
     result: Dict[str, Any]
     tool_result_summary: str
@@ -254,6 +257,19 @@ class ToolWorkerState(TypedDict):
 class ToolWorkerResult:
     receipt: ToolReceipt
     result: Dict[str, Any]
+
+
+def _model_like_to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dict(dumped)
+    return {}
 
 
 def _is_http_url(value: str) -> bool:
@@ -470,7 +486,7 @@ def _throttle_tool_request(tool_name: str) -> None:
         now = time.monotonic()
         wait_seconds = TAVILY_REQUEST_MIN_GAP_SECONDS - (now - _TAVILY_LAST_REQUEST_AT)
         if wait_seconds > 0:
-            time.sleep(wait_seconds)
+            wait_with_progress(wait_seconds, f"TOOL_RATE_LIMIT_WAIT:{tool_name}")
         _TAVILY_LAST_REQUEST_AT = time.monotonic()
 
 
@@ -526,7 +542,7 @@ def _call_tool_with_rate_limit_control(
             not_before_at = max(_TAVILY_LAST_REQUEST_AT + TAVILY_REQUEST_MIN_GAP_SECONDS, _TAVILY_NOT_BEFORE_AT)
             wait_seconds = not_before_at - now
             if wait_seconds > 0:
-                time.sleep(wait_seconds)
+                wait_with_progress(wait_seconds, f"TOOL_RATE_LIMIT_WAIT:{tool_name}")
             result = mcp_client.call_tool(tool_name, arguments)
             _TAVILY_LAST_REQUEST_AT = time.monotonic()
             if not _is_tavily_rate_limited_result(result) or attempt >= TAVILY_MAX_RETRIES:
@@ -563,15 +579,30 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
 
     def execute_tool(state: ToolWorkerState) -> Dict[str, Any]:
         emit_stage(state, "execute_tool", "started")
-        arguments = _normalize_tool_arguments(state["tool_name"], state["arguments"])
-        emit_run_event(state["run_id"], "TOOL_WORKER_STARTED", {"tool": state["tool_name"]})
-        logger.info("Tool worker executing", extra={"tool": state["tool_name"], "run_id": state["run_id"]})
-        result = _call_tool_with_rate_limit_control(
-            mcp_client,
-            state["tool_name"],
-            arguments,
-            state["run_id"],
-        )
+        arguments = dict(state["arguments"])
+        try:
+            arguments = _normalize_tool_arguments(state["tool_name"], state["arguments"])
+            emit_run_event(state["run_id"], "TOOL_WORKER_STARTED", {"tool": state["tool_name"]})
+            logger.info("Tool worker executing", extra={"tool": state["tool_name"], "run_id": state["run_id"]})
+            result = _call_tool_with_rate_limit_control(
+                mcp_client,
+                state["tool_name"],
+                arguments,
+                state["run_id"],
+            )
+        except Exception as exc:
+            error_message = f"{type(exc).__name__}: {exc}"
+            logger.exception(
+                "Tool worker execution failed",
+                extra={"tool": state["tool_name"], "run_id": state["run_id"]},
+            )
+            emit_stage(state, "execute_tool", "failed", error=error_message)
+            emit_run_event(
+                state["run_id"],
+                "TOOL_WORKER_EXECUTION_FAILED",
+                {"tool": state["tool_name"], "error": error_message},
+            )
+            return {"arguments": arguments, "ok": False, "result": {"error": error_message}}
         emit_stage(state, "execute_tool", "completed", ok=result.ok)
         return {"arguments": arguments, "ok": result.ok, "result": result.content}
 
@@ -646,6 +677,8 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
                 arguments=state["arguments"],
                 result=state.get("result", {}),
                 tool_result_summary=state.get("tool_result_summary", ""),
+                primary_target_contract=state.get("primary_target_contract", {}),
+                primary_graph_template=state.get("primary_graph_template", {}),
             )
         except Exception as exc:
             logger.exception(
@@ -751,15 +784,29 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             + next_pivots["next_queries"]
         )
 
-        artifact_ids, document_ids, summary_id = _store_artifacts_and_summary(
-            state["run_id"],
-            state["tool_name"],
-            state["arguments"],
-            state.get("result", {}),
-            summary,
-            key_facts,
-            confidence_score,
-        )
+        artifact_ids: List[str] = []
+        document_ids: List[str] = []
+        summary_id: str | None = None
+        try:
+            artifact_ids, document_ids, summary_id = _store_artifacts_and_summary(
+                state["run_id"],
+                state["tool_name"],
+                state["arguments"],
+                state.get("result", {}),
+                summary,
+                key_facts,
+                confidence_score,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Tool worker artifact persistence failed",
+                extra={"tool": state["tool_name"], "run_id": state["run_id"]},
+            )
+            emit_run_event(
+                state["run_id"],
+                "TOOL_RECEIPT_PERSIST_FAILED",
+                {"tool": state["tool_name"], "phase": "artifacts", "error": str(exc)},
+            )
 
         receipt = ToolReceipt(
             run_id=state["run_id"],
@@ -784,28 +831,50 @@ def build_tool_worker_graph(mcp_client: McpClientProtocol) -> StateGraph:
             next_queries=next_pivots["next_queries"],
         )
 
-        insert_tool_receipt(
-            run_id=state["run_id"],
-            tool_name=state["tool_name"],
-            ok=bool(state.get("ok", False)),
-            arguments=state["arguments"],
-            summary_id=summary_id,
-            artifact_ids=artifact_ids,
-            vector_upserts=vector_upserts,
-            graph_upserts=graph_upserts,
-            next_hints=next_hints,
-            next_urls=next_pivots["next_urls"],
-            next_people=next_pivots["next_people"],
-            next_orgs=next_pivots["next_orgs"],
-            next_topics=next_pivots["next_topics"],
-            next_handles=next_pivots["next_handles"],
-            next_queries=next_pivots["next_queries"],
-        )
+        try:
+            insert_tool_receipt(
+                run_id=state["run_id"],
+                tool_name=state["tool_name"],
+                ok=bool(state.get("ok", False)),
+                arguments=state["arguments"],
+                summary_id=summary_id,
+                artifact_ids=artifact_ids,
+                vector_upserts=vector_upserts,
+                graph_upserts=graph_upserts,
+                next_hints=next_hints,
+                next_urls=next_pivots["next_urls"],
+                next_people=next_pivots["next_people"],
+                next_orgs=next_pivots["next_orgs"],
+                next_topics=next_pivots["next_topics"],
+                next_handles=next_pivots["next_handles"],
+                next_queries=next_pivots["next_queries"],
+            )
+        except Exception as exc:
+            logger.exception(
+                "Tool worker receipt persistence failed",
+                extra={"tool": state["tool_name"], "run_id": state["run_id"]},
+            )
+            emit_run_event(
+                state["run_id"],
+                "TOOL_RECEIPT_PERSIST_FAILED",
+                {"tool": state["tool_name"], "phase": "receipt", "error": str(exc)},
+            )
 
         note = _note_from_receipt(receipt)
         if note:
-            insert_run_note(state["run_id"], note, _citations_from_receipt(receipt))
-        logger.info("Tool worker receipt stored", extra={"tool": state["tool_name"], "ok": receipt.ok})
+            try:
+                insert_run_note(state["run_id"], note, _citations_from_receipt(receipt))
+            except Exception as exc:
+                logger.exception(
+                    "Tool worker run-note persistence failed",
+                    extra={"tool": state["tool_name"], "run_id": state["run_id"]},
+                )
+                emit_run_event(
+                    state["run_id"],
+                    "TOOL_RECEIPT_PERSIST_FAILED",
+                    {"tool": state["tool_name"], "phase": "note", "error": str(exc)},
+                )
+        logger.info("Tool worker receipt finalized", extra={"tool": state["tool_name"], "ok": receipt.ok})
 
         emit_run_event(state["run_id"], "TOOL_RECEIPT_READY", {"tool": state["tool_name"], "ok": receipt.ok})
         emit_stage(
@@ -962,12 +1031,17 @@ def run_tool_worker(
     run_id: str,
     tool_name: str,
     arguments: Dict[str, Any],
+    *,
+    primary_target_contract: Any | None = None,
+    primary_graph_template: Any | None = None,
 ) -> ToolWorkerResult:
     graph = build_tool_worker_graph(mcp_client)
     state: ToolWorkerState = {
         "run_id": run_id,
         "tool_name": tool_name,
         "arguments": arguments,
+        "primary_target_contract": _model_like_to_dict(primary_target_contract),
+        "primary_graph_template": _model_like_to_dict(primary_graph_template),
         "ok": False,
         "result": {},
         "tool_result_summary": "",
@@ -1064,6 +1138,8 @@ def _run_graph_ingest_worker(
     arguments: Dict[str, Any],
     result: Dict[str, Any],
     tool_result_summary: str,
+    primary_target_contract: Dict[str, Any] | None = None,
+    primary_graph_template: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     if llm is not None:
         extracted_graph = _extract_graph_construction_payload(
@@ -1073,6 +1149,8 @@ def _run_graph_ingest_worker(
             arguments=arguments,
             result=result,
             tool_result_summary=tool_result_summary,
+            primary_target_contract=primary_target_contract,
+            primary_graph_template=primary_graph_template,
         )
         entities, relations = _build_graph_construction_batches(
             run_id=run_id,
@@ -1080,6 +1158,8 @@ def _run_graph_ingest_worker(
             arguments=arguments,
             result=result,
             extracted_graph=extracted_graph,
+            primary_target_contract=primary_target_contract,
+            primary_graph_template=primary_graph_template,
         )
         if entities:
             entity_tool_result = mcp_client.call_tool(
@@ -1113,6 +1193,9 @@ def _run_graph_ingest_worker(
                 "entityCount": len(entities),
                 "relationCount": len(relations),
                 "entities": entity_tool_result.content.get("entities", []),
+                "entityIds": entity_tool_result.content.get("entityIds", []),
+                "relationIds": relation_result.get("relationIds", []) or entity_tool_result.content.get("relationIds", []),
+                "evidenceRefs": relation_result.get("evidenceRefs", []) or entity_tool_result.content.get("evidenceRefs", []),
                 "entityWarnings": entity_tool_result.content.get("warnings", []),
                 "relationWarnings": relation_result.get("warnings", []),
                 "graphSchema": "person_context_v2",
@@ -1193,6 +1276,8 @@ def _extract_graph_construction_payload(
     arguments: Dict[str, Any],
     result: Dict[str, Any],
     tool_result_summary: str,
+    primary_target_contract: Dict[str, Any] | None = None,
+    primary_graph_template: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     graph_result = _normalize_tool_result_for_graph(tool_name, arguments, result)
     payload = {
@@ -1200,6 +1285,9 @@ def _extract_graph_construction_payload(
         "arguments": arguments,
         "result": graph_result,
         "tool_result_summary": tool_result_summary,
+        "primary_target_contract": _model_like_to_dict(primary_target_contract),
+        "primary_graph_template": _model_like_to_dict(primary_graph_template),
+        "primary_root_entity_id": str((_model_like_to_dict(primary_graph_template).get("root_entity_id") or _model_like_to_dict(primary_target_contract).get("root_entity_id") or "")).strip(),
         "output_schema": {
             "entities": [
                 {
@@ -1238,6 +1326,8 @@ def _build_graph_construction_batches(
     arguments: Dict[str, Any],
     result: Dict[str, Any],
     extracted_graph: Dict[str, Any],
+    primary_target_contract: Dict[str, Any] | None = None,
+    primary_graph_template: Dict[str, Any] | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     graph_result = _normalize_tool_result_for_graph(tool_name, arguments, result)
     raw_entities = extracted_graph.get("entities")
@@ -1246,7 +1336,13 @@ def _build_graph_construction_batches(
         raw_entities = []
     if not isinstance(raw_relations, list):
         raw_relations = []
-    supplemental_entities, supplemental_relations = _supplemental_graph_components_from_result(tool_name, arguments, graph_result)
+    supplemental_entities, supplemental_relations = _supplemental_graph_components_from_result(
+        tool_name,
+        arguments,
+        graph_result,
+        primary_target_contract=_model_like_to_dict(primary_target_contract),
+        primary_graph_template=_model_like_to_dict(primary_graph_template),
+    )
     raw_entities = list(raw_entities) + supplemental_entities
     raw_relations = list(raw_relations) + supplemental_relations
 
@@ -2119,6 +2215,108 @@ def _graph_name_signature(value: str) -> str:
     return normalized
 
 
+def _graph_requested_target_aliases(arguments: Dict[str, Any], fallback_names: List[str] | None = None) -> List[str]:
+    aliases: List[str] = []
+    for value in [
+        arguments.get("person_name"),
+        arguments.get("target_name"),
+        arguments.get("name"),
+        arguments.get("author"),
+        *(fallback_names or []),
+    ]:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            continue
+        aliases.append(cleaned)
+        aliases.extend(extract_person_targets(cleaned))
+    return _graph_unique_strings([item for item in aliases if item.strip()])
+
+
+def _graph_contract_aliases(
+    primary_target_contract: Dict[str, Any] | None,
+    primary_graph_template: Dict[str, Any] | None,
+) -> List[str]:
+    aliases: List[str] = []
+    contract = primary_target_contract if isinstance(primary_target_contract, dict) else {}
+    template = primary_graph_template if isinstance(primary_graph_template, dict) else {}
+    for value in [
+        contract.get("canonical_name"),
+        template.get("root_canonical_name"),
+        *(contract.get("prompt_targets") if isinstance(contract.get("prompt_targets"), list) else []),
+        *(contract.get("approved_aliases") if isinstance(contract.get("approved_aliases"), list) else []),
+        *(template.get("root_aliases") if isinstance(template.get("root_aliases"), list) else []),
+    ]:
+        cleaned = str(value or "").strip()
+        if cleaned:
+            aliases.append(cleaned)
+    return _graph_unique_strings(aliases)
+
+
+def _graph_contract_root_name(
+    primary_target_contract: Dict[str, Any] | None,
+    primary_graph_template: Dict[str, Any] | None,
+) -> str:
+    template = primary_graph_template if isinstance(primary_graph_template, dict) else {}
+    contract = primary_target_contract if isinstance(primary_target_contract, dict) else {}
+    return str(template.get("root_canonical_name") or contract.get("canonical_name") or "").strip()
+
+
+def _graph_name_matches_requested_aliases(name: str, aliases: List[str]) -> bool:
+    candidate_signature = _graph_name_signature(name)
+    if not candidate_signature:
+        return False
+    return any(candidate_signature == _graph_name_signature(alias) for alias in aliases if str(alias).strip())
+
+
+def _graph_text_mentions_requested_aliases(text: str, aliases: List[str]) -> bool:
+    normalized_text = f" {_graph_name_signature(text)} "
+    for alias in aliases:
+        alias_signature = _graph_name_signature(alias)
+        if alias_signature and f" {alias_signature} " in normalized_text:
+            return True
+    return False
+
+
+def _graph_value_mentions_requested_aliases(
+    value: Any,
+    aliases: List[str],
+    *,
+    ignored_keys: set[str] | None = None,
+) -> bool:
+    if not aliases:
+        return False
+    ignored_keys = {key.casefold() for key in (ignored_keys or set())}
+    if isinstance(value, str):
+        return _graph_text_mentions_requested_aliases(value, aliases)
+    if isinstance(value, list):
+        return any(
+            _graph_value_mentions_requested_aliases(item, aliases, ignored_keys=ignored_keys)
+            for item in value[:30]
+        )
+    if isinstance(value, dict):
+        for key, item in list(value.items())[:30]:
+            if str(key).casefold() in ignored_keys:
+                continue
+            if _graph_value_mentions_requested_aliases(item, aliases, ignored_keys=ignored_keys):
+                return True
+    return False
+
+
+def _graph_result_identity_matches_requested_target(result: Dict[str, Any], requested_aliases: List[str]) -> bool:
+    if not requested_aliases:
+        return True
+    if bool(result.get("resolved_primary_person_matches_target")):
+        return True
+    identity_fields = [
+        str(result.get("display_name") or "").strip(),
+        str(result.get("canonical_name") or "").strip(),
+    ]
+    return any(
+        candidate and _graph_name_matches_requested_aliases(candidate, requested_aliases)
+        for candidate in identity_fields
+    )
+
+
 def _graph_repository_key(values: List[str], attributes: List[str]) -> str:
     candidates = list(values) + _graph_attribute_values(attributes, "url", "id")
     for candidate in candidates:
@@ -2471,6 +2669,48 @@ GRAPH_SEARCH_NOISY_PERSON_PHRASES = (
     "google scholar",
     "semantic scholar",
 )
+GRAPH_SEARCH_NON_PERSON_TOKENS = {
+    "startup",
+    "scholarship",
+    "fellowship",
+    "conference",
+    "conferences",
+    "journal",
+    "journals",
+    "paper",
+    "papers",
+    "project",
+    "projects",
+    "initiative",
+    "initiatives",
+    "program",
+    "programs",
+    "city",
+    "country",
+    "countries",
+    "states",
+    "province",
+    "county",
+    "government",
+    "parliament",
+    "beach",
+    "beaches",
+    "hotel",
+    "hotels",
+    "tourism",
+    "university",
+    "college",
+    "school",
+    "department",
+    "institute",
+    "laboratory",
+    "lab",
+    "labs",
+}
+GRAPH_SEARCH_NON_PERSON_PHRASES = (
+    "la jolla shores",
+    "united states",
+)
 GRAPH_SEARCH_ROLE_PATTERN = re.compile(
     r"\b("
     r"assistant professor|associate professor|postdoctoral researcher|research scientist|"
@@ -2583,9 +2823,25 @@ def _graph_is_noisy_search_person_candidate(value: str) -> bool:
     return bool(re.search(r"[@/:]|\b(?:search|result|results)\b", candidate, re.IGNORECASE))
 
 
+def _graph_has_non_person_search_person_traits(value: str) -> bool:
+    normalized = _normalize_graph_name(value)
+    if not normalized:
+        return True
+    if any(phrase == normalized or f" {phrase} " in f" {normalized} " for phrase in GRAPH_SEARCH_NON_PERSON_PHRASES):
+        return True
+    tokens = [token for token in normalized.split() if token]
+    if any(token in GRAPH_SEARCH_NON_PERSON_TOKENS for token in tokens):
+        return True
+    return False
+
+
 def _graph_is_valid_search_person_candidate(value: str) -> bool:
     candidate = str(value or "").strip()
-    if not candidate or _graph_is_noisy_search_person_candidate(candidate):
+    if (
+        not candidate
+        or _graph_is_noisy_search_person_candidate(candidate)
+        or _graph_has_non_person_search_person_traits(candidate)
+    ):
         return False
     return _graph_looks_like_person_name(candidate)
 
@@ -2894,10 +3150,25 @@ def _normalize_search_like_result_for_graph(tool_name: str, arguments: Dict[str,
             str(arguments.get("name") or "").strip(),
         ]
     )
+    requested_aliases = _graph_requested_target_aliases(
+        arguments,
+        [
+            str(result.get("target_name") or "").strip(),
+            str(result.get("input") or "").strip() if tool_name == "tavily_research" else "",
+        ],
+    )
     resolved_primary_person = _graph_resolve_primary_person_from_rows(rows, fallback_names)
     if resolved_primary_person:
         normalized["resolved_primary_person"] = resolved_primary_person
-        if not str(normalized.get("canonical_name") or "").strip() or _graph_is_noisy_search_person_candidate(str(normalized.get("canonical_name") or "")):
+        matches_requested_target = _graph_name_matches_requested_aliases(
+            resolved_primary_person,
+            requested_aliases,
+        )
+        normalized["resolved_primary_person_matches_target"] = matches_requested_target
+        if matches_requested_target and (
+            not str(normalized.get("canonical_name") or "").strip()
+            or _graph_is_noisy_search_person_candidate(str(normalized.get("canonical_name") or ""))
+        ):
             normalized["canonical_name"] = resolved_primary_person
 
     external_links: List[Dict[str, Any]] = []
@@ -3079,32 +3350,59 @@ def _normalize_tool_result_for_graph(tool_name: str, arguments: Dict[str, Any], 
 
 
 def _graph_primary_people_from_context(tool_name: str, arguments: Dict[str, Any], result: Dict[str, Any]) -> List[str]:
-    ordered_candidates = (
+    requested_aliases = _graph_requested_target_aliases(
+        arguments,
         [
-            str(result.get("resolved_primary_person") or "").strip(),
-            str(result.get("display_name") or "").strip(),
-            str(result.get("canonical_name") or "").strip(),
-            str(arguments.get("person_name") or "").strip(),
-            str(arguments.get("target_name") or "").strip(),
-            str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "",
-            str(arguments.get("author") or "").strip(),
             str(result.get("target_name") or "").strip(),
             str(result.get("name") or "").strip(),
             str(result.get("input") or "").strip() if tool_name == "tavily_research" else "",
-        ]
-        if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr"
-        else [
-            str(arguments.get("person_name") or "").strip(),
-            str(arguments.get("target_name") or "").strip(),
-            str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "",
-            str(arguments.get("author") or "").strip(),
-            str(result.get("display_name") or "").strip(),
-            str(result.get("canonical_name") or "").strip(),
-        ]
+        ],
     )
+    if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr":
+        ordered_candidates = [
+            (
+                str(result.get("resolved_primary_person") or "").strip(),
+                bool(result.get("resolved_primary_person_matches_target")),
+            ),
+            (
+                str(result.get("display_name") or "").strip(),
+                _graph_name_matches_requested_aliases(str(result.get("display_name") or "").strip(), requested_aliases) if requested_aliases else True,
+            ),
+            (
+                str(result.get("canonical_name") or "").strip(),
+                _graph_name_matches_requested_aliases(str(result.get("canonical_name") or "").strip(), requested_aliases) if requested_aliases else True,
+            ),
+            (str(arguments.get("person_name") or "").strip(), True),
+            (str(arguments.get("target_name") or "").strip(), True),
+            (str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "", True),
+            (str(arguments.get("author") or "").strip(), True),
+            (
+                str(result.get("target_name") or "").strip(),
+                _graph_name_matches_requested_aliases(str(result.get("target_name") or "").strip(), requested_aliases) if requested_aliases else True,
+            ),
+            (
+                str(result.get("name") or "").strip(),
+                _graph_name_matches_requested_aliases(str(result.get("name") or "").strip(), requested_aliases) if requested_aliases else True,
+            ),
+            (
+                str(result.get("input") or "").strip() if tool_name == "tavily_research" else "",
+                _graph_name_matches_requested_aliases(str(result.get("input") or "").strip(), requested_aliases) if requested_aliases and tool_name == "tavily_research" else True,
+            ),
+        ]
+    else:
+        ordered_candidates = [
+            (str(arguments.get("person_name") or "").strip(), True),
+            (str(arguments.get("target_name") or "").strip(), True),
+            (str(arguments.get("name") or "").strip() if tool_name in {"person_search", "tavily_person_search"} else "", True),
+            (str(arguments.get("author") or "").strip(), True),
+            (str(result.get("display_name") or "").strip(), True),
+            (str(result.get("canonical_name") or "").strip(), True),
+        ]
     candidates = []
-    for candidate in ordered_candidates:
+    for candidate, allowed in ordered_candidates:
         if not candidate:
+            continue
+        if not allowed:
             continue
         if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr":
             if not _graph_is_valid_search_person_candidate(candidate):
@@ -3139,6 +3437,9 @@ def _supplemental_graph_components_from_result(
     tool_name: str,
     arguments: Dict[str, Any],
     result: Dict[str, Any],
+    *,
+    primary_target_contract: Dict[str, Any] | None = None,
+    primary_graph_template: Dict[str, Any] | None = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     entities_by_key: Dict[str, Dict[str, Any]] = {}
     relations_by_key: Dict[str, Dict[str, Any]] = {}
@@ -3700,6 +4001,9 @@ def _supplemental_graph_components_from_result(
             ]
         )
 
+    contract_aliases = _graph_contract_aliases(primary_target_contract, primary_graph_template)
+    seeded_root_name = _graph_contract_root_name(primary_target_contract, primary_graph_template)
+
     primary_people = _graph_primary_people_from_context(tool_name, arguments, result)
     if not primary_people:
         query = result.get("query")
@@ -3709,7 +4013,27 @@ def _supplemental_graph_components_from_result(
                 arguments,
                 {"query": query, **result},
             )
+    if tool_name in {"person_search", "tavily_person_search", "google_serp_person_search"} and not primary_people:
+        return [], []
+    if seeded_root_name and primary_people:
+        canonicalized_primary_people: List[str] = []
+        for person_name in primary_people:
+            if _graph_name_matches_requested_aliases(person_name, contract_aliases):
+                canonicalized_primary_people.append(seeded_root_name)
+            else:
+                canonicalized_primary_people.append(person_name)
+        primary_people = _graph_unique_strings(canonicalized_primary_people)
     primary_person = primary_people[0] if primary_people else None
+    requested_primary_aliases = _graph_unique_strings(
+        _graph_requested_target_aliases(arguments, primary_people) + contract_aliases
+    )
+    if tool_name in GRAPH_SEARCH_NORMALIZER_TOOL_NAMES or tool_name == "linkedin_download_html_ocr":
+        root_primary_anchor = _graph_result_identity_matches_requested_target(
+            result,
+            requested_primary_aliases,
+        )
+    else:
+        root_primary_anchor = bool(primary_person)
     for person_name in primary_people[:3]:
         add_entity(person_name, "Person")
     timeline_mention_sources: List[str] = []
@@ -4001,8 +4325,6 @@ def _supplemental_graph_components_from_result(
             consumed_urls.add(pub_url.lower())
         add_entity(pub_name, "Publication", attributes=pub_attributes)
         link_entity_to_time_node(pub_name, date=year[:4] if year else "")
-        if primary_person:
-            add_relation(primary_person, pub_name, "PUBLISHED")
         authors = []
         author_values = publication.get("authors") or publication.get("coauthors") or publication.get("author_names") or []
         if isinstance(author_values, list):
@@ -4013,40 +4335,48 @@ def _supplemental_graph_components_from_result(
                     authors.append(str(author.get("name")).strip())
         elif isinstance(author_values, str):
             authors.extend([part.strip() for part in re.split(r"\s*,\s*|\s+and\s+", author_values) if part.strip()])
+        publication_mentions_primary = root_primary_anchor or _graph_value_mentions_requested_aliases(
+            publication,
+            requested_primary_aliases,
+        )
+        if primary_person and publication_mentions_primary:
+            add_relation(primary_person, pub_name, "PUBLISHED")
         for author_name in _graph_unique_strings(authors)[:12]:
             add_entity(author_name, "Person")
             add_relation(author_name, pub_name, "PUBLISHED")
-            if primary_person and author_name.casefold() != primary_person.casefold():
+            if primary_person and publication_mentions_primary and author_name.casefold() != primary_person.casefold():
                 add_relation(primary_person, author_name, "COAUTHORED_WITH")
         pub_topics = publication_topics(publication)
         for topic in pub_topics[:12]:
             add_entity(topic, "Topic", attributes=["topic_kind: research"])
             add_relation(pub_name, topic, "HAS_TOPIC")
-            if primary_person:
+            if primary_person and publication_mentions_primary:
                 add_relation(primary_person, topic, "RESEARCHES")
             for author_name in _graph_unique_strings(authors)[:12]:
                 add_relation(author_name, topic, "RESEARCHES")
         affiliations = publication.get("affiliations")
         if isinstance(affiliations, list):
             for affiliation in [str(item).strip() for item in affiliations if isinstance(item, str) and str(item).strip()][:8]:
-                add_affiliation_context(
-                    primary_person,
-                    affiliation,
-                    relation="publication affiliation",
-                    why_relevant=f"publication affiliation for {pub_name}",
-                )
+                if primary_person and publication_mentions_primary:
+                    add_affiliation_context(
+                        primary_person,
+                        affiliation,
+                        relation="publication affiliation",
+                        why_relevant=f"publication affiliation for {pub_name}",
+                    )
         elif isinstance(affiliations, str) and affiliations.strip():
             for affiliation in [part.strip() for part in re.split(r"\s*;\s*|\s*,\s*", affiliations) if part.strip()][:8]:
-                add_affiliation_context(
-                    primary_person,
-                    affiliation,
-                    relation="publication affiliation",
-                    why_relevant=f"publication affiliation for {pub_name}",
-                )
+                if primary_person and publication_mentions_primary:
+                    add_affiliation_context(
+                        primary_person,
+                        affiliation,
+                        relation="publication affiliation",
+                        why_relevant=f"publication affiliation for {pub_name}",
+                    )
         if venue:
             add_entity(venue, "Conference", attributes=[f"year: {year[:4]}"] if year else [])
             add_relation(pub_name, venue, "PUBLISHED_IN")
-        if primary_person and year:
+        if primary_person and publication_mentions_primary and year:
             add_timeline_event(
                 primary_person,
                 f"Published {pub_name}",
@@ -4062,7 +4392,11 @@ def _supplemental_graph_components_from_result(
         if not candidate_name:
             continue
         add_entity(candidate_name, "Person")
-        if primary_person and candidate_name.casefold() != primary_person.casefold():
+        candidate_mentions_primary = _graph_value_mentions_requested_aliases(
+            candidate,
+            requested_primary_aliases,
+        )
+        if primary_person and candidate_name.casefold() != primary_person.casefold() and candidate_mentions_primary:
             add_relation(primary_person, candidate_name, "RELATED_TO", canonical_name="candidate_match")
         profile_url = str(candidate.get("profile_url") or candidate.get("homepage") or "").strip()
         if profile_url:
@@ -4154,7 +4488,7 @@ def _supplemental_graph_components_from_result(
         if not name:
             continue
         add_entity(name, "Person")
-        if primary_person:
+        if primary_person and root_primary_anchor:
             add_relation(primary_person, name, "COAUTHORED_WITH")
         email = str(coauthor.get("email") or "").strip()
         if email:
@@ -4167,7 +4501,7 @@ def _supplemental_graph_components_from_result(
         if not name:
             continue
         add_entity(name, "Person")
-        if primary_person and name.casefold() != primary_person.casefold():
+        if primary_person and root_primary_anchor and name.casefold() != primary_person.casefold():
             add_relation(primary_person, name, "COAUTHORED_WITH")
         email = str(contact.get("email") or "").strip()
         if email:
@@ -4178,7 +4512,7 @@ def _supplemental_graph_components_from_result(
         if not venue_name:
             continue
         add_entity(venue_name, "Conference")
-        if primary_person:
+        if primary_person and root_primary_anchor:
             add_relation(primary_person, venue_name, "PUBLISHED_IN")
 
     award_records: List[Any] = []
@@ -4689,33 +5023,69 @@ def _supplemental_graph_components_from_result(
             consumed_urls.add(filing_url.lower())
 
     for affiliation in _extract_arxiv_affiliations(result.get("extracted_entries"))[:10]:
-        add_affiliation_context(
-            primary_person,
-            affiliation,
-            relation="arxiv affiliation",
-            why_relevant="derived from arXiv author metadata",
-        )
+        if primary_person and root_primary_anchor:
+            add_affiliation_context(
+                primary_person,
+                affiliation,
+                relation="arxiv affiliation",
+                why_relevant="derived from arXiv author metadata",
+            )
     for coauthor in _extract_arxiv_coauthors(result.get("extracted_entries"), exclude_names=primary_people)[:12]:
         add_entity(coauthor, "Person")
-        if primary_person:
+        if primary_person and root_primary_anchor:
             add_relation(primary_person, coauthor, "COAUTHORED_WITH")
 
-    for url in _extract_url_candidates(result)[:20]:
-        cleaned = _clean_url_candidate(url)
-        if not cleaned or cleaned.lower() in consumed_urls or _is_graph_noise_url(cleaned):
+    explicit_resource_urls: List[str] = []
+    for key in (
+        "profile_url",
+        "profileUrl",
+        "profile",
+        "source_url",
+        "sourceUrl",
+        "document_url",
+        "documentUrl",
+        "pdf_url",
+        "pdfUrl",
+        "homepage",
+        "website",
+        "website_url",
+        "overlay_url",
+    ):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            explicit_resource_urls.append(value)
+    evidence = result.get("evidence")
+    if isinstance(evidence, dict):
+        for key in ("sourceUrl", "url", "document_url", "documentUrl", "pdf_url", "pdfUrl"):
+            value = evidence.get(key)
+            if isinstance(value, str) and value.strip():
+                explicit_resource_urls.append(value)
+    for artifact in result.get("artifactDocuments", []) if isinstance(result.get("artifactDocuments"), list) else []:
+        if not isinstance(artifact, dict):
             continue
-        lower_url = cleaned.lower()
-        entity_type = "Document" if lower_url.endswith(".pdf") or any(token in lower_url for token in ("/thesis", "/dissertation", "cv.pdf")) else "Website"
-        attributes = [f"url: {cleaned}"]
-        if entity_type == "Document" and any(token in lower_url for token in ("thesis", "dissertation")):
-            attributes.append("document_type: thesis")
-        add_entity(cleaned, entity_type, attributes=attributes)
-        host = (urlparse(cleaned).hostname or "").lower()
-        if host.startswith("www."):
-            host = host[4:]
-        if host:
-            add_entity(host, "Domain", attributes=[f"host: {host}"])
-            add_relation(cleaned, host, "HAS_DOMAIN")
+        for key in ("sourceUrl", "url", "document_url", "documentUrl", "pdf_url", "pdfUrl"):
+            value = artifact.get(key)
+            if isinstance(value, str) and value.strip():
+                explicit_resource_urls.append(value)
+
+    anchored_owner = primary_person or company_name
+    if anchored_owner:
+        for url in explicit_resource_urls[:20]:
+            cleaned = _clean_url_candidate(url)
+            if not cleaned or cleaned.lower() in consumed_urls or _is_graph_noise_url(cleaned):
+                continue
+            lower_url = cleaned.lower()
+            relation_type = (
+                "HAS_DOCUMENT"
+                if lower_url.endswith(".pdf") or any(token in lower_url for token in ("/thesis", "/dissertation", "cv.pdf"))
+                else "HAS_PROFILE"
+            )
+            add_profile(
+                anchored_owner,
+                cleaned,
+                relation_type=relation_type,
+                subject_name=anchored_owner,
+            )
 
     ordered_time_nodes = sorted(
         [
@@ -5125,12 +5495,27 @@ def _summarize_result(
             summary = f"LinkedIn capture did not produce usable artifacts for {profile or 'profile'}: {command_issue}"
         key_facts.append({"profile": profile, "fileCount": result.get("file_count")})
         key_facts.append({"outputDir": result.get("output_dir")})
+        username = str(result.get("username") or result.get("linkedin_username") or "").strip()
+        username_candidates = _extract_string_list(result.get("username_candidates"))[:10]
+        raw_cross_platform_profiles = result.get("cross_platform_profiles")
+        cross_platform_profiles = [
+            item for item in raw_cross_platform_profiles
+            if isinstance(item, dict)
+        ][:10] if isinstance(raw_cross_platform_profiles, list) else []
+        if username:
+            key_facts.append({"username": username})
+        if username_candidates:
+            key_facts.append({"usernames": username_candidates})
+        if cross_platform_profiles:
+            key_facts.append({"externalLinks": cross_platform_profiles})
         contact_info = result.get("contact_info") if isinstance(result.get("contact_info"), dict) else {}
         if contact_info:
             emails = _extract_string_list(contact_info.get("emails"))
             phones = _extract_string_list(contact_info.get("phones"))
             websites = _extract_string_list(contact_info.get("websites"))
             profiles = _extract_string_list(contact_info.get("profiles"))
+            addresses = _extract_string_list(contact_info.get("addresses"))
+            birthdays = _extract_string_list(contact_info.get("birthdays"))
             overlay_url = str(contact_info.get("overlay_url") or "").strip()
             if emails:
                 key_facts.append({"emails": emails[:10]})
@@ -5140,6 +5525,10 @@ def _summarize_result(
                 key_facts.append({"sourceUrls": websites[:10]})
             if profiles:
                 key_facts.append({"profileUrls": profiles[:10]})
+            if addresses:
+                key_facts.append({"addresses": addresses[:5]})
+            if birthdays:
+                key_facts.append({"birthdays": birthdays[:5]})
             if overlay_url:
                 key_facts.append({"contactOverlayUrl": overlay_url})
             if emails or phones or websites or profiles:
@@ -5150,13 +5539,15 @@ def _summarize_result(
             next_hints = _dedupe_str_list(
                 ([str(profile)] if profile else [])
                 + ([overlay_url] if overlay_url else [])
+                + ([username] if username else [])
+                + username_candidates
                 + emails[:10]
                 + phones[:10]
                 + websites[:10]
                 + profiles[:10]
             )
         elif profile:
-            next_hints = [str(profile)]
+            next_hints = _dedupe_str_list(([str(profile)] if profile else []) + ([username] if username else []) + username_candidates)
         return summary, key_facts, vector_upserts, graph_upserts, next_hints
 
     if tool_name in {"google_serp_person_search", "tavily_person_search", "tavily_research"}:
@@ -6325,7 +6716,7 @@ def _vector_upsert_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
     output: Dict[str, Any] = {}
-    for key in ("vectorCount", "chunkCount", "collection", "embeddingModel", "documentId"):
+    for key in ("vectorCount", "chunkCount", "collection", "embeddingModel", "documentId", "chunkIds"):
         if key in result:
             output[key] = result.get(key)
     return output
@@ -6335,7 +6726,7 @@ def _graph_upsert_from_result(result: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(result, dict):
         return {}
     output: Dict[str, Any] = {}
-    for key in ("entityType", "relationCount", "count", "entityCount", "graphSchema"):
+    for key in ("entityType", "relationCount", "count", "entityCount", "graphSchema", "entityIds", "relationIds", "evidenceRefs"):
         if key in result:
             output[key] = result.get(key)
     return output
@@ -6713,7 +7104,7 @@ def _extract_evidence_refs_from_arguments(tool_name: str, arguments: Dict[str, A
     def add_ref(ref: Any) -> None:
         if not isinstance(ref, dict):
             return
-        if (ref.get("bucket") and ref.get("objectKey")) or ref.get("documentId"):
+        if (ref.get("bucket") and ref.get("objectKey")) or ref.get("documentId") or ref.get("chunkId") or ref.get("sourceUrl"):
             evidence_refs.append(ref)
 
     def parse_json(value: Any) -> Any:

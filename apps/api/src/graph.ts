@@ -124,6 +124,22 @@ function truncateGraphText(value: string, maxLength: number): string {
   return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function compactNodeProperties(node: AnnotatedNode): Record<string, unknown> {
+  const compact: Record<string, unknown> = {
+    type: node.effectiveType,
+  };
+  if (node.properties.synthetic === true) compact.synthetic = true;
+  return compact;
+}
+
+function compactEdgeProperties(edge: AnnotatedEdge): Record<string, unknown> {
+  const compact: Record<string, unknown> = {
+    rel_type: edge.semanticType,
+  };
+  if (edge.properties.synthetic === true) compact.synthetic = true;
+  return compact;
+}
+
 function formatRelationType(type: string): string {
   return type
     .toLowerCase()
@@ -1300,7 +1316,7 @@ export function projectRunGraph(
     .map((node) => ({
       id: node.id,
       labels: node.labels,
-      properties: node.properties,
+      properties: compactNodeProperties(node),
       display: node.display,
     }));
 
@@ -1310,7 +1326,7 @@ export function projectRunGraph(
     target: edge.target,
     type: edge.type,
     display: edge.display,
-    properties: edge.properties,
+    properties: compactEdgeProperties(edge),
   }));
 
   return {
@@ -1320,7 +1336,7 @@ export function projectRunGraph(
     totalEdges: survivingEdges.length,
     rootNodeId,
     rootDisplay: rootNodeId ? projectedNodes.get(rootNodeId)?.display ?? null : null,
-    recommendedLayout: rootNodeId ? "grouped" : "cose",
+    recommendedLayout: rootNodeId ? "radial" : "cose",
     recommendedEgoDepth: rootNodeId ? 2 : 1,
   };
 }

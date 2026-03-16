@@ -345,6 +345,7 @@ export function registerIngestText(server: McpServer) {
         const output = {
           documentId,
           chunkCount: chunks.length,
+          chunkIds: chunks.map((chunk) => chunk.chunkId),
           vectorCount: embeddings.length,
           collection: cfg.qdrant.collection,
           embeddingModel: cfg.embeddings.model,

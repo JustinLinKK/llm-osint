@@ -62,6 +62,7 @@ Useful variants:
 ```bash
 yarn infra:ps
 yarn infra:up:build
+yarn infra:rebuild:all-lite
 yarn infra:restart:all-lite
 yarn infra:restart:api
 yarn infra:restart:embedding
@@ -87,11 +88,7 @@ This is required so the dev container can resolve compose service names like `po
 ## 5. Apply database migrations
 
 ```bash
-PG_CID=$(docker compose -f infra/docker/docker-compose.yml ps -q postgres)
-for f in infra/db/migrations/*.sql; do
-  echo "Applying $f"
-  docker exec -i "$PG_CID" psql -U osint -d osint < "$f"
-done
+yarn db:migrate
 ```
 
 Current migration set:
@@ -103,6 +100,7 @@ Current migration set:
 - `0005_evidence_links.sql`
 - `0006_run_titles.sql`
 - `0007_stage2_reports.sql`
+- `0008_typed_receipt_pivots.sql`
 
 ## 6. Start the web app
 

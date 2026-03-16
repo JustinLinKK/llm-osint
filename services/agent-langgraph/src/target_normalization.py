@@ -57,6 +57,7 @@ PERSON_CANDIDATE_BREAKWORDS = {
     "with",
     "for",
     "about",
+    "on",
     "gather",
     "collect",
     "find",
@@ -416,6 +417,15 @@ def sanitize_search_tool_arguments(
                     return candidates[0]
         return fallback
 
+    def cap_positive_int(key: str, maximum: int) -> None:
+        value = normalized.get(key)
+        if value in (None, ""):
+            return
+        try:
+            normalized[key] = max(1, min(int(value), maximum))
+        except (TypeError, ValueError):
+            return
+
     if tool_name == "person_search":
         target = coerce_target("name", "query")
         if target:
@@ -435,8 +445,10 @@ def sanitize_search_tool_arguments(
         target = coerce_target("input", "query", "target_name", "name")
         if target:
             normalized["input"] = tavily_research_query(target)
+            normalized["target_name"] = target
         elif explicit_input and not looks_like_natural_language_query(explicit_input):
             normalized["input"] = tavily_research_query(explicit_input)
+        cap_positive_int("max_results", 5)
 
     if tool_name == "tavily_person_search":
         target = coerce_target("target_name", "query", "name")
@@ -453,5 +465,12 @@ def sanitize_search_tool_arguments(
                 normalized["query"] = tavily_person_query(target)
             if "name" in normalized:
                 normalized["name"] = target
+        cap_positive_int("max_results", 5)
+
+    if tool_name == "web_search":
+        cap_positive_int("max_results", 5)
+
+    if tool_name in {"crawl_webpage", "map_webpage"}:
+        cap_positive_int("limit", 5)
 
     return normalized

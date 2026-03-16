@@ -8,15 +8,53 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+class _CompiledGraph:
+    def __init__(self, graph: "_StateGraph") -> None:
+        self._graph = graph
+
+    def invoke(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        current = self._graph.entry_point
+        working = dict(state)
+        while current and current != self._graph.END:
+            updates = self._graph.nodes[current](working)
+            if isinstance(updates, dict):
+                working.update(updates)
+            current = self._graph.edges.get(current)
+        return working
+
+
+class _StateGraph:
+    END = "__END__"
+
+    def __init__(self, _state_type: Any) -> None:
+        self.nodes: Dict[str, Any] = {}
+        self.edges: Dict[str, str] = {}
+        self.entry_point: str | None = None
+
+    def add_node(self, name: str, fn: Any) -> None:
+        self.nodes[name] = fn
+
+    def set_entry_point(self, name: str) -> None:
+        self.entry_point = name
+
+    def add_edge(self, source: str, target: str) -> None:
+        self.edges[source] = target
+
+    def compile(self) -> _CompiledGraph:
+        return _CompiledGraph(self)
+
+
 def _load_tool_worker_graph_module(monkeypatch):
     src_root = Path(__file__).resolve().parents[1] / "src"
     if str(src_root) not in sys.path:
         sys.path.insert(0, str(src_root))
+    monkeypatch.setenv("LANGGRAPH_ENABLE_WORKER_LLM", "false")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
 
     langgraph_module = types.ModuleType("langgraph")
     langgraph_graph_module = types.ModuleType("langgraph.graph")
-    langgraph_graph_module.END = "__END__"
-    langgraph_graph_module.StateGraph = object
+    langgraph_graph_module.END = _StateGraph.END
+    langgraph_graph_module.StateGraph = _StateGraph
     monkeypatch.setitem(sys.modules, "langgraph", langgraph_module)
     monkeypatch.setitem(sys.modules, "langgraph.graph", langgraph_graph_module)
 
@@ -99,7 +137,23 @@ def _load_tool_worker_graph_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "system_prompts", system_prompts_module)
 
     target_norm_module = types.ModuleType("target_normalization")
-    target_norm_module.extract_person_targets = lambda text: []
+
+    def _extract_person_targets(text: str) -> list[str]:
+        matches: list[str] = []
+        for name in (
+            "Xinyu Pi",
+            "Frederick Pi",
+            "Jingbin Lin",
+            "Quanhui Jia",
+            "Shuang Yang",
+            "Ada Lovelace",
+            "Alan Turing",
+        ):
+            if name in (text or ""):
+                matches.append(name)
+        return matches
+
+    target_norm_module.extract_person_targets = _extract_person_targets
     target_norm_module.normalize_person_candidate = lambda value: str(value or "").strip() or None
     target_norm_module.sanitize_search_tool_arguments = lambda tool, arguments, fallback_person_targets=None: arguments
     monkeypatch.setitem(sys.modules, "target_normalization", target_norm_module)
@@ -109,6 +163,7 @@ def _load_tool_worker_graph_module(monkeypatch):
         info=lambda *a, **k: None,
         warning=lambda *a, **k: None,
         error=lambda *a, **k: None,
+        exception=lambda *a, **k: None,
     )
     monkeypatch.setitem(sys.modules, "logger", logger_module)
 
@@ -323,6 +378,12 @@ def test_summarize_linkedin_contact_overlay_emits_contact_signals(monkeypatch) -
         {"profile": "https://www.linkedin.com/in/frederick-pi-40a668181"},
         {
             "profile": "https://www.linkedin.com/in/frederick-pi-40a668181",
+            "username": "frederick-pi-40a668181",
+            "username_candidates": ["frederick-pi-40a668181", "FrederickPi1969"],
+            "cross_platform_profiles": [
+                {"platform": "linkedin", "username": "frederick-pi-40a668181", "url": "https://www.linkedin.com/in/frederick-pi-40a668181"},
+                {"platform": "github", "username": "FrederickPi1969", "url": "https://github.com/FrederickPi1969"},
+            ],
             "file_count": 3,
             "output_dir": "/tmp/linkedin_html",
             "contact_info": {
@@ -331,16 +392,29 @@ def test_summarize_linkedin_contact_overlay_emits_contact_signals(monkeypatch) -
                 "phones": ["+1 555-0101"],
                 "websites": ["https://frederickpi.dev"],
                 "profiles": ["https://github.com/FrederickPi1969"],
+                "addresses": ["University of California San Diego"],
+                "birthdays": ["August 30"],
             },
         },
         True,
     )
 
     assert "contact signals" in summary
+    assert {"username": "frederick-pi-40a668181"} in key_facts
+    assert {"usernames": ["frederick-pi-40a668181", "FrederickPi1969"]} in key_facts
     assert {"emails": ["frederick.pi@example.com"]} in key_facts
     assert {"phones": ["+1 555-0101"]} in key_facts
     assert {"sourceUrls": ["https://frederickpi.dev"]} in key_facts
     assert {"profileUrls": ["https://github.com/FrederickPi1969"]} in key_facts
+    assert {"addresses": ["University of California San Diego"]} in key_facts
+    assert {"birthdays": ["August 30"]} in key_facts
+    assert {
+        "externalLinks": [
+            {"platform": "linkedin", "username": "frederick-pi-40a668181", "url": "https://www.linkedin.com/in/frederick-pi-40a668181"},
+            {"platform": "github", "username": "FrederickPi1969", "url": "https://github.com/FrederickPi1969"},
+        ]
+    } in key_facts
+    assert "frederick-pi-40a668181" in next_hints
     assert "frederick.pi@example.com" in next_hints
     assert "https://github.com/FrederickPi1969" in next_hints
 
@@ -442,6 +516,104 @@ def test_build_graph_construction_batches_merges_aliases_and_expands_semantic_gr
     assert "HOLDS_ROLE" in relation_types
     assert "STUDIED_AT" in relation_types
     assert "HAS_ORGANIZATION_PROFILE" in relation_types
+
+
+def test_extract_graph_construction_payload_includes_root_contract_and_template(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    seen_payload: dict[str, Any] = {}
+
+    class _FakeLLM:
+        def complete_json(self, prompt: str, payload: Dict[str, Any], temperature: float = 0.1, timeout: int = 30, **kwargs: Any) -> Dict[str, Any]:
+            seen_payload.update(payload)
+            return {"entities": [], "relations": []}
+
+    tool_worker_graph._extract_graph_construction_payload(
+        llm=_FakeLLM(),
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="github_identity_search",
+        arguments={"person_name": "Federick Pi"},
+        result={"canonical_name": "Frederick Xinyu Pi"},
+        tool_result_summary="Resolved code profile.",
+        primary_target_contract={
+            "canonical_name": "Federick Pi",
+            "approved_aliases": ["Frederick Pi"],
+            "root_entity_id": "ent-root",
+        },
+        primary_graph_template={
+            "root_entity_id": "ent-root",
+            "root_canonical_name": "Federick Pi",
+            "root_aliases": ["Federick Pi", "Frederick Pi"],
+            "template_mode": "metadata_only",
+        },
+    )
+
+    assert seen_payload["primary_target_contract"]["canonical_name"] == "Federick Pi"
+    assert seen_payload["primary_graph_template"]["root_entity_id"] == "ent-root"
+    assert seen_payload["primary_root_entity_id"] == "ent-root"
+
+
+def test_build_graph_construction_batches_prefers_seeded_root_name_for_equivalent_primary_person(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="github_identity_search",
+        arguments={"person_name": "Federick Pi"},
+        result={
+            "canonical_name": "Frederick Pi",
+            "profile_url": "https://github.com/frederickpi1969",
+            "topics": ["machine learning"],
+        },
+        extracted_graph={"entities": [], "relations": []},
+        primary_target_contract={
+            "canonical_name": "Federick Pi",
+            "approved_aliases": ["Frederick Pi"],
+            "prompt_targets": ["Federick Pi"],
+            "root_entity_id": "ent-root",
+        },
+        primary_graph_template={
+            "root_entity_id": "ent-root",
+            "root_canonical_name": "Federick Pi",
+            "root_aliases": ["Federick Pi", "Frederick Pi"],
+            "template_mode": "metadata_only",
+        },
+    )
+
+    assert any(entity["type"] == "Person" and entity["canonical_name"] == "Federick Pi" for entity in entities)
+    assert not any(entity["type"] == "Person" and entity["canonical_name"] == "Frederick Pi" for entity in entities)
+    node_ids = {entity["canonical_name"]: entity["node_id"] for entity in entities}
+    assert any(
+        relation["src_id"] == node_ids["Federick Pi"] and relation["rel_type"] in {"HAS_CONTACT_POINT", "RESEARCHES"}
+        for relation in relations
+    )
+
+
+def test_build_graph_construction_batches_skips_unanchored_free_text_urls_but_keeps_explicit_profile_urls(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, _relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="github_identity_search",
+        arguments={"person_name": "Ada Lovelace"},
+        result={
+            "canonical_name": "Ada Lovelace",
+            "profile_url": "https://github.com/ada-lovelace",
+            "summary": (
+                "Incidental crawl output mentioned https://noise.example/path and "
+                "https://noise.example/files/cv.pdf but they were not structured profile fields."
+            ),
+            "notes": {
+                "text": "Another free-text artifact: https://tracker.example/session/123"
+            },
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert any(entity["type"] == "Website" and entity["canonical_name"] == "GitHub profile for Ada Lovelace" for entity in entities)
+    assert not any(entity["canonical_name"] == "https://noise.example/path" for entity in entities)
+    assert not any(entity["canonical_name"] == "https://noise.example/files/cv.pdf" for entity in entities)
+    assert not any(entity["canonical_name"] == "noise.example" for entity in entities)
 
 
 def test_store_artifacts_and_summary_collects_compact_artifact_documents(monkeypatch) -> None:
@@ -831,6 +1003,36 @@ def test_extract_related_people_from_search_rows_filters_generic_geo_snippet(mon
     assert tool_worker_graph._extract_related_people_from_search_rows(rows, "Frederick Pi") == []
 
 
+def test_build_graph_construction_batches_skips_location_like_person_search_query(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="person_search",
+        arguments={"name": "La Jolla Shores"},
+        result={
+            "name": "La Jolla Shores",
+            "count": 3,
+            "results": [
+                {
+                    "url": "https://www.sandiego.gov/beaches/la-jolla-shores",
+                    "title": "La Jolla Shores - City of San Diego",
+                    "extracted_text": "La Jolla Shores is a popular San Diego beach with lifeguards and visitor information.",
+                },
+                {
+                    "url": "https://www.ljshoreshotel.com/",
+                    "title": "La Jolla Shores Hotel",
+                    "extracted_text": "Beachfront hotel near La Jolla Shores beach with visitor amenities and dining.",
+                },
+            ],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    assert entities == []
+    assert relations == []
+
+
 def test_extract_related_people_from_search_rows_excludes_primary_aliases_from_noisy_query(monkeypatch) -> None:
     tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
 
@@ -893,10 +1095,14 @@ def test_call_tool_with_rate_limit_control_spaces_tavily_calls(monkeypatch) -> N
     tool_worker_graph._TAVILY_LAST_REQUEST_AT = 100.0
     tool_worker_graph._TAVILY_NOT_BEFORE_AT = 0.0
 
-    sleep_calls = []
+    wait_calls = []
     monotonic_values = iter([103.0, 108.0])
 
-    monkeypatch.setattr(tool_worker_graph.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "wait_with_progress",
+        lambda seconds, stage=None: wait_calls.append((seconds, stage)),
+    )
     monkeypatch.setattr(tool_worker_graph.time, "monotonic", lambda: next(monotonic_values))
 
     client = types.SimpleNamespace(call_tool=lambda name, arguments: types.SimpleNamespace(ok=True, content={}))
@@ -908,7 +1114,7 @@ def test_call_tool_with_rate_limit_control_spaces_tavily_calls(monkeypatch) -> N
         "run-1",
     )
 
-    assert sleep_calls == [5.0]
+    assert wait_calls == [(5.0, "TOOL_RATE_LIMIT_WAIT:tavily_research")]
 
 
 def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> None:
@@ -919,7 +1125,7 @@ def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> No
     tool_worker_graph._TAVILY_LAST_REQUEST_AT = 0.0
     tool_worker_graph._TAVILY_NOT_BEFORE_AT = 0.0
 
-    sleep_calls = []
+    wait_calls = []
     events = []
     responses = iter(
         [
@@ -929,7 +1135,11 @@ def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> No
     )
     monotonic_values = iter([100.0, 101.0, 101.0, 132.0])
 
-    monkeypatch.setattr(tool_worker_graph.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "wait_with_progress",
+        lambda seconds, stage=None: wait_calls.append((seconds, stage)),
+    )
     monkeypatch.setattr(tool_worker_graph.time, "monotonic", lambda: next(monotonic_values))
     monkeypatch.setattr(tool_worker_graph, "emit_run_event", lambda *args, **kwargs: events.append((args, kwargs)))
 
@@ -943,7 +1153,7 @@ def test_call_tool_with_rate_limit_control_retries_tavily_429(monkeypatch) -> No
     )
 
     assert result.ok is True
-    assert sleep_calls == [30.0]
+    assert wait_calls == [(30.0, "TOOL_RATE_LIMIT_WAIT:tavily_research")]
     assert events
     assert events[0][0][1] == "TOOL_RATE_LIMIT_BACKOFF"
 
@@ -981,3 +1191,144 @@ def test_call_tool_with_rate_limit_control_does_not_backoff_on_success_payload_t
     assert result.ok is True
     assert sleep_calls == []
     assert events == []
+
+
+def test_execute_tool_converts_runtime_exception_into_failed_result(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    events = []
+
+    class _ExplodingClient:
+        def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
+            raise RuntimeError(f"boom for {tool_name}")
+
+    monkeypatch.setattr(tool_worker_graph, "emit_run_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    graph = tool_worker_graph.build_tool_worker_graph(_ExplodingClient())
+    execute_tool = graph.nodes["execute_tool"]
+    result = execute_tool(
+        {
+            "run_id": "run-1",
+            "tool_name": "person_search",
+            "arguments": {"name": "Ada Lovelace"},
+        }
+    )
+
+    assert result["ok"] is False
+    assert result["result"]["error"].startswith("RuntimeError: boom for person_search")
+    assert any(call[0][1] == "TOOL_WORKER_EXECUTION_FAILED" for call in events)
+
+
+def test_persist_receipt_degrades_when_persistence_steps_fail(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+    events = []
+
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "_store_artifacts_and_summary",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("artifact store down")),
+    )
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "insert_tool_receipt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("receipt store down")),
+    )
+    monkeypatch.setattr(
+        tool_worker_graph,
+        "insert_run_note",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("note store down")),
+    )
+    monkeypatch.setattr(tool_worker_graph, "emit_run_event", lambda *args, **kwargs: events.append((args, kwargs)))
+
+    graph = tool_worker_graph.build_tool_worker_graph(types.SimpleNamespace(call_tool=lambda *args, **kwargs: None))
+    persist_receipt = graph.nodes["persist_receipt"]
+    result = persist_receipt(
+        {
+            "run_id": "run-1",
+            "tool_name": "person_search",
+            "arguments": {"name": "Ada Lovelace"},
+            "ok": True,
+            "result": {"results": [{"title": "Ada Lovelace"}]},
+            "tool_result_summary": "Ada Lovelace profile summary",
+            "vector_ingest_result": {},
+            "graph_ingest_result": {},
+            "receipt_llm_result": {},
+        }
+    )
+
+    receipt = result["receipt"]
+    assert receipt.ok is True
+    assert receipt.artifact_ids == []
+    assert receipt.document_ids == []
+    assert receipt.summary
+    persist_failures = [
+        call[0][2]["phase"]
+        for call in events
+        if call[0][1] == "TOOL_RECEIPT_PERSIST_FAILED"
+    ]
+    assert persist_failures == ["artifacts", "receipt", "note"]
+    assert any(call[0][1] == "TOOL_RECEIPT_READY" for call in events)
+
+
+def test_normalize_search_like_result_does_not_reanchor_primary_person(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    normalized = tool_worker_graph._normalize_search_like_result_for_graph(
+        "semantic_scholar_search",
+        {"person_name": "Jingbin Lin"},
+        {
+            "results": [
+                {
+                    "title": "Quanhui Jia - Ant Financial Services Group",
+                    "text": "Quanhui Jia researches financial fraud detection and graph neural networks.",
+                    "url": "https://www.semanticscholar.org/author/9228343",
+                }
+            ]
+        },
+    )
+
+    primary_people = tool_worker_graph._graph_primary_people_from_context(
+        "semantic_scholar_search",
+        {"person_name": "Jingbin Lin"},
+        normalized,
+    )
+
+    assert normalized.get("resolved_primary_person") in {"Jingbin Lin", "Quanhui Jia"}
+    assert normalized.get("canonical_name") != "Quanhui Jia"
+    assert primary_people[0] == "Jingbin Lin"
+
+
+def test_build_graph_construction_batches_skips_primary_publication_relations_for_mismatched_candidate(monkeypatch) -> None:
+    tool_worker_graph = _load_tool_worker_graph_module(monkeypatch)
+
+    entities, relations = tool_worker_graph._build_graph_construction_batches(
+        run_id="123e4567-e89b-12d3-a456-426614174000",
+        tool_name="semantic_scholar_search",
+        arguments={"person_name": "Jingbin Lin"},
+        result={
+            "canonical_name": "Quanhui Jia",
+            "display_name": "Quanhui Jia",
+            "resolved_primary_person": "Quanhui Jia",
+            "resolved_primary_person_matches_target": False,
+            "publications": [
+                {
+                    "title": "Fraud Detection with Graph Learning",
+                    "authors": ["Quanhui Jia", "Shuang Yang"],
+                    "year": "2021",
+                    "venue": "KDD",
+                }
+            ],
+            "coauthors": [{"name": "Shuang Yang"}],
+            "author_contacts": [{"name": "Shuang Yang", "email": "shuang@example.com"}],
+        },
+        extracted_graph={"entities": [], "relations": []},
+    )
+
+    relation_pairs = {
+        (relation.get("src"), relation.get("dst"), relation.get("rel_type"))
+        for relation in relations
+        if isinstance(relation, dict)
+    }
+
+    assert ("Jingbin Lin", "Fraud Detection with Graph Learning", "PUBLISHED") not in relation_pairs
+    assert ("Jingbin Lin", "Shuang Yang", "COAUTHORED_WITH") not in relation_pairs
+    assert any(entity["canonical_name"] == "Fraud Detection with Graph Learning" for entity in entities)

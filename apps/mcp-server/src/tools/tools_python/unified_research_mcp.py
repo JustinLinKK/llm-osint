@@ -13,6 +13,7 @@ import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -31,10 +32,14 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 TAVILY_SCORE_SCALE_MAX = 10.0
+TAVILY_SEARCH_MAX_RESULTS = 5
 TAVILY_SEARCH_CHUNKS_PER_SOURCE_DEFAULT = 5
 TAVILY_SEARCH_CHUNKS_PER_SOURCE_MAX = 3
 TAVILY_EXTRACT_CHUNKS_PER_SOURCE_DEFAULT = 5
 TAVILY_EXTRACT_CHUNKS_PER_SOURCE_MAX = 5
+TAVILY_CRAWL_LIMIT_MAX = 5
+TAVILY_MAP_LIMIT_MAX = 5
+TAVILY_RESEARCH_SOURCE_LIMIT = 5
 
 
 def _find_repo_root(start: Path) -> Path | None:
@@ -163,6 +168,123 @@ def _read_text_file(path: Path, max_bytes: int = 1_500_000) -> str:
             return f.read(max_bytes)
     except Exception:
         return ""
+
+
+def _clean_username_candidate(value: Any) -> str:
+    candidate = str(value or "").strip().lstrip("@")
+    if not candidate:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{1,61}[A-Za-z0-9])?", candidate):
+        return ""
+    return candidate
+
+
+def _extract_profile_identity(url: Any) -> dict[str, str] | None:
+    raw = str(url or "").strip()
+    if not raw.startswith(("http://", "https://")):
+        return None
+
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return None
+
+    platform = ""
+    username = ""
+    if host.endswith("linkedin.com") and len(parts) >= 2 and parts[0].casefold() in {"in", "pub"}:
+        platform = "linkedin"
+        username = parts[1]
+    elif host in {"github.com", "gitlab.com", "x.com", "twitter.com", "instagram.com"}:
+        platform = host.split(".", 1)[0]
+        username = parts[0]
+    elif host == "medium.com" and parts[0].startswith("@"):
+        platform = "medium"
+        username = parts[0][1:]
+    else:
+        return None
+
+    normalized_username = _clean_username_candidate(username)
+    if not normalized_username:
+        return None
+
+    profile_url = f"{parsed.scheme or 'https'}://{host}{parsed.path}".rstrip("/")
+    return {
+        "platform": platform,
+        "username": normalized_username,
+        "url": profile_url,
+    }
+
+
+def _derive_linkedin_identity_pivots(profile: str, contact_info: dict[str, Any]) -> dict[str, Any]:
+    username_candidates: list[str] = []
+    seen_usernames: set[str] = set()
+    cross_platform_profiles: list[dict[str, str]] = []
+    seen_profiles: set[tuple[str, str, str]] = set()
+
+    def add_username(value: Any) -> None:
+        normalized = _clean_username_candidate(value)
+        if not normalized:
+            return
+        lowered = normalized.casefold()
+        if lowered in seen_usernames:
+            return
+        seen_usernames.add(lowered)
+        username_candidates.append(normalized)
+
+    def add_profile(url: Any) -> None:
+        identity = _extract_profile_identity(url)
+        if not identity:
+            return
+        key = (
+            identity["platform"].casefold(),
+            identity["username"].casefold(),
+            identity["url"].casefold(),
+        )
+        if key in seen_profiles:
+            return
+        seen_profiles.add(key)
+        cross_platform_profiles.append(identity)
+        add_username(identity["username"])
+
+    add_profile(profile)
+    for value in contact_info.get("username_candidates", []):
+        add_username(value)
+    for value in contact_info.get("profiles", []):
+        add_profile(value)
+    for value in contact_info.get("websites", []):
+        add_profile(value)
+    for value in contact_info.get("cross_platform_profiles", []):
+        if not isinstance(value, dict):
+            continue
+        add_profile(value.get("url"))
+        add_username(value.get("username"))
+
+    linkedin_username = ""
+    for item in cross_platform_profiles:
+        if item["platform"] == "linkedin":
+            linkedin_username = item["username"]
+            break
+    if not linkedin_username:
+        linkedin_username = _clean_username_candidate(contact_info.get("linkedin_username"))
+        add_username(linkedin_username)
+
+    email_domains: list[str] = []
+    for email in contact_info.get("emails", []):
+        _, _, domain = str(email or "").strip().partition("@")
+        normalized_domain = domain.strip().lower()
+        if normalized_domain and normalized_domain not in email_domains:
+            email_domains.append(normalized_domain)
+
+    return {
+        "linkedin_username": linkedin_username,
+        "username": linkedin_username,
+        "username_candidates": username_candidates,
+        "cross_platform_profiles": cross_platform_profiles,
+        "email_domains": email_domains,
+    }
 
 
 def _http_json_request(
@@ -306,7 +428,7 @@ def _build_tavily_search_payload(
     payload: dict[str, Any] = {
         "query": query,
         "search_depth": search_depth,
-        "max_results": max(1, min(max_results, 20)),
+        "max_results": max(1, min(max_results, TAVILY_SEARCH_MAX_RESULTS)),
         "include_raw_content": include_raw_content,
         "include_images": include_images,
     }
@@ -342,7 +464,7 @@ def _extract_tavily_search_results(raw_response: dict[str, Any]) -> tuple[list[d
         result_rows.append(normalized_row)
 
     extracted_results: list[dict[str, Any]] = []
-    for index, item in enumerate(result_rows[:20], start=1):
+    for index, item in enumerate(result_rows[:TAVILY_SEARCH_MAX_RESULTS], start=1):
         extracted_results.append(
             {
                 "rank": index,
@@ -475,7 +597,7 @@ def _tool_x_get_user_posts_api(input_data: dict[str, Any]) -> dict[str, Any]:
     if not username:
         raise RuntimeError("Missing required input: username")
 
-    max_results = int(input_data.get("max_results", 10))
+    max_results = min(int(input_data.get("max_results", TAVILY_SEARCH_MAX_RESULTS)), TAVILY_SEARCH_MAX_RESULTS)
     raw = bool(input_data.get("raw", False))
     download_media = bool(input_data.get("download_media", False))
     max_video_bitrate = int(input_data.get("max_video_bitrate", 800000))
@@ -586,6 +708,12 @@ def _tool_linkedin_download_html_ocr(input_data: dict[str, Any]) -> dict[str, An
             contact_info_path = json_file
             break
 
+    identity_pivots = _derive_linkedin_identity_pivots(profile, contact_info)
+    linkedin_username = str(identity_pivots.get("linkedin_username") or "").strip()
+    username_candidates = identity_pivots.get("username_candidates", [])
+    cross_platform_profiles = identity_pivots.get("cross_platform_profiles", [])
+    email_domains = identity_pivots.get("email_domains", [])
+
     extracted_pages: list[dict[str, Any]] = []
     for file_path in html_files[:5]:
         path = Path(file_path)
@@ -599,6 +727,11 @@ def _tool_linkedin_download_html_ocr(input_data: dict[str, Any]) -> dict[str, An
 
     return {
         "profile": profile,
+        "username": linkedin_username,
+        "linkedin_username": linkedin_username,
+        "username_candidates": username_candidates,
+        "cross_platform_profiles": cross_platform_profiles,
+        "email_domains": email_domains,
         "output_dir": str(output_path),
         "html_files": html_files,
         "json_files": json_files,
@@ -617,7 +750,7 @@ def _tool_google_serp_person_search(input_data: dict[str, Any]) -> dict[str, Any
     if not target_name:
         raise RuntimeError("Missing required input: target_name (or query)")
 
-    max_results = int(input_data.get("max_results", 10))
+    max_results = min(int(input_data.get("max_results", TAVILY_SEARCH_MAX_RESULTS)), TAVILY_SEARCH_MAX_RESULTS)
     start = int(input_data.get("start", 1))
     timeout = int(input_data.get("timeout", 20))
     timeout_seconds = int(input_data.get("timeout_seconds", 600))
@@ -1030,7 +1163,7 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     timeout_seconds = int(input_data.get("timeout_seconds", 300))
     max_depth = int(input_data.get("max_depth", 2))
     max_breadth = int(input_data.get("max_breadth", 20))
-    limit = int(input_data.get("limit", 20))
+    limit = min(int(input_data.get("limit", TAVILY_CRAWL_LIMIT_MAX)), TAVILY_CRAWL_LIMIT_MAX)
     instructions = _normalize_tavily_instructions(input_data)
     select_paths = input_data.get("select_paths")
     exclude_paths = input_data.get("exclude_paths")
@@ -1064,8 +1197,9 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
 
     raw_results = raw_response.get("results")
     result_rows = [item for item in raw_results if isinstance(item, dict)] if isinstance(raw_results, list) else []
+    limited_rows = result_rows[:TAVILY_CRAWL_LIMIT_MAX]
     extracted_pages: list[dict[str, Any]] = []
-    for item in result_rows:
+    for item in limited_rows:
         content = item.get("raw_content") or item.get("content")
         extracted_pages.append(
             {
@@ -1078,14 +1212,14 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
 
     page_files = _write_page_exports(
         output_dir,
-        result_rows,
+        limited_rows,
         prefix="crawl",
         extension=".md" if format_value == "markdown" else ".txt",
     )
     page_manifest_path = _write_json_file(output_dir / "page_manifest.json", page_files)
     summary = {
         "url": url,
-        "results_found": len(result_rows),
+        "results_found": len(limited_rows),
         "max_depth": max_depth,
         "max_breadth": max_breadth,
         "limit": limit,
@@ -1103,7 +1237,7 @@ def _tool_crawl_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "page_manifest_path": str(page_manifest_path),
         "page_files": page_files,
         "raw_files": [str(summary_path), str(raw_path), str(index_path), str(page_manifest_path), *[item["path"] for item in page_files]],
-        "results_found": len(result_rows),
+        "results_found": len(limited_rows),
         "summary": summary,
         "extracted_pages": extracted_pages,
     }
@@ -1121,7 +1255,7 @@ def _tool_map_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
     timeout_seconds = int(input_data.get("timeout_seconds", 120))
     max_depth = int(input_data.get("max_depth", 2))
     max_breadth = int(input_data.get("max_breadth", 50))
-    limit = int(input_data.get("limit", 100))
+    limit = min(int(input_data.get("limit", TAVILY_MAP_LIMIT_MAX)), TAVILY_MAP_LIMIT_MAX)
     instructions = _normalize_tavily_instructions(input_data)
     select_paths = input_data.get("select_paths")
     exclude_paths = input_data.get("exclude_paths")
@@ -1153,10 +1287,11 @@ def _tool_map_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
 
     raw_results = raw_response.get("results")
     urls = [item for item in raw_results if isinstance(item, str) and item.strip()] if isinstance(raw_results, list) else []
-    extracted_results = [{"title": candidate, "url": candidate, "extracted_text": ""} for candidate in urls[:100]]
+    limited_urls = urls[:TAVILY_MAP_LIMIT_MAX]
+    extracted_results = [{"title": candidate, "url": candidate, "extracted_text": ""} for candidate in limited_urls]
     summary = {
         "url": url,
-        "results_found": len(urls),
+        "results_found": len(limited_urls),
         "max_depth": max_depth,
         "max_breadth": max_breadth,
         "limit": limit,
@@ -1172,8 +1307,8 @@ def _tool_map_webpage(input_data: dict[str, Any]) -> dict[str, Any]:
         "api_response_path": str(raw_path),
         "index_path": str(index_path),
         "raw_files": [str(summary_path), str(raw_path), str(index_path)],
-        "results_found": len(urls),
-        "urls": urls,
+        "results_found": len(limited_urls),
+        "urls": limited_urls,
         "summary": summary,
     }
     if temp_output:
@@ -1185,6 +1320,7 @@ def _tool_tavily_research(input_data: dict[str, Any]) -> dict[str, Any]:
     research_input = str(input_data.get("input") or input_data.get("query") or input_data.get("target_name") or "").strip()
     if not research_input:
         raise RuntimeError("Missing required input: input (or query/target_name)")
+    target_name = str(input_data.get("target_name") or "").strip()
 
     api_url = str(os.getenv("TAVILY_RESEARCH_API_URL") or "https://api.tavily.com/research").strip()
     timeout_seconds = int(input_data.get("timeout_seconds", 300))
@@ -1246,8 +1382,9 @@ def _tool_tavily_research(input_data: dict[str, Any]) -> dict[str, Any]:
 
     sources = status_response.get("sources")
     source_rows = [item for item in sources if isinstance(item, dict)] if isinstance(sources, list) else []
+    limited_source_rows = source_rows[:TAVILY_RESEARCH_SOURCE_LIMIT]
     extracted_results: list[dict[str, Any]] = []
-    for index, item in enumerate(source_rows[:50], start=1):
+    for index, item in enumerate(limited_source_rows, start=1):
         extracted_results.append(
             {
                 "rank": index,
@@ -1265,12 +1402,13 @@ def _tool_tavily_research(input_data: dict[str, Any]) -> dict[str, Any]:
 
     summary = {
         "input": research_input,
+        "target_name": target_name or None,
         "request_id": request_id,
         "status": status,
         "model": status_response.get("model") or create_response.get("model") or model,
         "citation_format": citation_format,
         "response_time": status_response.get("response_time") or create_response.get("response_time"),
-        "sources_found": len(source_rows),
+        "sources_found": len(limited_source_rows),
         "report_preview": _clean_text(content_text, max_len=1200),
         "results": extracted_results,
     }
@@ -1280,6 +1418,7 @@ def _tool_tavily_research(input_data: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         "input": research_input,
+        "target_name": target_name or None,
         "request_id": request_id,
         "status": status,
         "output_dir": str(output_dir),
@@ -1292,7 +1431,7 @@ def _tool_tavily_research(input_data: dict[str, Any]) -> dict[str, Any]:
         "raw_files": [str(summary_path), str(create_path), str(status_path), str(report_path), str(index_path)],
         "summary": summary,
         "report_content": content,
-        "sources": source_rows,
+        "sources": limited_source_rows,
         "extracted_results": extracted_results,
     }
     if temp_output:

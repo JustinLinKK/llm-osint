@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   Button,
   Card,
@@ -123,6 +123,44 @@ const GRAPH_GROUP_ORDER: GraphGroupName[] = [
   "Other"
 ];
 
+type GraphRenderBoundaryProps = {
+  resetKey: string;
+  children: ReactNode;
+};
+
+type GraphRenderBoundaryState = {
+  hasError: boolean;
+  message: string;
+};
+
+class GraphRenderBoundary extends Component<GraphRenderBoundaryProps, GraphRenderBoundaryState> {
+  state: GraphRenderBoundaryState = { hasError: false, message: "" };
+
+  static getDerivedStateFromError(error: Error): GraphRenderBoundaryState {
+    return {
+      hasError: true,
+      message: error.message || "Graph rendering failed.",
+    };
+  }
+
+  componentDidUpdate(prevProps: GraphRenderBoundaryProps): void {
+    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
+      this.setState({ hasError: false, message: "" });
+    }
+  }
+
+  render(): ReactNode {
+    if (this.state.hasError) {
+      return (
+        <div className="flex h-full min-h-[560px] items-center justify-center rounded-xl border border-rose-400/30 bg-slate-950/80 p-6 text-center text-sm text-rose-100">
+          Graph rendering failed. {this.state.message || "Try switching the layout or reloading the run."}
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 type ReportPayload = {
   reportId: string;
   runId: string;
@@ -198,6 +236,16 @@ function statusColor(status: string): "primary" | "warning" | "success" | "dange
   if (["failed", "error"].includes(status)) return "danger";
   if (["collecting", "extracting", "mining", "reporting", "draft"].includes(status)) return "warning";
   return "primary";
+}
+
+function runStatusLabel(run: RunSummary): string {
+  if (run.status === "done" && run.reportStatus === "failed") return "done / report failed";
+  return run.reportStatus ?? run.status;
+}
+
+function runStatusColor(run: RunSummary): "primary" | "warning" | "success" | "danger" {
+  if (run.status === "done" && run.reportStatus === "failed") return "warning";
+  return statusColor(run.reportStatus ?? run.status);
 }
 
 function deriveTitle(prompt: string): string {
@@ -293,6 +341,19 @@ function triggerBlobDownload(blob: Blob, filename: string): void {
   URL.revokeObjectURL(url);
 }
 
+function waitForAnimationFrame(): Promise<void> {
+  return new Promise((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+}
+
+function graphRootSelector(nodeId: string): string {
+  const normalized = nodeId.trim();
+  if (!normalized) return "";
+  const escaped = normalized.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return `[id = "${escaped}"]`;
+}
+
 function graphNodeType(node: GraphNode): string {
   const rawType = node.properties?.type;
   if (typeof rawType === "string" && rawType.trim()) return rawType.trim();
@@ -370,13 +431,7 @@ function groupedPresetPositions(
   const sectorSpan = (2 * Math.PI) / Math.max(activeGroups.length, 1);
 
   for (const [groupIndex, group] of activeGroups.entries()) {
-    const groupNodeId = `__group__:${group}`;
     const centerAngle = -Math.PI / 2 + sectorSpan * groupIndex;
-    positions.set(groupNodeId, {
-      x: Math.cos(centerAngle) * groupRadius,
-      y: Math.sin(centerAngle) * groupRadius
-    });
-
     const members = (groupMembers.get(group) ?? []).filter((nodeId) => visibleNodeIds.includes(nodeId));
     const sectorWidth = Math.min(sectorSpan * 0.76, Math.PI / 2.6);
     const perRing = 6;
@@ -468,23 +523,6 @@ function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<
       }
     },
     {
-      selector: "node[isGroup = 1]",
-      style: {
-        shape: "round-rectangle",
-        "background-opacity": 0.22,
-        "border-width": 2.2,
-        "border-color": "#334155",
-        "font-size": 13,
-        "font-weight": 700,
-        width: 110,
-        height: 42,
-        color: "#0f172a",
-        "text-valign": "center",
-        "text-halign": "center",
-        "z-index": 1
-      }
-    },
-    {
       selector: "edge",
       style: {
         "curve-style": "bezier",
@@ -493,16 +531,6 @@ function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<
         "target-arrow-shape": "triangle",
         "arrow-scale": 0.8,
         width: 1.4
-      }
-    },
-    {
-      selector: "edge[isGroupEdge = 1]",
-      style: {
-        "line-style": "dashed",
-        "target-arrow-shape": "none",
-        "line-color": "#64748b",
-        width: 2,
-        opacity: 0.6
       }
     },
     {
@@ -547,6 +575,8 @@ function buildReportMarkdown(report: ReportPayload | null, fallbackContent: stri
 }
 
 export default function App() {
+  const MAX_GRAPH_EXPORT_WIDTH = 2400;
+  const MAX_GRAPH_EXPORT_HEIGHT = 1800;
   const cytoscapeRef = useRef<Core | null>(null);
   const [runs, setRuns] = useState<RunSummary[]>(() => loadRuns());
   const [selectedRunId, setSelectedRunId] = useState<string | null>(runs[0]?.runId ?? null);
@@ -620,7 +650,7 @@ export default function App() {
     setSelectedGraphNodeTypes([]);
     setSelectedGraphRelTypes([]);
     setGraphMinDegree(0);
-    setGraphNodeLimit(60);
+    setGraphNodeLimit(200);
     setGraphEgoNode("");
     setGraphEgoDepth(1);
     setGraphLayoutName("cose");
@@ -630,7 +660,7 @@ export default function App() {
 
   useEffect(() => {
     setGraphNodeLimit((current) => {
-      const nextDefault = Math.min(80, graphLimitMax);
+      const nextDefault = Math.min(200, graphLimitMax);
       if (current < graphLimitMin) return nextDefault;
       if (current > graphLimitMax) return graphLimitMax;
       return current;
@@ -741,32 +771,11 @@ export default function App() {
         degree: graphDegreeByNode.get(nodeId) ?? 0,
         color: stableGraphColor(nodeType),
         isRoot: rootNodeId && nodeId === rootNodeId ? 1 : 0,
-        isGroup: 0,
         groupName: groupedMode && node ? classifyGraphGroup(node, rootNodeId) : ""
       };
       const position = groupedPositions.get(nodeId);
       return position ? { data, position } : { data };
     });
-
-    if (groupedMode) {
-      for (const group of activeGroups) {
-        const groupNodeId = `__group__:${group}`;
-        const position = groupedPositions.get(groupNodeId);
-        elements.push({
-          data: {
-            id: groupNodeId,
-            label: group,
-            type: "Group",
-            degree: (groupMembers.get(group)?.length ?? 0) + 1,
-            color: stableGraphColor(group),
-            isRoot: 0,
-            isGroup: 1,
-            groupName: group
-          },
-          ...(position ? { position } : {})
-        });
-      }
-    }
 
     for (const edge of filteredEdges) {
       elements.push({
@@ -776,46 +785,34 @@ export default function App() {
           target: edge.target,
           label: edge.display ?? graphRelType(edge),
           rel_type: graphRelType(edge),
-          isGroupEdge: 0,
           isRootSpoke: rootNodeId && (edge.source === rootNodeId || edge.target === rootNodeId) ? 1 : 0
         }
       });
     }
 
-    if (groupedMode && rootNodeId) {
-      for (const group of activeGroups) {
-        const groupNodeId = `__group__:${group}`;
-        elements.push({
-          data: {
-            id: `__group_edge__:${rootNodeId}:${group}`,
-            source: rootNodeId,
-            target: groupNodeId,
-            label: group,
-            rel_type: "GROUPS",
-            isGroupEdge: 1,
-            isRootSpoke: 0
-          }
-        });
-      }
-    }
+    const groupedFallbackToRadial = graphLayoutName === "grouped" && hasGraphRoot && !groupedMode;
+    const effectiveLayoutName =
+      groupedMode && rootNodeId
+        ? "preset"
+        : graphLayoutName === "radial" || groupedFallbackToRadial
+          ? hasGraphRoot
+            ? "breadthfirst"
+            : "concentric"
+          : graphLayoutName === "grouped"
+            ? "cose"
+            : graphLayoutName || "cose";
 
     const layout: Record<string, unknown> = {
-      name:
-        groupedMode && rootNodeId
-          ? "preset"
-          : graphLayoutName === "radial"
-            ? hasGraphRoot
-              ? "breadthfirst"
-              : "concentric"
-            : graphLayoutName || "cose",
+      name: effectiveLayoutName,
       animate: false,
       fit: true,
       padding: 40
     };
+    const rootSelector = graphRootSelector(graphEgoNode);
     if (groupedMode && rootNodeId) {
       layout.padding = 72;
-    } else if (graphLayoutName === "radial" && hasGraphRoot) {
-      layout.roots = `#${graphEgoNode}`;
+    } else if ((graphLayoutName === "radial" || groupedFallbackToRadial) && hasGraphRoot) {
+      if (rootSelector) layout.roots = rootSelector;
       layout.circle = true;
       layout.directed = true;
       layout.avoidOverlap = true;
@@ -823,7 +820,7 @@ export default function App() {
       layout.spacingFactor = finalNodeIds.size > 40 ? 1.15 : 1.35;
       layout.padding = 56;
     } else if (graphLayoutName === "breadthfirst" && hasGraphRoot) {
-      layout.roots = `#${graphEgoNode}`;
+      if (rootSelector) layout.roots = rootSelector;
       layout.directed = true;
       layout.spacingFactor = 1.1;
     }
@@ -841,7 +838,7 @@ export default function App() {
       layout,
       stylesheet: makeGraphStylesheet(showGraphEdgeLabels, graphMaxDegree),
       stats: groupedMode
-        ? `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges with ${activeGroups.length} visual groups (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`
+        ? `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges with grouped positioning (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`
         : `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`,
       warning: warnings.join(" ")
     };
@@ -1046,18 +1043,13 @@ export default function App() {
       setIsLoadingGraph(true);
       try {
         const res = await fetch(
-          `${API_BASE}/runs/${selectedRunId}/graph?nodeLimit=200&nodeOffset=0&edgeLimit=300&edgeOffset=0`
+          `${API_BASE}/runs/${selectedRunId}/graph?nodeLimit=400&nodeOffset=0&edgeLimit=600&edgeOffset=0`
         );
         if (!res.ok) throw new Error("Failed to load graph");
         const payload = (await res.json()) as GraphPayload;
         if (!disposed) {
           setGraphNodes(payload.nodes ?? []);
           setGraphEdges(payload.edges ?? []);
-          if (payload.graphRoot?.nodeId) {
-            setGraphEgoNode(payload.graphRoot.nodeId);
-            setGraphEgoDepth(payload.graphRoot.recommendedEgoDepth ?? 2);
-            setGraphLayoutName(payload.graphRoot.recommendedLayout ?? "radial");
-          }
         }
       } catch (error) {
         if (!disposed) setErrorMessage(error instanceof Error ? error.message : "Failed to load graph");
@@ -1228,13 +1220,19 @@ export default function App() {
     if (!cytoscapeRef.current || !selectedRun) return;
     setIsDownloadingGraph(true);
     try {
-      const dataUrl = cytoscapeRef.current.png({
+      cytoscapeRef.current.resize();
+      if (filteredGraph.elements.length > 0) {
+        cytoscapeRef.current.fit(undefined, 28);
+      }
+      cytoscapeRef.current.center();
+      await waitForAnimationFrame();
+      const pngBlob = await cytoscapeRef.current.png({
         full: true,
         bg: "#ffffff",
-        scale: 3
+        output: "blob-promise",
+        maxWidth: MAX_GRAPH_EXPORT_WIDTH,
+        maxHeight: MAX_GRAPH_EXPORT_HEIGHT
       });
-      const response = await fetch(dataUrl);
-      const pngBlob = await response.blob();
       triggerBlobDownload(pngBlob, `${reportFilenameBase}-graph.png`);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to export graph PNG");
@@ -1275,12 +1273,12 @@ export default function App() {
                         <div className="flex items-center justify-between gap-2">
                           <p className="font-mono text-sm text-cyan-50">#{shortRunId(run.runId)}</p>
                           <Chip
-                            color={statusColor(run.reportStatus ?? run.status)}
+                            color={runStatusColor(run)}
                             size="sm"
                             variant="flat"
                             classNames={{ content: "font-medium text-slate-50" }}
                           >
-                            {run.reportStatus ?? run.status}
+                            {runStatusLabel(run)}
                           </Chip>
                         </div>
                         <p className="mt-2 line-clamp-2 text-sm text-cyan-100">{run.title || deriveTitle(run.prompt)}</p>
@@ -1767,73 +1765,63 @@ export default function App() {
                                     Download PNG
                                   </Button>
                                 </div>
-                                <div className="h-[70vh] min-h-[560px] overflow-hidden rounded-xl border border-white/10 bg-white">
-                                  <CytoscapeComponent
-                                    elements={filteredGraph.elements}
-                                    layout={filteredGraph.layout}
-                                    stylesheet={filteredGraph.stylesheet}
-                                    style={{ width: "100%", height: "100%" }}
-                                    cy={(cy: Core) => {
-                                      cytoscapeRef.current = cy;
-                                      cy.off("tap");
-                                      cy.on("tap", "node", (event: EventObject) => {
-                                        const nodeId = event.target.id();
-                                        const node = graphNodeMap.get(nodeId);
-                                        if (event.target.data("isGroup") === 1) {
+                                <GraphRenderBoundary
+                                  resetKey={`${selectedRunId ?? "no-run"}:${graphLayoutName}:${filteredGraph.elements.length}:${graphNodes.length}:${sanitizedGraphEdges.length}`}
+                                >
+                                  <div className="h-[70vh] min-h-[560px] overflow-hidden rounded-xl border border-white/10 bg-white">
+                                    <CytoscapeComponent
+                                      elements={filteredGraph.elements}
+                                      layout={filteredGraph.layout}
+                                      stylesheet={filteredGraph.stylesheet}
+                                      style={{ width: "100%", height: "100%" }}
+                                      cy={(cy: Core) => {
+                                        cytoscapeRef.current = cy;
+                                        cy.off("tap");
+                                        cy.on("tap", "node", (event: EventObject) => {
+                                          const nodeId = event.target.id();
+                                          const node = graphNodeMap.get(nodeId);
                                           setGraphSelectionText(
                                             formatSelectionPayload({
-                                              element: "group",
+                                              element: "node",
                                               id: nodeId,
-                                              label: event.target.data("label"),
-                                              groupName: event.target.data("groupName"),
-                                              memberCount: Math.max(0, Number(event.target.data("degree") || 0) - 1)
+                                              title: node?.display ?? nodeId,
+                                              type: node ? graphNodeType(node) : null,
+                                              labels: node?.labels ?? []
                                             })
                                           );
-                                          return;
-                                        }
-                                        setGraphSelectionText(
-                                          formatSelectionPayload({
-                                            element: "node",
-                                            id: nodeId,
-                                            display: node?.display ?? nodeId,
-                                            type: node ? graphNodeType(node) : null,
-                                            labels: node?.labels ?? [],
-                                            properties: node?.properties ?? {}
-                                          })
-                                        );
-                                      });
-                                      cy.on("tap", "edge", (event: EventObject) => {
-                                        const edgeId = event.target.id();
-                                        const edge = sanitizedGraphEdges.find((item) => item.id === edgeId);
-                                        if (event.target.data("isGroupEdge") === 1 || !edge) {
+                                        });
+                                        cy.on("tap", "edge", (event: EventObject) => {
+                                          const edgeId = event.target.id();
+                                          const edge = sanitizedGraphEdges.find((item) => item.id === edgeId);
+                                          if (!edge) {
+                                            setGraphSelectionText(
+                                              formatSelectionPayload({
+                                                element: "edge",
+                                                id: edgeId,
+                                                source: event.target.source().id(),
+                                                target: event.target.target().id(),
+                                                relationship: event.target.data("rel_type"),
+                                                label: event.target.data("label"),
+                                                synthetic: true
+                                              })
+                                            );
+                                            return;
+                                          }
                                           setGraphSelectionText(
-                                            formatSelectionPayload({
-                                              element: "edge",
-                                              id: edgeId,
-                                              source: event.target.source().id(),
-                                              target: event.target.target().id(),
-                                              relType: event.target.data("rel_type"),
-                                              label: event.target.data("label"),
-                                              synthetic: true
-                                            })
+                                              formatSelectionPayload({
+                                                element: "edge",
+                                                id: edgeId,
+                                                source: edge?.source ?? event.target.source().id(),
+                                                target: edge?.target ?? event.target.target().id(),
+                                                relationship: edge ? graphRelType(edge) : event.target.data("rel_type"),
+                                                label: edge?.display ?? event.target.data("label")
+                                              })
                                           );
-                                          return;
-                                        }
-                                        setGraphSelectionText(
-                                          formatSelectionPayload({
-                                            element: "edge",
-                                            id: edgeId,
-                                            source: edge?.source ?? event.target.source().id(),
-                                            target: edge?.target ?? event.target.target().id(),
-                                            relType: edge ? graphRelType(edge) : event.target.data("rel_type"),
-                                            label: edge?.display ?? event.target.data("label"),
-                                            properties: edge?.properties ?? {}
-                                          })
-                                        );
-                                      });
-                                    }}
-                                  />
-                                </div>
+                                        });
+                                      }}
+                                    />
+                                  </div>
+                                </GraphRenderBoundary>
                               </CardBody>
                             </Card>
 

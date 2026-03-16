@@ -9,7 +9,13 @@ from report_helpers import (
     pack_evidence,
     run_consistency_validator,
 )
-from report_models import ClaimModel, EvidenceRefModel, SectionDraftModel
+from report_models import (
+    ClaimModel,
+    EvidenceRefModel,
+    PrimaryTargetContractModel,
+    SectionDraftModel,
+    SectionTaskModel,
+)
 from tool_worker_graph import ToolReceipt
 
 
@@ -188,6 +194,7 @@ def test_build_report_memory_recovers_profile_and_publication_inventory_from_rec
         question="profile Xinyu Pi",
         report_type="person",
         primary_entities=["Xinyu Frederick Pi"],
+        primary_target_contract=None,
         noteboard=[],
         stage1_receipts=receipts,
         claims=[],
@@ -234,6 +241,91 @@ def test_pick_primary_entities_prefers_canonical_identity_from_receipts() -> Non
         run_id="run-1",
         prompt="profile Xinyu Pi",
         noteboard=["[Evidence] Primary target anchor: Frederick Xinyu Pi."],
+        receipts=receipts,
+    )
+
+    assert entities[0] == "Frederick Xinyu Pi"
+
+
+def test_pick_primary_entities_prefers_locked_primary_target_contract() -> None:
+    class _FakeMcpClient:
+        def call_tool(self, name: str, arguments: dict) -> object:
+            raise AssertionError("graph lookup should not be used when a locked contract is present")
+
+    receipts = [
+        ToolReceipt(
+            run_id="run-1",
+            tool_name="cross_platform_profile_resolver",
+            arguments={},
+            argument_signature="sig-1",
+            ok=True,
+            summary="Resolved canonical identity.",
+            key_facts=[
+                {
+                    "canonical_identity": {
+                        "canonical_name": "Ruolan Yang",
+                        "aliases": ["Stone Tao", "Xinyu Fang"],
+                    }
+                }
+            ],
+            artifact_ids=[],
+            document_ids=[],
+        )
+    ]
+
+    entities = pick_primary_entities(
+        mcp_client=_FakeMcpClient(),
+        run_id="run-1",
+        prompt="profile Frederick Xinyu Pi",
+        noteboard=[
+            "[Evidence] Primary target anchor: Frederick Xinyu Pi.",
+            "Resolved identity 'Ruolan Yang' with aliases Stone Tao and Xinyu Fang.",
+        ],
+        receipts=receipts,
+        primary_target_contract=PrimaryTargetContractModel(
+            canonical_name="Frederick Xinyu Pi",
+            prompt_targets=["Frederick Xinyu Pi", "Xinyu Pi"],
+            approved_aliases=["Frederick Pi"],
+        ),
+    )
+
+    assert entities == ["Frederick Xinyu Pi", "Xinyu Pi", "Frederick Pi"]
+
+
+def test_pick_primary_entities_ignores_non_anchor_noteboard_names() -> None:
+    class _FakeMcpClient:
+        def call_tool(self, name: str, arguments: dict) -> object:
+            raise AssertionError("graph lookup should not be used when graph search is disabled")
+
+    receipts = [
+        ToolReceipt(
+            run_id="run-1",
+            tool_name="cross_platform_profile_resolver",
+            arguments={},
+            argument_signature="sig-1",
+            ok=True,
+            summary="Resolved canonical identity.",
+            key_facts=[
+                {
+                    "canonical_identity": {
+                        "canonical_name": "Ruolan Yang",
+                        "aliases": ["Stone Tao", "Xinyu Fang"],
+                    }
+                }
+            ],
+            artifact_ids=[],
+            document_ids=[],
+        )
+    ]
+
+    entities = pick_primary_entities(
+        mcp_client=_FakeMcpClient(),
+        run_id="run-1",
+        prompt="profile Frederick Xinyu Pi",
+        noteboard=[
+            "[Evidence] Primary target anchor: Frederick Xinyu Pi.",
+            "Resolved identity 'Ruolan Yang' with aliases Stone Tao and Xinyu Fang.",
+        ],
         receipts=receipts,
     )
 
@@ -360,6 +452,77 @@ def test_pack_evidence_accepts_graph_backed_rows_and_rejects_unbacked_rows() -> 
     assert len(packed) == 1
     assert packed[0].db_source == "graph"
     assert packed[0].graph_ref["entityId"] == "ent_123"
+
+
+def test_pack_evidence_prefers_on_target_rows_over_higher_score_off_target_rows() -> None:
+    task = SectionTaskModel(
+        section_id="identity_profile",
+        title="Identity profile",
+        objective="Establish the primary target identity.",
+        entity_ids=["Jingbin Lin"],
+    )
+    rows = [
+        {
+            "document_id": "doc-off-target",
+            "snippet": "Quanhui Jia is affiliated with Ant Financial.",
+            "source_url": "https://example.com/quanhui",
+            "title": "Quanhui Jia profile",
+            "score": 0.99,
+            "db_source": "vector",
+        },
+        {
+            "document_id": "doc-on-target",
+            "snippet": "Jingbin Lin maintains a public profile and personal site.",
+            "source_url": "https://example.com/jingbin",
+            "title": "Jingbin Lin profile",
+            "score": 0.42,
+            "db_source": "vector",
+        },
+    ]
+
+    packed = pack_evidence("identity_profile", rows, k=1, section_context=task)
+
+    assert len(packed) == 1
+    assert packed[0].document_id == "doc-on-target"
+    assert packed[0].target_match_score and packed[0].target_match_score > 0
+
+
+def test_assemble_final_report_falls_back_when_llm_opening_is_off_target() -> None:
+    class _OffTargetLLM:
+        def complete_json(self, prompt: str, payload: dict, temperature: float, timeout: int, **kwargs: object) -> dict:
+            return {
+                "report_text": (
+                    "# Quanhui Jia\n\n"
+                    "## Identity\n"
+                    "Quanhui Jia is the main subject of this report [ID_1].\n\n"
+                    "## Notes\n"
+                    "Jingbin Lin appears only incidentally.\n"
+                )
+            }
+
+    state = {
+        "prompt": "profile Jingbin Lin",
+        "report_type": "person",
+        "primary_entities": ["Jingbin Lin"],
+        "section_drafts": [
+            SectionDraftModel(
+                section_id="identity_profile",
+                title="Identity profile",
+                content="Jingbin Lin is the declared target in this run [ID_1].",
+            )
+        ],
+        "claim_ledger": [],
+        "evidence_refs": [],
+        "section_issues": [],
+        "stage1_receipts": [],
+        "noteboard": [],
+        "report_memory": None,
+    }
+
+    report = assemble_final_report(state, _OffTargetLLM())
+
+    assert report.startswith("Qwen Deep Research")
+    assert "Quanhui Jia is the main subject" not in report
 
 
 def test_report_related_people_filter_rejects_none_publications_phrase() -> None:

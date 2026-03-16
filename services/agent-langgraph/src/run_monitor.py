@@ -12,9 +12,85 @@ from logger import get_logger
 logger = get_logger(__name__)
 
 HeartbeatEmitter = Callable[[str, Dict[str, Any]], None]
+STALL_TIMEOUT_BUFFER_SECONDS = 90.0
 
 _ACTIVE_MONITOR: Optional["RunMonitor"] = None
 _ACTIVE_MONITOR_LOCK = threading.Lock()
+
+
+def _env_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return float(default)
+    try:
+        return float(raw_value)
+    except ValueError:
+        return float(default)
+
+
+def progress_keepalive_seconds() -> float:
+    return max(1.0, _env_float("LANGGRAPH_PROGRESS_KEEPALIVE_SECONDS", 10.0))
+
+
+def default_stall_timeout_seconds() -> float:
+    explicit = os.getenv("LANGGRAPH_STALL_TIMEOUT_SECONDS")
+    if explicit is not None and explicit.strip():
+        return max(1.0, _env_float("LANGGRAPH_STALL_TIMEOUT_SECONDS", 360.0))
+
+    openrouter_timeout = max(0.1, _env_float("OPENROUTER_TIMEOUT_SECONDS", 120.0))
+    planner_timeout = max(0.1, _env_float("OPENROUTER_PLANNER_TIMEOUT_SECONDS", openrouter_timeout))
+    worker_timeout = max(0.1, _env_float("OPENROUTER_WORKER_TIMEOUT_SECONDS", openrouter_timeout))
+    report_timeout = max(
+        0.1,
+        _env_float(
+            "OPENROUTER_REPORT_TIMEOUT_SECONDS",
+            _env_float(
+                "OPENROUTER_PLANNER_TIMEOUT_SECONDS",
+                _env_float("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+            ),
+        ),
+    )
+    report_worker_timeout = max(
+        0.1,
+        _env_float(
+            "OPENROUTER_REPORT_WORKER_TIMEOUT_SECONDS",
+            _env_float(
+                "OPENROUTER_WORKER_TIMEOUT_SECONDS",
+                _env_float("OPENROUTER_TIMEOUT_SECONDS", 400.0),
+            ),
+        ),
+    )
+    title_timeout = max(
+        0.1,
+        _env_float("OPENROUTER_TITLE_TIMEOUT_SECONDS", min(openrouter_timeout, 45.0)),
+    )
+    mcp_init_timeout = max(0.1, _env_float("MCP_HTTP_INIT_TIMEOUT_SECONDS", 30.0))
+    mcp_request_timeout = max(0.1, _env_float("MCP_HTTP_TIMEOUT_SECONDS", 300.0))
+
+    largest_timeout = max(
+        planner_timeout,
+        worker_timeout,
+        report_timeout,
+        report_worker_timeout,
+        title_timeout,
+        mcp_init_timeout,
+        mcp_request_timeout,
+    )
+    return largest_timeout + STALL_TIMEOUT_BUFFER_SECONDS
+
+
+def wait_with_progress(duration_seconds: float, stage: Optional[str] = None) -> None:
+    remaining = max(0.0, float(duration_seconds))
+    if remaining <= 0:
+        return
+
+    cadence = progress_keepalive_seconds()
+    while remaining > 0:
+        sleep_for = min(cadence, remaining)
+        time.sleep(sleep_for)
+        remaining -= sleep_for
+        if stage:
+            notify_progress(stage)
 
 
 @dataclass
@@ -25,7 +101,7 @@ class RunMonitor:
         default_factory=lambda: float(os.getenv("LANGGRAPH_HEARTBEAT_INTERVAL_SECONDS", "30"))
     )
     stall_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("LANGGRAPH_STALL_TIMEOUT_SECONDS", "360"))
+        default_factory=default_stall_timeout_seconds
     )
 
     def __post_init__(self) -> None:

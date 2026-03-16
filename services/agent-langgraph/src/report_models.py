@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, TypedDict
 
+from conflict_models import GraphConflictCaseModel
 from pydantic import BaseModel, Field
 
 from tool_worker_graph import ToolReceipt
@@ -18,13 +19,16 @@ class SectionTaskModel(BaseModel):
     entity_ids: List[str] = Field(default_factory=list)
     query_hints: List[str] = Field(default_factory=list)
     current_content: str = ""
+    reflection_source: str = ""
     revision_focus: str = ""
     next_step_suggestion: str = ""
+    revision_query_hints: List[str] = Field(default_factory=list)
 
 
 class SectionReflectionModel(BaseModel):
     section_id: str
     status: Literal["ok", "needs_revision", "missing"] = "ok"
+    reflection_source: str = ""
     critique: str = ""
     current_content: str = ""
     next_step_suggestion: str = ""
@@ -46,6 +50,7 @@ class EvidenceRefModel(BaseModel):
     evidence_object_key: str | None = None
     source_type: str = "web"
     score: float | None = None
+    target_match_score: float | None = None
     db_source: str = "vector"
     object_ref: Dict[str, Any] = Field(default_factory=dict)
     graph_ref: Dict[str, Any] = Field(default_factory=dict)
@@ -56,6 +61,8 @@ class ClaimModel(BaseModel):
     section_id: str
     text: str
     subject_entity_id: str | None = None
+    subject_name: str | None = None
+    about_primary_subject: bool | None = None
     predicate: str = "observed"
     object: str | None = None
     confidence: float = 0.0
@@ -208,6 +215,40 @@ class DocDeepDiveModel(BaseModel):
     acknowledgements: List[str] = Field(default_factory=list)
 
 
+class PrimaryTargetContractModel(BaseModel):
+    target_type: Literal["person", "organization", "unknown"] = "person"
+    prompt_targets: List[str] = Field(default_factory=list)
+    canonical_name: str = ""
+    approved_aliases: List[str] = Field(default_factory=list)
+    approved_handles: List[str] = Field(default_factory=list)
+    approved_domains: List[str] = Field(default_factory=list)
+    root_entity_id: str = ""
+    anchor_receipt_ids: List[str] = Field(default_factory=list)
+    locked_iteration: int = 0
+    lock_reason: str = ""
+
+
+class PrimaryGraphTemplateModel(BaseModel):
+    root_entity_id: str = ""
+    root_entity_type: Literal["Person", "Organization", "Unknown"] = "Person"
+    root_canonical_name: str = ""
+    root_aliases: List[str] = Field(default_factory=list)
+    approved_handles: List[str] = Field(default_factory=list)
+    approved_domains: List[str] = Field(default_factory=list)
+    first_hop_entity_categories: List[str] = Field(default_factory=list)
+    first_hop_relation_categories: List[str] = Field(default_factory=list)
+    template_mode: Literal["metadata_only"] = "metadata_only"
+
+
+class Stage2ModelConfig(BaseModel):
+    outline_model: str = ""
+    section_query_model: str = ""
+    section_claim_model: str = ""
+    section_draft_model: str = ""
+    final_reflection_model: str = ""
+    final_report_model: str = ""
+
+
 class ReportMemoryModel(BaseModel):
     question: str
     entities: List[EntityModel] = Field(default_factory=list)
@@ -232,6 +273,10 @@ class ReportMemoryModel(BaseModel):
     coauthor_clusters: List[CoauthorClusterModel] = Field(default_factory=list)
     profile_index: List[ProfileIndexItemModel] = Field(default_factory=list)
     doc_deep_dives: List[DocDeepDiveModel] = Field(default_factory=list)
+    primary_target_contract: PrimaryTargetContractModel = Field(default_factory=PrimaryTargetContractModel)
+    stage1_conflict_cases: List[GraphConflictCaseModel] = Field(default_factory=list)
+    stage1_resolved_conflicts: List[GraphConflictCaseModel] = Field(default_factory=list)
+    stage1_unresolved_conflicts: List[GraphConflictCaseModel] = Field(default_factory=list)
 
 
 class ReportState(TypedDict):
@@ -239,6 +284,10 @@ class ReportState(TypedDict):
     prompt: str
     noteboard: List[str]
     stage1_receipts: List[ToolReceipt]
+    stage1_conflict_cases: List[GraphConflictCaseModel]
+    stage1_resolved_conflicts: List[GraphConflictCaseModel]
+    stage1_unresolved_conflicts: List[GraphConflictCaseModel]
+    primary_target_contract: PrimaryTargetContractModel
     report_type: str
     primary_entities: List[str]
     outline: List[SectionTaskModel]
@@ -279,6 +328,7 @@ class ReportResult:
     quality_ok: bool
     refine_round: int
     report_memory: ReportMemoryModel
+    primary_target_contract: PrimaryTargetContractModel
 
 
 def make_initial_report_state(
@@ -287,6 +337,10 @@ def make_initial_report_state(
     noteboard: List[str],
     stage1_receipts: List[ToolReceipt],
     max_refine_rounds: int,
+    stage1_conflict_cases: List[GraphConflictCaseModel] | None = None,
+    stage1_resolved_conflicts: List[GraphConflictCaseModel] | None = None,
+    stage1_unresolved_conflicts: List[GraphConflictCaseModel] | None = None,
+    primary_target_contract: PrimaryTargetContractModel | None = None,
 ) -> ReportState:
     """Create the canonical initial state used by the report subgraph."""
     return {
@@ -294,6 +348,10 @@ def make_initial_report_state(
         "prompt": prompt,
         "noteboard": list(noteboard),
         "stage1_receipts": list(stage1_receipts),
+        "stage1_conflict_cases": list(stage1_conflict_cases or []),
+        "stage1_resolved_conflicts": list(stage1_resolved_conflicts or []),
+        "stage1_unresolved_conflicts": list(stage1_unresolved_conflicts or []),
+        "primary_target_contract": primary_target_contract or PrimaryTargetContractModel(),
         "report_type": "person",
         "primary_entities": [],
         "outline": [],
@@ -317,7 +375,13 @@ def make_initial_report_state(
         "done": False,
         "final_report": "",
         "evidence_appendix": "",
-        "report_memory": ReportMemoryModel(question=prompt),
+        "report_memory": ReportMemoryModel(
+            question=prompt,
+            primary_target_contract=primary_target_contract or PrimaryTargetContractModel(),
+            stage1_conflict_cases=list(stage1_conflict_cases or []),
+            stage1_resolved_conflicts=list(stage1_resolved_conflicts or []),
+            stage1_unresolved_conflicts=list(stage1_unresolved_conflicts or []),
+        ),
         "consistency_issues": [],
         "contradiction_query_hints": [],
     }
