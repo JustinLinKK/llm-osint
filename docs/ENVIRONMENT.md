@@ -253,6 +253,6 @@ getent hosts postgres minio qdrant neo4j redis temporal
 
 ## Additional Resources
 
+- [WIKI.md](./WIKI.md) - Repository overview and current runtime
 - [SETUP.md](../SETUP.md) - Complete setup guide
 - [MCP_CLIENT_GUIDE.md](../apps/mcp-server/MCP_CLIENT_GUIDE.md) - MCP client patterns
-- [Checkpoint.md](../Checkpoint.md) - Current project status

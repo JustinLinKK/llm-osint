@@ -31,6 +31,8 @@ export type GraphProjection = {
   recommendedEgoDepth: number;
 };
 
+export type GraphVariant = "investigation" | "public";
+
 type AnnotatedNode = GraphNodePayload & {
   effectiveType: string;
   family: string;
@@ -144,6 +146,18 @@ function formatRelationType(type: string): string {
   return type
     .toLowerCase()
     .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function formatEntityTypeLabel(type: string): string {
+  const spaced = type
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_\s]+/g, " ")
+    .trim();
+  return spaced
+    .split(" ")
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
@@ -1103,6 +1117,7 @@ export function projectRunGraph(
     nodeOffset: number;
     edgeLimit: number;
     edgeOffset: number;
+    variant?: GraphVariant;
   }
 ): GraphProjection {
   const annotatedNodes: AnnotatedNode[] = rawNodes.map((node) => {
@@ -1329,7 +1344,7 @@ export function projectRunGraph(
     properties: compactEdgeProperties(edge),
   }));
 
-  return {
+  const projection: GraphProjection = {
     nodes,
     edges,
     totalNodes: survivingNodes.length,
@@ -1338,5 +1353,64 @@ export function projectRunGraph(
     rootDisplay: rootNodeId ? projectedNodes.get(rootNodeId)?.display ?? null : null,
     recommendedLayout: rootNodeId ? "radial" : "cose",
     recommendedEgoDepth: rootNodeId ? 2 : 1,
+  };
+
+  if (options.variant === "public") {
+    return createPublicGraphProjection(projection);
+  }
+
+  return projection;
+}
+
+function createPublicGraphProjection(projection: GraphProjection): GraphProjection {
+  const typeCounters = new Map<string, number>();
+  const nodeIdMap = new Map<string, string>();
+
+  const publicNodes = projection.nodes.map((node) => {
+    const type =
+      typeof node.properties?.type === "string" && node.properties.type.trim()
+        ? node.properties.type.trim()
+        : node.labels[0] || "Entity";
+    const labelBase = formatEntityTypeLabel(type);
+    const isRoot = Boolean(projection.rootNodeId && node.id === projection.rootNodeId);
+    const nextCount = isRoot ? (typeCounters.get(type) ?? 0) : (typeCounters.get(type) ?? 0) + 1;
+    if (!isRoot) {
+      typeCounters.set(type, nextCount);
+    }
+    const publicId = isRoot
+      ? `public:root:${normalizeGraphText(type).replace(/\s+/g, "_") || "entity"}`
+      : `public:${normalizeGraphText(type).replace(/\s+/g, "_") || "entity"}:${String(nextCount).padStart(3, "0")}`;
+    nodeIdMap.set(node.id, publicId);
+    return {
+      ...node,
+      id: publicId,
+      labels: uniqueStrings(node.labels.length ? node.labels : [type]),
+      display: isRoot ? `Primary ${labelBase}` : `${labelBase} ${nextCount}`,
+      properties: {
+        type,
+        synthetic: true,
+      },
+    };
+  });
+
+  const publicEdges = projection.edges.map((edge, index) => ({
+    ...edge,
+    id: `public-edge-${String(index + 1).padStart(4, "0")}`,
+    source: nodeIdMap.get(edge.source) ?? edge.source,
+    target: nodeIdMap.get(edge.target) ?? edge.target,
+    properties: {
+      rel_type: edge.type,
+      synthetic: true,
+    },
+  }));
+
+  const publicRootId = projection.rootNodeId ? nodeIdMap.get(projection.rootNodeId) ?? null : null;
+
+  return {
+    ...projection,
+    nodes: publicNodes,
+    edges: publicEdges,
+    rootNodeId: publicRootId,
+    rootDisplay: publicRootId ? publicNodes.find((node) => node.id === publicRootId)?.display ?? null : null,
   };
 }

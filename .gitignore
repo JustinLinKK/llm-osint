@@ -10,6 +10,8 @@
 .cursor/
 .cursorignore
 .cursorindexingignore
+.yarn/install-state.gz
+.yarn/unplugged/
 
 # ============================================================================
 # Node.js / JavaScript / TypeScript
@@ -80,6 +82,10 @@ db.sqlite3-journal
 logs/
 *.log
 *.pid
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # ============================================================================
 # OS
@@ -146,4 +152,9 @@ apps/mcp-server/tmp/
 apps/mcp-server/logs/
 services/agent-langgraph/logs/
 person_search_seen_urls.txt
-result_benchmark/
+apps/mcp-server/src/tools/tools_python/research_integration/.linkedin_context_id
+reports/benchmark_comparison/
+result_benchmark/.last_*
+result_benchmark/*.stderr
+result_benchmark/*.stdout
+/pipeline_diagram.mmd

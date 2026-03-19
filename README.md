@@ -2,7 +2,9 @@
 
 LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a Streamable HTTP MCP server, and Python LangGraph graphs for evidence collection and report generation.
 
-## What is in the repo
+The release-stage source of truth is [docs/WIKI.md](docs/WIKI.md). This README is the short landing page.
+
+## What Is In The Repo
 
 - `apps/api`: Fastify API for runs, events, files, graph views, and report retrieval
 - `apps/mcp-server`: MCP server with deterministic ingest tools and Python-backed research tools
@@ -14,7 +16,7 @@ LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a St
 - `infra/docker`: Docker Compose stack for local development
 - `infra/db/migrations`: Postgres schema migrations
 
-## Current runtime flow
+## Current Runtime Flow
 ![alt text](public/Flow.png)
 1. `POST /runs` creates a run.
 2. The API autostarts `services/agent-langgraph/src/run_planner.py`.
@@ -22,7 +24,7 @@ LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a St
 4. Stage 1 calls MCP tools, stores evidence, emits receipts, and updates vector/graph stores.
 5. Stage 2 writes report snapshots to Postgres and the API exposes them at `GET /runs/:runId/report`.
 
-## Core services
+## Core Services
 
 - API: `http://localhost:3000`
 - MCP server: `http://localhost:3001/mcp`
@@ -32,10 +34,11 @@ LLM-OSINT is a local-first OSINT research stack built around a Fastify API, a St
 - Neo4j browser: `http://localhost:7474`
 - Temporal UI: `http://localhost:8233`
 
-## Quick start
+## Quick Start
 
 ```bash
 cp .env.example .env
+cp infra/docker/.env.example infra/docker/.env
 yarn install
 yarn infra:up
 ```
@@ -72,12 +75,11 @@ curl -X POST http://localhost:3000/runs \
   -d '{"prompt":"Investigate example.com and related accounts"}'
 ```
 
+## Documentation
 
-## Related docs
-
-- `SETUP.md`: full setup and verification
-- `ENV_FILES_README.md`: environment template guidance
-- `ENV_CONFIGURATION_SUMMARY.md`: environment behavior summary
-- `Checkpoint.md`: current repository checkpoint
-- `PROJECT_PLAN_TODO.md`: remaining work
-- `pipeline_structure.md`: Stage 1 / Stage 2 runtime structure
+- [docs/WIKI.md](docs/WIKI.md): comprehensive repository wiki
+- [SETUP.md](SETUP.md): shortest setup path
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md): environment troubleshooting
+- [apps/mcp-server/README.md](apps/mcp-server/README.md): MCP server details
+- [apps/mcp-server/MCP_CLIENT_GUIDE.md](apps/mcp-server/MCP_CLIENT_GUIDE.md): MCP client integration
+- [docs/STAGE1_BLUEPRINT_RUNTIME_MAPPING.md](docs/STAGE1_BLUEPRINT_RUNTIME_MAPPING.md): Stage 1 blueprint/runtime contract mapping

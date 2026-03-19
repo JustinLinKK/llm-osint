@@ -1,6 +1,6 @@
 # Setup Guide
 
-This guide matches the current repo behavior as of March 6, 2026.
+This is the shortest setup path. The fuller repo reference now lives in [docs/WIKI.md](docs/WIKI.md).
 
 ## Prerequisites
 
@@ -9,12 +9,11 @@ This guide matches the current repo behavior as of March 6, 2026.
 - Yarn 4
 - Python 3.11+
 
-VS Code dev container is recommended but not required.
-
-## 1. Create `.env`
+## 1. Create Environment Files
 
 ```bash
 cp .env.example .env
+cp infra/docker/.env.example infra/docker/.env
 ```
 
 Required for normal LangGraph planning:
@@ -23,7 +22,7 @@ Required for normal LangGraph planning:
 OPENROUTER_API_KEY=your_key_here
 ```
 
-Common optional credentials:
+Useful optional credentials:
 
 ```bash
 TAVILY_API_KEY=
@@ -36,13 +35,15 @@ BROWSERBASE_PROJECT_ID=
 X_BEARER_TOKEN=
 ```
 
-Notes:
+If you are inside the dev container, keep Docker service names in `.env` and connect the container to the compose network once:
 
-- Inside the dev container, keep service hostnames like `postgres`, `minio`, `qdrant`, `neo4j`, `mcp-server`.
-- On a native host, copy `.env.example` and replace those hostnames with `localhost`.
-- The API defaults `LANGGRAPH_AUTOSTART=true`, and API-launched runs include Stage 2 automatically.
+```bash
+docker network connect docker_default $(hostname) || true
+```
 
-## 2. Install dependencies
+If you run locally on the host OS, replace service hostnames in `.env` with `localhost`.
+
+## 2. Install Dependencies
 
 ```bash
 yarn install
@@ -51,10 +52,11 @@ python3 -m venv .venv-agent
 pip install -r services/agent-langgraph/requirements.txt
 ```
 
-## 3. Start infrastructure
+## 3. Start Infrastructure And Apply Migrations
 
 ```bash
 yarn infra:up
+yarn db:migrate
 ```
 
 Useful variants:
@@ -62,113 +64,41 @@ Useful variants:
 ```bash
 yarn infra:ps
 yarn infra:up:build
-yarn infra:rebuild:all-lite
 yarn infra:restart:all-lite
-yarn infra:restart:api
-yarn infra:restart:embedding
-yarn infra:restart:kali
+yarn infra:rebuild:all-lite
 ```
 
-When to rebuild instead of restart:
-
-- Dockerfile changed
-- Python or Node dependencies changed inside a container image
-- base image changed
-
-## 4. Dev container network hookup
-
-If you are inside the dev container:
-
-```bash
-docker network connect docker_default $(hostname) || true
-```
-
-This is required so the dev container can resolve compose service names like `postgres` and `minio`.
-
-## 5. Apply database migrations
-
-```bash
-yarn db:migrate
-```
-
-Current migration set:
-
-- `0001_init.sql`
-- `0002_run_events.sql`
-- `0003_reports.sql`
-- `0004_micro_agent_schema.sql`
-- `0005_evidence_links.sql`
-- `0006_run_titles.sql`
-- `0007_stage2_reports.sql`
-- `0008_typed_receipt_pivots.sql`
-
-## 6. Start the web app
+## 4. Start The UI
 
 ```bash
 yarn dev:web
 ```
 
-Open `http://localhost:5173`.
+If you also want the API outside Docker in watch mode:
 
-The Vite app proxies API requests to `http://localhost:3000`.
+```bash
+yarn dev:api
+```
 
-## 7. Verify services
-
-Health check:
+## 5. Verify The Stack
 
 ```bash
 curl http://localhost:3000/health
-```
-
-Expected:
-
-```json
-{"ok":true}
-```
-
-Create a run:
-
-```bash
 curl -X POST http://localhost:3000/runs \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Investigate example.com and related accounts"}'
 ```
 
-Follow live events:
+Helpful follow-ups:
 
 ```bash
 curl -N http://localhost:3000/runs/<RUN_ID>/events
-```
-
-Fetch the latest report:
-
-```bash
 curl http://localhost:3000/runs/<RUN_ID>/report
+cd apps/mcp-server && yarn example
 ```
 
-## Current service ports
+## References
 
-- API: `3000`
-- MCP server: `3001`
-- Kali MCP server: `3002`
-- Web UI: `5173`
-- Postgres: `5432`
-- Redis: `6379`
-- Qdrant: `6333`
-- Neo4j browser / bolt: `7474` / `7687`
-- Temporal / UI: `7233` / `8233`
-- MinIO API / console: `9000` / `9001`
-- Embedding worker: host `8008` -> container `8000`
-
-## What is real today
-
-- `POST /runs` starts the LangGraph planner from the API
-- the API passes `--run-stage2`
-- Stage 2 report snapshots are stored in `report_runs`, `section_drafts`, `claim_ledger`, and `evidence_refs`
-- `GET /runs/:runId/report` prefers the Stage 2 tables, then falls back to the legacy `reports` path
-
-## What is not fully wired
-
-- Temporal is still a skeleton worker, not the primary orchestrator
-- `services/worker-python` is not running as an independent background service
-- upload-centric workflows are still limited compared with prompt-driven runs
+- [docs/WIKI.md](docs/WIKI.md)
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)
+- [apps/mcp-server/MCP_CLIENT_GUIDE.md](apps/mcp-server/MCP_CLIENT_GUIDE.md)

@@ -18,10 +18,10 @@ URL_RE = re.compile(r"https?://\S+")
 SECTION_RE = re.compile(r"^##\s+", re.MULTILINE)
 
 ROOT = Path("/workspaces/llm-osint")
-BENCHMARK_PATH = ROOT / "Benchmark.txt"
+BENCHMARK_PATH = ROOT / "result_benchmark" / "Benchmark.txt"
 BLUEPRINT_PATH = ROOT / "graph_blueprint_sample.json"
 CONTRACT_PATH = ROOT / "schemas" / "stage1_graph_blueprint_contract.v1.json"
-BASELINE_REPORT_PATH = ROOT / "PIPELINE_VS_BENCHMARK_REPORT.md"
+BASELINE_REPORT_PATH = ROOT / "result_benchmark" / "PIPELINE_VS_BENCHMARK_REPORT.md"
 
 
 @dataclass
@@ -280,7 +280,7 @@ def main() -> int:
     parser.add_argument("--run-id", required=True, help="Run UUID")
     parser.add_argument("--api-base", default="http://localhost:3000", help="API base URL")
     parser.add_argument("--out", default=None, help="Output markdown path")
-    parser.add_argument("--append-baseline", action="store_true", help="Append gate delta to PIPELINE_VS_BENCHMARK_REPORT.md")
+    parser.add_argument("--append-baseline", action="store_true", help="Append gate delta to result_benchmark/PIPELINE_VS_BENCHMARK_REPORT.md")
     parser.add_argument("--fail-on-gates", action="store_true", help="Exit non-zero when any hard gate fails")
     args = parser.parse_args()
 

@@ -624,6 +624,7 @@ app.get("/runs/:runId/graph", async (req, reply) => {
     edgeLimit?: string;
     edgeOffset?: string;
     scope?: string;
+    variant?: string;
   };
 
   const nodeLimit = parsePositiveInt(query.nodeLimit, 80, 400);
@@ -636,6 +637,8 @@ app.get("/runs/:runId/graph", async (req, reply) => {
   const fetchEdgeLimitInt = neo4j.int(fetchEdgeLimit);
   const requestedScope = String(query.scope ?? "run").trim().toLowerCase();
   const scope = requestedScope === "global" || requestedScope === "hybrid" ? requestedScope : "run";
+  const requestedVariant = String(query.variant ?? "investigation").trim().toLowerCase();
+  const variant = requestedVariant === "public" ? "public" : "investigation";
 
   const runRes = await pool.query(`SELECT prompt, title FROM runs WHERE run_id = $1 LIMIT 1`, [runId]);
   const runPrompt = String(runRes.rows[0]?.prompt ?? "");
@@ -646,6 +649,7 @@ app.get("/runs/:runId/graph", async (req, reply) => {
     return {
       runId,
       scope,
+      variant,
       nodes: [],
       edges: [],
       page: {
@@ -772,12 +776,14 @@ app.get("/runs/:runId/graph", async (req, reply) => {
       nodeLimit,
       nodeOffset,
       edgeLimit,
-      edgeOffset
+      edgeOffset,
+      variant,
     });
 
     return {
       runId,
       scope,
+      variant,
       nodes: projection.nodes,
       edges: projection.edges,
       page: {

@@ -15,6 +15,7 @@ import { jsPDF } from "jspdf";
 
 type ViewMode = "chat" | "report" | "evidence";
 type EvidenceView = "files" | "graph";
+type GraphVariant = "investigation" | "public";
 
 type RunSummary = {
   runId: string;
@@ -59,20 +60,49 @@ type GraphNode = {
   properties?: Record<string, unknown>;
 };
 
-const GRAPH_PALETTE = [
-  "#1f77b4",
-  "#ff7f0e",
-  "#2ca02c",
-  "#d62728",
-  "#9467bd",
-  "#8c564b",
-  "#e377c2",
-  "#7f7f7f",
-  "#bcbd22",
-  "#17becf",
-  "#4c78a8",
-  "#f58518"
+const GRAPH_FALLBACK_PALETTE = [
+  "#0f766e",
+  "#c2410c",
+  "#7c3aed",
+  "#be123c",
+  "#0369a1",
+  "#4d7c0f",
+  "#a21caf",
+  "#b45309",
+  "#1d4ed8",
+  "#15803d",
+  "#9f1239",
+  "#4338ca"
 ] as const;
+
+const GRAPH_TYPE_COLORS: Record<string, string> = {
+  Person: "#06b6d4",
+  Organization: "#dc2626",
+  Institution: "#84cc16",
+  Publication: "#eab308",
+  Conference: "#8b5cf6",
+  Topic: "#f97316",
+  Repository: "#2563eb",
+  Project: "#0f766e",
+  Website: "#6b7280",
+  Document: "#a16207",
+  TimelineEvent: "#14b8a6",
+  Handle: "#ec4899",
+  Email: "#0891b2",
+  Phone: "#ea580c",
+  Location: "#65a30d",
+  ContactPoint: "#64748b",
+  Role: "#b91c1c",
+  Experience: "#1d4ed8",
+  Occupation: "#c2410c",
+  Affiliation: "#16a34a",
+  EducationalCredential: "#ca8a04",
+  Language: "#7c3aed",
+  Award: "#d97706",
+  Grant: "#0d9488",
+  Patent: "#9333ea",
+  OrganizationProfile: "#475569",
+};
 
 type GraphEdge = {
   id: string;
@@ -84,6 +114,7 @@ type GraphEdge = {
 };
 
 type GraphPayload = {
+  variant?: GraphVariant;
   nodes: GraphNode[];
   edges: GraphEdge[];
   graphRoot?: {
@@ -367,13 +398,15 @@ function graphNodeAttributes(node: GraphNode): string[] {
 }
 
 function stableGraphColor(label: string): string {
-  const key = label.trim().toLowerCase();
-  if (!key) return "#9ca3af";
+  const normalized = label.trim();
+  if (!normalized) return "#9ca3af";
+  if (GRAPH_TYPE_COLORS[normalized]) return GRAPH_TYPE_COLORS[normalized];
+  const key = normalized.toLowerCase();
   let hash = 0;
   for (let index = 0; index < key.length; index += 1) {
     hash = (hash * 31 + key.charCodeAt(index)) >>> 0;
   }
-  return GRAPH_PALETTE[hash % GRAPH_PALETTE.length] ?? "#9ca3af";
+  return GRAPH_FALLBACK_PALETTE[hash % GRAPH_FALLBACK_PALETTE.length] ?? "#9ca3af";
 }
 
 function graphRelType(edge: GraphEdge): string {
@@ -492,13 +525,13 @@ function bfsNeighborhood(adjacency: Map<string, Set<string>>, root: string, dept
   return visited;
 }
 
-function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<Record<string, unknown>> {
+function makeGraphStylesheet(showNodeLabels: boolean, showEdgeLabels: boolean, maxDegree: number): Array<Record<string, unknown>> {
   const boundedDegree = Math.max(maxDegree, 1);
   const stylesheet: Array<Record<string, unknown>> = [
     {
       selector: "node",
       style: {
-        label: "data(label)",
+        label: showNodeLabels ? "data(label)" : "",
         "font-size": 10,
         "text-wrap": "wrap",
         "text-max-width": 140,
@@ -515,7 +548,7 @@ function makeGraphStylesheet(showEdgeLabels: boolean, maxDegree: number): Array<
       style: {
         "border-width": 3,
         "border-color": "#0f172a",
-        "font-size": 12,
+        "font-size": showNodeLabels ? 12 : 0,
         "font-weight": 700,
         width: 72,
         height: 72,
@@ -598,6 +631,7 @@ export default function App() {
   const [report, setReport] = useState<ReportPayload | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [graphSearchText, setGraphSearchText] = useState("");
+  const [graphVariant, setGraphVariant] = useState<GraphVariant>("investigation");
   const [selectedGraphNodeTypes, setSelectedGraphNodeTypes] = useState<string[]>([]);
   const [selectedGraphRelTypes, setSelectedGraphRelTypes] = useState<string[]>([]);
   const [graphMinDegree, setGraphMinDegree] = useState(0);
@@ -647,6 +681,7 @@ export default function App() {
 
   useEffect(() => {
     setGraphSearchText("");
+    setGraphVariant("investigation");
     setSelectedGraphNodeTypes([]);
     setSelectedGraphRelTypes([]);
     setGraphMinDegree(0);
@@ -832,11 +867,18 @@ export default function App() {
     if (wantsGroupedMode && hasGraphRoot && !groupedMode) {
       warnings.push(`Grouped layout hidden because no visual group has at least ${MIN_GROUPED_LAYOUT_MEMBERS} members.`);
     }
+    const legendItems = uniqueSorted(
+      sortedNodeIds
+        .map((nodeId) => graphNodeMap.get(nodeId))
+        .filter((node): node is GraphNode => Boolean(node))
+        .map((node) => graphNodeType(node))
+    );
 
     return {
       elements,
       layout,
-      stylesheet: makeGraphStylesheet(showGraphEdgeLabels, graphMaxDegree),
+      stylesheet: makeGraphStylesheet(graphVariant !== "public", showGraphEdgeLabels, graphMaxDegree),
+      legendItems,
       stats: groupedMode
         ? `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges with grouped positioning (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`
         : `Showing ${finalNodeIds.size} nodes / ${filteredEdges.length} edges (from ${graphNodes.length} nodes / ${sanitizedGraphEdges.length} edges total)`,
@@ -854,6 +896,7 @@ export default function App() {
     graphNodeMap,
     graphNodes.length,
     graphSearchText,
+    graphVariant,
     sanitizedGraphEdges,
     selectedGraphNodeTypes,
     selectedGraphRelTypes,
@@ -1043,7 +1086,7 @@ export default function App() {
       setIsLoadingGraph(true);
       try {
         const res = await fetch(
-          `${API_BASE}/runs/${selectedRunId}/graph?nodeLimit=400&nodeOffset=0&edgeLimit=600&edgeOffset=0`
+          `${API_BASE}/runs/${selectedRunId}/graph?nodeLimit=400&nodeOffset=0&edgeLimit=600&edgeOffset=0&variant=${graphVariant}`
         );
         if (!res.ok) throw new Error("Failed to load graph");
         const payload = (await res.json()) as GraphPayload;
@@ -1064,7 +1107,7 @@ export default function App() {
     return () => {
       disposed = true;
     };
-  }, [selectedRunId, runIsFinished]);
+  }, [graphVariant, selectedRunId, runIsFinished]);
 
   const startRun = async () => {
     if (!prompt.trim()) return;
@@ -1233,7 +1276,8 @@ export default function App() {
         maxWidth: MAX_GRAPH_EXPORT_WIDTH,
         maxHeight: MAX_GRAPH_EXPORT_HEIGHT
       });
-      triggerBlobDownload(pngBlob, `${reportFilenameBase}-graph.png`);
+      const graphSuffix = graphVariant === "public" ? "public-graph" : "graph";
+      triggerBlobDownload(pngBlob, `${reportFilenameBase}-${graphSuffix}.png`);
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to export graph PNG");
     } finally {
@@ -1607,6 +1651,40 @@ export default function App() {
                             <Card className="min-h-0 border border-white/10 bg-slate-900/50" shadow="none">
                               <CardBody className="space-y-4 overflow-y-auto text-sm">
                                 <div>
+                                  <p className="mb-2 font-semibold text-cyan-100">Graph Variant</p>
+                                  <div className="inline-flex rounded-lg border border-white/10 bg-slate-950/80 p-1">
+                                    <button
+                                      type="button"
+                                      onClick={() => setGraphVariant("investigation")}
+                                      className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                                        graphVariant === "investigation"
+                                          ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(103,232,249,0.45)]"
+                                          : "text-default-500 hover:text-cyan-100"
+                                      }`}
+                                    >
+                                      Investigation
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setGraphVariant("public")}
+                                      className={`rounded-md px-3 py-1.5 text-xs font-medium transition ${
+                                        graphVariant === "public"
+                                          ? "bg-emerald-500/20 text-emerald-100 shadow-[inset_0_0_0_1px_rgba(110,231,183,0.45)]"
+                                          : "text-default-500 hover:text-emerald-100"
+                                      }`}
+                                    >
+                                      Public Graph
+                                    </button>
+                                  </div>
+                                  <p className="mt-2 text-xs text-cyan-100/65">
+                                    Public graph keeps node and relation types plus topology, but replaces labels and IDs with synthetic placeholders for paper-safe export.
+                                  </p>
+                                  {graphVariant === "public" ? (
+                                    <p className="mt-1 text-xs text-emerald-200/80">Node titles are hidden in the canvas for safer publication screenshots.</p>
+                                  ) : null}
+                                </div>
+
+                                <div>
                                   <p className="mb-2 font-semibold text-cyan-100">Search</p>
                                   <input
                                     type="text"
@@ -1750,6 +1828,11 @@ export default function App() {
                                 <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
                                   <div>
                                     <p className="font-semibold text-cyan-100">{filteredGraph.stats}</p>
+                                    {graphVariant === "public" ? (
+                                      <p className="text-xs text-emerald-300">
+                                        Publishing-safe synthetic graph with preserved node types, relation patterns, and graph structure.
+                                      </p>
+                                    ) : null}
                                     {filteredGraph.warning ? (
                                       <p className="text-xs text-amber-300">{filteredGraph.warning}</p>
                                     ) : null}
@@ -1766,9 +1849,9 @@ export default function App() {
                                   </Button>
                                 </div>
                                 <GraphRenderBoundary
-                                  resetKey={`${selectedRunId ?? "no-run"}:${graphLayoutName}:${filteredGraph.elements.length}:${graphNodes.length}:${sanitizedGraphEdges.length}`}
+                                  resetKey={`${selectedRunId ?? "no-run"}:${graphVariant}:${graphLayoutName}:${filteredGraph.elements.length}:${graphNodes.length}:${sanitizedGraphEdges.length}`}
                                 >
-                                  <div className="h-[70vh] min-h-[560px] overflow-hidden rounded-xl border border-white/10 bg-white">
+                                  <div className="relative h-[70vh] min-h-[560px] overflow-hidden rounded-xl border border-white/10 bg-white">
                                     <CytoscapeComponent
                                       elements={filteredGraph.elements}
                                       layout={filteredGraph.layout}
@@ -1786,7 +1869,8 @@ export default function App() {
                                               id: nodeId,
                                               title: node?.display ?? nodeId,
                                               type: node ? graphNodeType(node) : null,
-                                              labels: node?.labels ?? []
+                                              labels: node?.labels ?? [],
+                                              synthetic: node?.properties?.synthetic === true
                                             })
                                           );
                                         });
@@ -1810,16 +1894,33 @@ export default function App() {
                                           setGraphSelectionText(
                                               formatSelectionPayload({
                                                 element: "edge",
-                                                id: edgeId,
-                                                source: edge?.source ?? event.target.source().id(),
-                                                target: edge?.target ?? event.target.target().id(),
-                                                relationship: edge ? graphRelType(edge) : event.target.data("rel_type"),
-                                                label: edge?.display ?? event.target.data("label")
+                                              id: edgeId,
+                                              source: edge?.source ?? event.target.source().id(),
+                                              target: edge?.target ?? event.target.target().id(),
+                                              relationship: edge ? graphRelType(edge) : event.target.data("rel_type"),
+                                              label: edge?.display ?? event.target.data("label"),
+                                              synthetic: edge?.properties?.synthetic === true
                                               })
                                           );
                                         });
                                       }}
                                     />
+                                    {filteredGraph.legendItems.length ? (
+                                      <div className="pointer-events-none absolute right-3 top-3 max-w-[260px] rounded-xl border border-slate-300/80 bg-white/92 p-3 shadow-lg backdrop-blur-sm">
+                                        <p className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-700">Legend</p>
+                                        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                                          {filteredGraph.legendItems.map((type) => (
+                                            <div key={type} className="flex items-center gap-2 text-[11px] leading-4 text-slate-700">
+                                              <span
+                                                className="inline-block h-3 w-3 shrink-0 rounded-full border border-slate-500/60"
+                                                style={{ backgroundColor: stableGraphColor(type) }}
+                                              />
+                                              <span className="min-w-0 truncate">{type}</span>
+                                            </div>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    ) : null}
                                   </div>
                                 </GraphRenderBoundary>
                               </CardBody>
@@ -1837,7 +1938,7 @@ export default function App() {
                                 <div>
                                   <p className="mb-2 font-semibold text-cyan-100">Type Palette</p>
                                   <div className="space-y-2">
-                                    {graphNodeTypeValues.map((type) => (
+                                    {filteredGraph.legendItems.map((type) => (
                                       <div key={type} className="flex items-center gap-3 rounded-lg border border-white/10 bg-slate-950/50 px-3 py-2">
                                         <span
                                           className="inline-block h-3 w-3 rounded-full"
